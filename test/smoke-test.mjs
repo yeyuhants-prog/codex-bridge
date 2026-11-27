@@ -1,4 +1,6 @@
 import { spawn } from "node:child_process";
+import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -9,9 +11,10 @@ const SERVER_PATH =
 const LIVE = process.argv.includes("--live");
 
 class McpTestClient {
-  constructor() {
+  constructor(extraEnv = {}) {
     this.child = spawn(process.execPath, [SERVER_PATH], {
       stdio: ["pipe", "pipe", "pipe"],
+      env: { ...process.env, ...extraEnv },
       windowsHide: true,
     });
     this.nextId = 1;
@@ -66,12 +69,13 @@ class McpTestClient {
 }
 
 async function main() {
-  const client = new McpTestClient();
+  const tempDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-bridge-test-"));
+  const client = new McpTestClient({ CODEX_BRIDGE_DATA_DIR: tempDataDir });
   try {
     const init = await client.request("initialize", {
       protocolVersion: "2025-03-26",
       capabilities: {},
-      clientInfo: { name: "smoke-test", version: "1.0.0" },
+      clientInfo: { name: "smoke-test", version: "1.2.0" },
     });
     console.log("1) initialize OK:", init.serverInfo, init.protocolVersion);
     client.notify("notifications/initialized");
@@ -79,8 +83,8 @@ async function main() {
     const toolsRes = await client.request("tools/list");
     const toolNames = toolsRes.tools.map((t) => t.name);
     console.log("2) tools/list OK:", toolNames.join(", "));
-    if (toolNames.length !== 8) {
-      throw new Error(`Expected 8 tools, got ${toolNames.length}`);
+    if (toolNames.length !== 9) {
+      throw new Error(`Expected 9 tools, got ${toolNames.length}`);
     }
 
     const infoRes = await client.request("tools/call", {
@@ -94,15 +98,61 @@ async function main() {
 
     const cfgRes = await client.request("tools/call", {
       name: "codex_config",
-      arguments: { list_models: true },
+      arguments: {
+        progression_mode: "autonomous",
+        max_auto_iterations: 15,
+        list_models: true,
+      },
     });
     console.log("4) codex_config OK (length=" + cfgRes.content[0].text.length + ")");
-    if (cfgRes.isError) {
-      throw new Error("codex_config returned isError=true");
+    if (cfgRes.isError || !cfgRes.content[0].text.includes("autonomous")) {
+      throw new Error("codex_config failed to update progression_mode");
     }
 
+    const goalCreate = await client.request("tools/call", {
+      name: "codex_goal",
+      arguments: {
+        action: "create",
+        title: "Verify backend auth fix",
+        objective: "Reproduce 500 error and pass pytest",
+        cwd: process.cwd(),
+        acceptance_criteria: ["pytest passes"],
+        milestones: [
+          { title: "Reproduce bug", verification: "pytest -k auth" },
+          { title: "Apply fix and verify", verification: "pytest" },
+        ],
+      },
+    });
+    const goalText = goalCreate.content[0].text;
+    const m = /goal_[a-f0-9]+/.exec(goalText);
+    if (!m) throw new Error("codex_goal create did not return a goal_id");
+    const goalId = m[0];
+    console.log("5) codex_goal create OK:", goalId);
+
+    const msUpdate = await client.request("tools/call", {
+      name: "codex_goal",
+      arguments: {
+        action: "update_milestone",
+        goal_id: goalId,
+        milestone_id: "m1",
+        status: "done",
+        notes: "Reproduced locally",
+      },
+    });
+    if (msUpdate.isError || !msUpdate.content[0].text.includes("1/2 milestones")) {
+      throw new Error("codex_goal update_milestone failed");
+    }
+    console.log("6) codex_goal update_milestone OK (1/2 done)");
+
+    const goalDel = await client.request("tools/call", {
+      name: "codex_goal",
+      arguments: { action: "delete", goal_id: goalId },
+    });
+    if (goalDel.isError) throw new Error("codex_goal delete failed");
+    console.log("7) codex_goal delete OK");
+
     if (LIVE) {
-      console.log("4) Running live codex_run (read-only, ephemeral)...");
+      console.log("8) Running live codex_run (read-only, ephemeral)...");
       const runRes = await client.request("tools/call", {
         name: "codex_run",
         arguments: {
@@ -114,10 +164,6 @@ async function main() {
         _meta: { progressToken: "smoke-1" },
       });
       console.log("   codex_run result:\n" + runRes.content[0].text);
-      console.log(
-        "   progress notifications received:",
-        client.notifications.length
-      );
       if (runRes.isError || !runRes.content[0].text.includes("BRIDGE_OK")) {
         throw new Error("Live codex_run did not return expected BRIDGE_OK");
       }
@@ -126,6 +172,7 @@ async function main() {
     console.log("\nALL SMOKE TESTS PASSED!");
   } finally {
     client.close();
+    fs.rmSync(tempDataDir, { recursive: true, force: true });
   }
 }
 

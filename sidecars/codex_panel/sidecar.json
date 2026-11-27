@@ -3,7 +3,7 @@
   "args": ["main.mjs"],
   "restart_policy": "always",
   "display_name": "Codex Bridge",
-  "description": "交互式控制面板：可视化选择 Codex 模型、思考深度、沙箱权限与协作模式，查看实时连接状态与最近执行记录。",
+  "description": "交互式控制面板与目标推进中心：可视化选择 Codex 模型、思考深度、沙箱权限与推进模式（手动/完工自动验收/目标持续自动推进），实时管理持久化目标板与后台任务。",
   "has_web_ui": true,
   "agent_permissions": {
     "allows_user_interactions": true

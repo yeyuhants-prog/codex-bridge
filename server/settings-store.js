@@ -22,11 +22,31 @@ export function getHistoryPath() {
   return path.join(getDataDir(), "history.json");
 }
 
+export function getJobsPath() {
+  return path.join(getDataDir(), "jobs.json");
+}
+
+export function getGoalsPath() {
+  return path.join(getDataDir(), "goals.json");
+}
+
+export function writeJsonAtomic(filePath, data) {
+  const dir = path.dirname(filePath);
+  fs.mkdirSync(dir, { recursive: true });
+  const tmpPath = `${filePath}.${process.pid}.${Date.now()}.tmp`;
+  fs.writeFileSync(tmpPath, JSON.stringify(data, null, 2) + "\n", "utf8");
+  fs.renameSync(tmpPath, filePath);
+}
+
 export const DEFAULT_SETTINGS = {
   model: "", // "" means follow ~/.codex/config.toml default
   reasoningEffort: "", // "" means follow model/config default
   sandbox: "workspace-write",
   workflowMode: "direct", // "direct" | "plan_first"
+  progressionMode: "notify", // "manual" | "notify" | "autonomous"
+  maxAutoIterations: 12,
+  boundConversationId: "",
+  boundProjectId: "",
   ephemeral: false,
   skipGitRepoCheck: true,
 };
@@ -38,6 +58,8 @@ const VALID_SANDBOXES = new Set([
 ]);
 
 const VALID_WORKFLOW_MODES = new Set(["direct", "plan_first"]);
+
+const VALID_PROGRESSION_MODES = new Set(["manual", "notify", "autonomous"]);
 
 const VALID_EFFORTS = new Set([
   "",
@@ -58,6 +80,7 @@ export function loadSettings() {
       return { ...DEFAULT_SETTINGS, updatedAt: null };
     }
     const raw = JSON.parse(fs.readFileSync(filePath, "utf8"));
+    const maxIter = Number(raw.maxAutoIterations);
     return {
       model: typeof raw.model === "string" ? raw.model.trim() : "",
       reasoningEffort: VALID_EFFORTS.has(raw.reasoningEffort)
@@ -69,6 +92,21 @@ export function loadSettings() {
       workflowMode: VALID_WORKFLOW_MODES.has(raw.workflowMode)
         ? raw.workflowMode
         : DEFAULT_SETTINGS.workflowMode,
+      progressionMode: VALID_PROGRESSION_MODES.has(raw.progressionMode)
+        ? raw.progressionMode
+        : DEFAULT_SETTINGS.progressionMode,
+      maxAutoIterations:
+        Number.isInteger(maxIter) && maxIter >= 1 && maxIter <= 100
+          ? maxIter
+          : DEFAULT_SETTINGS.maxAutoIterations,
+      boundConversationId:
+        typeof raw.boundConversationId === "string"
+          ? raw.boundConversationId.trim()
+          : "",
+      boundProjectId:
+        typeof raw.boundProjectId === "string"
+          ? raw.boundProjectId.trim()
+          : "",
       ephemeral: Boolean(raw.ephemeral),
       skipGitRepoCheck:
         raw.skipGitRepoCheck === undefined
@@ -83,6 +121,11 @@ export function loadSettings() {
 
 export function saveSettings(patch = {}) {
   const current = loadSettings();
+  const maxIterPatch =
+    patch.maxAutoIterations !== undefined
+      ? Number(patch.maxAutoIterations)
+      : undefined;
+
   const next = {
     model:
       patch.model !== undefined
@@ -103,6 +146,26 @@ export function saveSettings(patch = {}) {
       VALID_WORKFLOW_MODES.has(patch.workflowMode)
         ? patch.workflowMode
         : current.workflowMode,
+    progressionMode:
+      patch.progressionMode !== undefined &&
+      VALID_PROGRESSION_MODES.has(patch.progressionMode)
+        ? patch.progressionMode
+        : current.progressionMode,
+    maxAutoIterations:
+      maxIterPatch !== undefined &&
+      Number.isInteger(maxIterPatch) &&
+      maxIterPatch >= 1 &&
+      maxIterPatch <= 100
+        ? maxIterPatch
+        : current.maxAutoIterations,
+    boundConversationId:
+      patch.boundConversationId !== undefined
+        ? String(patch.boundConversationId ?? "").trim()
+        : current.boundConversationId,
+    boundProjectId:
+      patch.boundProjectId !== undefined
+        ? String(patch.boundProjectId ?? "").trim()
+        : current.boundProjectId,
     ephemeral:
       patch.ephemeral !== undefined
         ? Boolean(patch.ephemeral)
@@ -114,16 +177,18 @@ export function saveSettings(patch = {}) {
     updatedAt: new Date().toISOString(),
   };
 
-  const dir = getDataDir();
-  fs.mkdirSync(dir, { recursive: true });
-  const tmpPath = `${getSettingsPath()}.tmp`;
-  fs.writeFileSync(tmpPath, JSON.stringify(next, null, 2) + "\n", "utf8");
-  fs.renameSync(tmpPath, getSettingsPath());
+  writeJsonAtomic(getSettingsPath(), next);
   return next;
 }
 
 export function resetSettings() {
-  return saveSettings({ ...DEFAULT_SETTINGS });
+  const current = loadSettings();
+  return saveSettings({
+    ...DEFAULT_SETTINGS,
+    // Keep bound conversation so resetting preferences does not break callback routing
+    boundConversationId: current.boundConversationId,
+    boundProjectId: current.boundProjectId,
+  });
 }
 
 export function loadHistory() {
@@ -144,11 +209,7 @@ export function appendHistory(entry) {
       at: new Date().toISOString(),
       ...entry,
     });
-    const trimmed = list.slice(0, 25);
-    fs.mkdirSync(getDataDir(), { recursive: true });
-    const tmpPath = `${getHistoryPath()}.tmp`;
-    fs.writeFileSync(tmpPath, JSON.stringify(trimmed, null, 2) + "\n", "utf8");
-    fs.renameSync(tmpPath, getHistoryPath());
+    writeJsonAtomic(getHistoryPath(), list.slice(0, 30));
   } catch {
     // Non-fatal
   }
@@ -175,7 +236,7 @@ export function readCodexTomlDefaults() {
     for (const rawLine of text.split(/\r?\n/)) {
       const line = rawLine.trim();
       if (!line || line.startsWith("#")) continue;
-      if (line.startsWith("[")) break; // top-level keys end at first section
+      if (line.startsWith("[")) break;
       const m = /^([a-zA-Z0-9_]+)\s*=\s*"([^"]*)"/.exec(line);
       if (!m) continue;
       const [, key, val] = m;

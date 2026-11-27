@@ -20,12 +20,20 @@
           <p id="codex-meta" class="subtitle">正在读取本机 Codex 环境与模型列表</p>
         </div>
       </div>
-      <button id="btn-refresh" type="button" class="icon-btn" title="刷新模型与状态">↻</button>
+      <button id="btn-refresh" type="button" class="icon-btn" title="刷新状态、模型与目标">↻</button>
     </header>
+
+    <nav class="tabs" role="tablist">
+      <button type="button" class="tab active" data-tab="control">控制台</button>
+      <button type="button" class="tab" data-tab="goals">
+        目标与任务 <span id="tab-badge" class="tab-badge hidden">0</span>
+      </button>
+    </nav>
 
     <div id="toast" class="toast hidden" role="status" aria-live="polite"></div>
 
-    <main class="content">
+    <!-- TAB 1: CONTROL PANEL -->
+    <main id="panel-control" class="content">
       <!-- Model Picker -->
       <section class="card">
         <div class="card-head">
@@ -46,10 +54,39 @@
         <p id="effort-desc" class="helper"></p>
       </section>
 
-      <!-- Sandbox Mode -->
+      <!-- Progression Mode -->
       <section class="card">
         <div class="card-head">
-          <span class="card-title">执行权限（Sandbox）</span>
+          <span class="card-title">目标推进模式（Progression）</span>
+          <span id="bind-badge" class="hint">未绑定对话</span>
+        </div>
+        <div id="progression-group" class="segment-row" role="radiogroup" aria-label="目标推进模式">
+          <button type="button" class="seg-btn" data-progression="manual">
+            <span class="seg-label">手动推进</span>
+            <span class="seg-sub">干完不回调，等你指示</span>
+          </button>
+          <button type="button" class="seg-btn" data-progression="notify">
+            <span class="seg-label">完工自动验收</span>
+            <span class="seg-sub">后台跑完自动唤醒汇报</span>
+          </button>
+          <button type="button" class="seg-btn" data-progression="autonomous">
+            <span class="seg-label">持续自动推进</span>
+            <span class="seg-sub">自动验收→返工/下一步</span>
+          </button>
+        </div>
+        <div class="inline-setting">
+          <label for="max-iter-input" class="hint">自动推进轮次上限</label>
+          <div class="inline-controls">
+            <input id="max-iter-input" type="number" min="1" max="100" value="12" class="num-input" />
+            <button id="btn-bind-conv" type="button" class="mini-btn" title="绑定当前对话接收自动回调">绑定当前对话</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- Sandbox & Workflow -->
+      <section class="card">
+        <div class="card-head">
+          <span class="card-title">执行权限（Sandbox）与派活方式</span>
         </div>
         <div id="sandbox-group" class="segment-row" role="radiogroup" aria-label="沙箱权限">
           <button type="button" class="seg-btn" data-sandbox="read-only">
@@ -65,21 +102,14 @@
             <span class="seg-sub">full-access</span>
           </button>
         </div>
-      </section>
-
-      <!-- Collaboration Workflow -->
-      <section class="card">
-        <div class="card-head">
-          <span class="card-title">协作方式（反重力 → Codex）</span>
-        </div>
-        <div id="workflow-group" class="segment-row two-col" role="radiogroup" aria-label="协作方式">
+        <div id="workflow-group" class="segment-row two-col mt-8" role="radiogroup" aria-label="派活方式">
           <button type="button" class="seg-btn" data-workflow="direct">
             <span class="seg-label">直接派活执行</span>
-            <span class="seg-sub">反重力拆解后直接让 Codex 落地</span>
+            <span class="seg-sub">拆解后立即交给 Codex</span>
           </button>
           <button type="button" class="seg-btn" data-workflow="plan_first">
-            <span class="seg-label">先出任务单再执行</span>
-            <span class="seg-sub">先输出详细要求，你确认后再跑</span>
+            <span class="seg-label">先出任务单确认</span>
+            <span class="seg-sub">你点头后再启动 Codex</span>
           </button>
         </div>
         <div class="toggle-row">
@@ -87,32 +117,70 @@
             <input id="toggle-ephemeral" type="checkbox" />
             <span>临时会话模式（不写入 Codex 历史会话）</span>
           </label>
+          <button id="btn-reset" type="button" class="link-btn">恢复默认</button>
         </div>
       </section>
 
       <!-- Quick Dispatch -->
       <section class="card">
         <div class="card-head">
-          <span class="card-title">快捷指令</span>
-          <button id="btn-reset" type="button" class="link-btn">恢复默认</button>
+          <span class="card-title">快捷派活给反重力 → Codex</span>
         </div>
-        <div class="quick-input-row">
-          <textarea id="quick-task" rows="2" class="textarea" placeholder="输入你想让反重力整理并派给 Codex 的任务，点击下方按钮发回当前对话…"></textarea>
-        </div>
+        <textarea id="quick-task" rows="2" class="textarea" placeholder="描述你想让 Codex 持续排查、验证或修改的后端/Meta分析任务…"></textarea>
         <div class="action-row">
-          <button id="btn-send-task" type="button" class="primary-btn">发给反重力去指挥 Codex</button>
-          <button id="btn-check-status" type="button" class="secondary-btn">在对话中自检</button>
+          <button id="btn-send-task" type="button" class="primary-btn">发送任务给反重力</button>
+          <button id="btn-check-status" type="button" class="secondary-btn">对话自检</button>
+        </div>
+      </section>
+    </main>
+
+    <!-- TAB 2: GOALS & JOBS -->
+    <main id="panel-goals" class="content hidden">
+      <!-- Persistent Goal Board -->
+      <section class="card">
+        <div class="card-head">
+          <span class="card-title">持久化目标板（Goal & Milestones）</span>
+          <button id="btn-toggle-new-goal" type="button" class="mini-btn">+ 新建目标</button>
+        </div>
+
+        <form id="new-goal-form" class="goal-form hidden">
+          <input id="goal-title" type="text" class="input" placeholder="目标标题，例如：排查后端鉴权 500 报错并补全单测" required />
+          <input id="goal-cwd" type="text" class="input" placeholder="项目目录（可选，留空自动使用当前工作区）" />
+          <textarea id="goal-milestones" rows="3" class="textarea" placeholder="子里程碑（每行一条），例如：&#10;复现 500 错误并定位根因&#10;修复代码并跑通 pytest&#10;验证接口回归无副作用"></textarea>
+          <div class="action-row">
+            <button type="submit" class="primary-btn">创建并设为当前目标</button>
+            <button id="btn-cancel-goal" type="button" class="secondary-btn">取消</button>
+          </div>
+        </form>
+
+        <div id="goal-selector-row" class="goal-selector hidden">
+          <select id="goal-select" class="select"></select>
+        </div>
+
+        <div id="active-goal-view" class="goal-view">
+          <div class="empty">暂无持久化目标。点右上角「+ 新建目标」或直接在对话中让反重力创建目标板～</div>
+        </div>
+      </section>
+
+      <!-- Live & Persisted Background Jobs -->
+      <section class="card">
+        <div class="card-head">
+          <span class="card-title">后台 Codex 任务（断点可续接）</span>
+          <span id="jobs-count" class="hint">0 个</span>
+        </div>
+        <div id="jobs-list" class="history-list">
+          <div class="empty">暂无后台任务记录。</div>
         </div>
       </section>
 
       <!-- Recent History -->
       <section class="card">
         <div class="card-head">
-          <span class="card-title">最近 Codex 执行记录</span>
+          <span class="card-title">最近执行记录</span>
           <span id="history-count" class="hint">0 条</span>
         </div>
         <div id="history-list" class="history-list">
-          <div class="empty">还没有执行记录，派 Codex 干一单后会显示在这里～</div>
+          <div class="empty">还没有执行记录～</div>
         </div>
       </section>
     </main>

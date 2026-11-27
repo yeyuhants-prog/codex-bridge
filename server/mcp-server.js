@@ -13,10 +13,22 @@ import {
   readCodexTomlDefaults,
   readCodexModelsCatalog,
 } from "./settings-store.js";
+import {
+  listGoals,
+  getGoal,
+  createGoal,
+  setActiveGoal,
+  updateGoalStatus,
+  addMilestone,
+  updateMilestone,
+  recordGoalExecution,
+  deleteGoal,
+  formatGoalSummary,
+} from "./goal-store.js";
 
 const SERVER_INFO = {
   name: "codex-mcp-bridge",
-  version: "1.1.0",
+  version: "1.2.0",
 };
 
 const SUPPORTED_PROTOCOL_VERSIONS = [
@@ -26,7 +38,7 @@ const SUPPORTED_PROTOCOL_VERSIONS = [
 ];
 
 const jobManager = new JobManager();
-const activeRequests = new Map(); // requestId -> AbortController
+const activeRequests = new Map();
 
 function log(...args) {
   process.stderr.write(`[codex-mcp-bridge] ${args.join(" ")}\n`);
@@ -63,24 +75,34 @@ const COMMON_RUN_PROPERTIES = {
   cwd: {
     type: "string",
     description:
-      "Absolute path to the working directory where Codex should operate. Defaults to the current workspace directory.",
+      "Absolute path to the working directory where Codex should operate. Defaults to the active goal cwd or current workspace directory.",
   },
   sandbox: {
     type: "string",
     enum: ["read-only", "workspace-write", "danger-full-access"],
     description:
-      "Sandbox policy for Codex shell commands. Omit to use the active Codex Bridge UI panel setting (defaults to 'workspace-write').",
+      "Sandbox policy for Codex shell commands. Omit to use the active Codex Bridge UI panel setting.",
   },
   model: {
     type: "string",
     description:
-      "Optional model override for Codex (e.g. 'gpt-6.2-sol', 'gpt-6.2-astra'). Omit to use the model selected in the Codex Bridge UI panel or ~/.codex/config.toml.",
+      "Optional model override for Codex. Omit to use the model selected in the Codex Bridge UI panel or ~/.codex/config.toml.",
   },
   reasoning_effort: {
     type: "string",
     enum: ["low", "medium", "high", "xhigh", "max", "ultra"],
     description:
       "Optional reasoning effort override for Codex. Omit to use the level selected in the Codex Bridge UI panel or Codex default.",
+  },
+  goal_id: {
+    type: "string",
+    description:
+      "Optional persistent goal_id to associate this Codex execution with (auto-links session_id and iteration count).",
+  },
+  milestone_id: {
+    type: "string",
+    description:
+      "Optional milestone_id (e.g. 'm1') inside goal_id that this execution is working on.",
   },
   profile: {
     type: "string",
@@ -169,6 +191,8 @@ const TOOLS = [
         },
         model: COMMON_RUN_PROPERTIES.model,
         reasoning_effort: COMMON_RUN_PROPERTIES.reasoning_effort,
+        goal_id: COMMON_RUN_PROPERTIES.goal_id,
+        milestone_id: COMMON_RUN_PROPERTIES.milestone_id,
         images: COMMON_RUN_PROPERTIES.images,
         config: COMMON_RUN_PROPERTIES.config,
         skip_git_repo_check: COMMON_RUN_PROPERTIES.skip_git_repo_check,
@@ -211,8 +235,7 @@ const TOOLS = [
         },
         prompt: {
           type: "string",
-          description:
-            "Optional custom review instructions.",
+          description: "Optional custom review instructions.",
         },
         model: COMMON_RUN_PROPERTIES.model,
         reasoning_effort: COMMON_RUN_PROPERTIES.reasoning_effort,
@@ -229,7 +252,7 @@ const TOOLS = [
   {
     name: "codex_start",
     description:
-      "Launch a Codex task asynchronously in the background and immediately return a job_id. Ideal for long-running refactors/builds or dispatching multiple Codex workers in parallel. Poll progress with codex_status.",
+      "Launch a Codex task asynchronously in the background and immediately return a job_id. Persisted to disk; when progression mode is 'notify' or 'autonomous', the Sidecar automatically sends a callback message back to Antigravity upon completion so verification and milestone progression continue seamlessly.",
     inputSchema: {
       type: "object",
       properties: {
@@ -241,6 +264,11 @@ const TOOLS = [
           type: "string",
           description:
             "Optional: if provided, starts an async `codex exec resume` on this session_id instead of a brand-new session.",
+        },
+        notify_on_complete: {
+          type: "boolean",
+          description:
+            "Whether the Sidecar should automatically notify the bound Antigravity conversation when this job finishes. Defaults to true unless progression_mode is 'manual'.",
         },
         ...COMMON_RUN_PROPERTIES,
         timeout_seconds: {
@@ -255,7 +283,7 @@ const TOOLS = [
   {
     name: "codex_status",
     description:
-      "Check status, live progress events, session_id, or final output of a background Codex job started with codex_start. Optionally waits up to wait_seconds for completion.",
+      "Check status, live progress events, session_id, or final output of a background Codex job started with codex_start (also inspects jobs persisted across restarts). Optionally waits up to wait_seconds.",
     inputSchema: {
       type: "object",
       properties: {
@@ -288,16 +316,101 @@ const TOOLS = [
     },
   },
   {
+    name: "codex_goal",
+    description:
+      "Manage persistent multi-step Goals & Milestones shared with the Codex Bridge Sidecar panel (survives restarts and conversation compaction). Use this for ongoing backend debugging, refactors, or meta-analysis pipelines that require iterative verification.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        action: {
+          type: "string",
+          enum: [
+            "get",
+            "list",
+            "create",
+            "update_milestone",
+            "add_milestone",
+            "set_status",
+            "set_active",
+            "delete",
+          ],
+          default: "get",
+          description: "Operation to perform on the persistent goal board.",
+        },
+        goal_id: {
+          type: "string",
+          description: "Target goal_id (defaults to the active goal).",
+        },
+        title: {
+          type: "string",
+          description: "Title for a new goal or new milestone.",
+        },
+        objective: {
+          type: "string",
+          description: "Detailed goal description/objective (for create).",
+        },
+        cwd: {
+          type: "string",
+          description: "Working directory for the goal (for create).",
+        },
+        acceptance_criteria: {
+          type: "array",
+          items: { type: "string" },
+          description: "Verifiable acceptance criteria list (for create).",
+        },
+        milestones: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              id: { type: "string" },
+              title: { type: "string" },
+              verification: { type: "string" },
+            },
+            required: ["title"],
+          },
+          description: "Initial ordered milestones list (for create).",
+        },
+        milestone_id: {
+          type: "string",
+          description: "Target milestone id like 'm1' (for update_milestone).",
+        },
+        status: {
+          type: "string",
+          description:
+            "New status: goal ('active'|'paused'|'completed'|'failed') or milestone ('pending'|'in_progress'|'done'|'blocked'|'skipped').",
+        },
+        verification: {
+          type: "string",
+          description: "Verification command or check for a milestone.",
+        },
+        notes: {
+          type: "string",
+          description: "Verification outcome, findings, or notes.",
+        },
+        blockers: {
+          type: "array",
+          items: { type: "string" },
+          description: "Current blockers list (for set_status).",
+        },
+        max_iterations: {
+          type: "number",
+          description: "Max automatic progression iterations for this goal (default 12).",
+        },
+      },
+    },
+  },
+  {
     name: "codex_config",
     description:
-      "Read or update the persistent Codex Bridge preferences (model, reasoning_effort, sandbox, workflow_mode) shared with the Codex Bridge UI panel, and list available local Codex models.",
+      "Read or update persistent Codex Bridge preferences (model, reasoning_effort, sandbox, workflow_mode, progression_mode, max_auto_iterations) shared with the Codex Bridge UI panel, and list available local Codex models.",
     inputSchema: {
       type: "object",
       properties: {
         model: {
           type: "string",
           description:
-            "Set default Codex model slug (pass empty string '' to follow ~/.codex/config.toml).",
+            "Set default Codex model slug (pass '' to follow ~/.codex/config.toml).",
         },
         reasoning_effort: {
           type: "string",
@@ -314,7 +427,17 @@ const TOOLS = [
           type: "string",
           enum: ["direct", "plan_first"],
           description:
-            "Set collaboration mode: 'direct' executes immediately; 'plan_first' drafts a detailed brief for user confirmation before invoking Codex.",
+            "Briefing mode: 'direct' executes immediately; 'plan_first' presents a brief for confirmation first.",
+        },
+        progression_mode: {
+          type: "string",
+          enum: ["manual", "notify", "autonomous"],
+          description:
+            "Goal progression mode: 'manual' (no auto-callback), 'notify' (auto-notify Antigravity when background Codex job finishes), 'autonomous' (auto-verify and continuously advance goal milestones until done or paused).",
+        },
+        max_auto_iterations: {
+          type: "number",
+          description: "Maximum automatic iterations before pausing (1-100, default 12).",
         },
         list_models: {
           type: "boolean",
@@ -327,7 +450,7 @@ const TOOLS = [
   {
     name: "codex_info",
     description:
-      "Check Codex Bridge health: shows resolved codex.exe path & version, active UI panel preferences (model, reasoning effort, sandbox, workflow mode), and tracked background jobs.",
+      "Check Codex Bridge health: shows resolved codex.exe path & version, active UI panel preferences (model, reasoning effort, sandbox, workflow mode, progression mode), active goal progress, and tracked background jobs.",
     inputSchema: {
       type: "object",
       properties: {},
@@ -337,12 +460,15 @@ const TOOLS = [
 
 function mapCommonOptions(args) {
   const prefs = loadSettings();
+  const linkedGoal = args.goal_id ? getGoal(args.goal_id) : null;
   return {
-    cwd: args.cwd,
+    cwd: args.cwd || linkedGoal?.cwd || undefined,
     sandbox: args.sandbox || prefs.sandbox || "workspace-write",
     model: args.model || prefs.model || undefined,
     reasoningEffort:
       args.reasoning_effort || prefs.reasoningEffort || undefined,
+    goalId: args.goal_id || undefined,
+    milestoneId: args.milestone_id || undefined,
     profile: args.profile,
     addDirs: args.add_dirs,
     images: args.images,
@@ -375,6 +501,8 @@ function recordRunHistory(mode, opts, result) {
     model: opts.model || "(codex default)",
     reasoningEffort: opts.reasoningEffort || "(default)",
     sandbox: opts.sandbox || "workspace-write",
+    goalId: opts.goalId || null,
+    milestoneId: opts.milestoneId || null,
     cwd: result.cwd || opts.cwd || process.cwd(),
     sessionId: result.sessionId || null,
     durationMs: result.durationMs || 0,
@@ -392,11 +520,16 @@ async function handleToolCall(name, args = {}, meta = {}, signal) {
     const jobs = jobManager.listJobs();
     const prefs = loadSettings();
     const toml = readCodexTomlDefaults();
+    const activeGoal = getGoal();
     const effectiveModel =
       prefs.model || `${toml.model || "default"} (Codex 默认)`;
     const effectiveEffort =
       prefs.reasoningEffort ||
       `${toml.reasoningEffort || "default"} (Codex 默认)`;
+    const goalLine = activeGoal
+      ? `${activeGoal.title} (${activeGoal.id}) [${activeGoal.status}, ${activeGoal.milestones.filter((m) => m.status === "done").length}/${activeGoal.milestones.length} done]`
+      : "(none)";
+
     const text = [
       `Bridge: ${SERVER_INFO.name} v${SERVER_INFO.version}`,
       `Node: ${process.version}`,
@@ -406,11 +539,163 @@ async function handleToolCall(name, args = {}, meta = {}, signal) {
       `Reasoning Effort: ${effectiveEffort}`,
       `Sandbox Policy: ${prefs.sandbox}`,
       `Workflow Mode: ${prefs.workflowMode}`,
+      `Progression Mode: ${prefs.progressionMode} (maxAutoIterations=${prefs.maxAutoIterations})`,
+      `Bound Conversation: ${prefs.boundConversationId || "(open Sidecar panel to bind)"}`,
+      `Active Goal: ${goalLine}`,
       `Tracked Jobs: ${jobs.length} (${jobs.filter((j) => j.status === "running").length} running)`,
     ].join("\n");
     return {
       content: [{ type: "text", text }],
       isError: !resolved,
+    };
+  }
+
+  if (name === "codex_goal") {
+    const action = args.action || "get";
+    if (action === "list") {
+      const store = listGoals();
+      if (store.goals.length === 0) {
+        return {
+          content: [{ type: "text", text: "No persistent goals recorded yet." }],
+        };
+      }
+      const lines = store.goals.map((g) => {
+        const done = g.milestones.filter((m) => m.status === "done").length;
+        const activeMark = g.id === store.activeGoalId ? "★ " : "";
+        return `- ${activeMark}\`${g.id}\` [${g.status}] **${g.title}** (${done}/${g.milestones.length} done, iter ${g.iterationCount || 0}/${g.maxIterations || 12})`;
+      });
+      return { content: [{ type: "text", text: lines.join("\n") }] };
+    }
+
+    if (action === "get") {
+      const goal = getGoal(args.goal_id);
+      if (!goal) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: args.goal_id
+                ? `Goal not found: ${args.goal_id}`
+                : "No active goal. Create one with codex_goal(action='create', ...).",
+            },
+          ],
+        };
+      }
+      return { content: [{ type: "text", text: formatGoalSummary(goal) }] };
+    }
+
+    if (action === "create") {
+      const goal = createGoal({
+        title: args.title,
+        objective: args.objective,
+        cwd: args.cwd,
+        acceptanceCriteria: args.acceptance_criteria,
+        milestones: args.milestones,
+        maxIterations: args.max_iterations,
+      });
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Created and activated persistent goal.\n\n${formatGoalSummary(goal)}`,
+          },
+        ],
+      };
+    }
+
+    if (action === "add_milestone") {
+      const { goal, milestone } = addMilestone(args.goal_id, {
+        title: args.title,
+        verification: args.verification,
+        status: args.status || "pending",
+      });
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Added milestone ${milestone.id} to ${goal.id}.\n\n${formatGoalSummary(goal)}`,
+          },
+        ],
+      };
+    }
+
+    if (action === "update_milestone") {
+      if (!args.milestone_id) {
+        return {
+          content: [
+            { type: "text", text: "Error: 'milestone_id' is required." },
+          ],
+          isError: true,
+        };
+      }
+      const { goal } = updateMilestone(args.goal_id, args.milestone_id, {
+        status: args.status,
+        notes: args.notes,
+        verification: args.verification,
+      });
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Updated milestone ${args.milestone_id}.\n\n${formatGoalSummary(goal)}`,
+          },
+        ],
+      };
+    }
+
+    if (action === "set_status") {
+      const goal = updateGoalStatus(args.goal_id, args.status, {
+        blockers: args.blockers,
+        notes: args.notes,
+      });
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Updated goal ${goal.id}.\n\n${formatGoalSummary(goal)}`,
+          },
+        ],
+      };
+    }
+
+    if (action === "set_active") {
+      const goal = setActiveGoal(args.goal_id);
+      return {
+        content: [
+          {
+            type: "text",
+            text: goal
+              ? `Activated goal ${goal.id}.\n\n${formatGoalSummary(goal)}`
+              : "Cleared active goal.",
+          },
+        ],
+      };
+    }
+
+    if (action === "delete") {
+      if (!args.goal_id) {
+        return {
+          content: [{ type: "text", text: "Error: 'goal_id' is required." }],
+          isError: true,
+        };
+      }
+      const ok = deleteGoal(args.goal_id);
+      return {
+        content: [
+          {
+            type: "text",
+            text: ok
+              ? `Deleted goal ${args.goal_id}.`
+              : `Goal not found: ${args.goal_id}`,
+          },
+        ],
+        isError: !ok,
+      };
+    }
+
+    return {
+      content: [{ type: "text", text: `Unknown goal action: ${action}` }],
+      isError: true,
     };
   }
 
@@ -422,6 +707,10 @@ async function handleToolCall(name, args = {}, meta = {}, signal) {
     if (args.sandbox !== undefined) patch.sandbox = args.sandbox;
     if (args.workflow_mode !== undefined)
       patch.workflowMode = args.workflow_mode;
+    if (args.progression_mode !== undefined)
+      patch.progressionMode = args.progression_mode;
+    if (args.max_auto_iterations !== undefined)
+      patch.maxAutoIterations = args.max_auto_iterations;
 
     const updated =
       Object.keys(patch).length > 0 ? saveSettings(patch) : loadSettings();
@@ -432,6 +721,7 @@ async function handleToolCall(name, args = {}, meta = {}, signal) {
       `- Reasoning Effort: ${updated.reasoningEffort || `(follow default: ${toml.reasoningEffort || "auto"})`}`,
       `- Sandbox: ${updated.sandbox}`,
       `- Workflow Mode: ${updated.workflowMode}`,
+      `- Progression Mode: ${updated.progressionMode} (maxAutoIterations=${updated.maxAutoIterations})`,
       `- Ephemeral: ${updated.ephemeral}`,
     ];
 
@@ -471,6 +761,13 @@ async function handleToolCall(name, args = {}, meta = {}, signal) {
         sendProgress(progressToken, eventCount, summary);
       },
     });
+    if (opts.goalId) {
+      recordGoalExecution(opts.goalId, {
+        milestoneId: opts.milestoneId,
+        sessionId: result.sessionId,
+        incrementIteration: true,
+      });
+    }
     recordRunHistory("run", opts, result);
     return {
       content: [{ type: "text", text: formatCodexResult(result) }],
@@ -503,6 +800,13 @@ async function handleToolCall(name, args = {}, meta = {}, signal) {
         sendProgress(progressToken, eventCount, summary);
       },
     });
+    if (opts.goalId) {
+      recordGoalExecution(opts.goalId, {
+        milestoneId: opts.milestoneId,
+        sessionId: result.sessionId || args.session_id,
+        incrementIteration: true,
+      });
+    }
     recordRunHistory("resume", opts, result);
     return {
       content: [{ type: "text", text: formatCodexResult(result) }],
@@ -560,23 +864,35 @@ async function handleToolCall(name, args = {}, meta = {}, signal) {
       mode,
       sessionId: args.session_id,
       prompt: args.prompt,
+      notifyOnComplete: args.notify_on_complete,
       ...mapCommonOptions(args),
     };
     const job = jobManager.startJob(opts);
     job.promise.then(() => {
       if (job.result) recordRunHistory(mode, opts, job.result);
     });
-    const text = [
+    const prefs = loadSettings();
+    const lines = [
       `Started background Codex job.`,
       `Job ID: ${job.id}`,
       `Mode: ${job.mode}`,
       `Model: ${opts.model || "(codex default)"}`,
       `Reasoning Effort: ${opts.reasoningEffort || "(default)"}`,
       `Working Dir: ${job.cwd}`,
-      `Use codex_status(job_id="${job.id}", wait_seconds=30) to monitor progress or collect the result.`,
-    ].join("\n");
+    ];
+    if (job.goalId) {
+      lines.push(
+        `Goal: ${job.goalId}${job.milestoneId ? ` / ${job.milestoneId}` : ""}`
+      );
+    }
+    lines.push(
+      `Auto-Callback: ${job.notifyOnComplete ? `${prefs.progressionMode} (${prefs.boundConversationId ? "conversation bound" : "open Codex Bridge panel once to bind conversation"})` : "off"}`
+    );
+    lines.push(
+      `Use codex_status(job_id="${job.id}", wait_seconds=30) to poll progress or let the auto-callback wake you when finished.`
+    );
     return {
-      content: [{ type: "text", text }],
+      content: [{ type: "text", text: lines.join("\n") }],
     };
   }
 
@@ -590,7 +906,7 @@ async function handleToolCall(name, args = {}, meta = {}, signal) {
       }
       const lines = jobs.map(
         (j) =>
-          `- ${j.id} [${j.status}] session=${j.sessionId || "pending"} events=${j.eventCount} cwd=${j.cwd} | "${j.promptPreview}"`
+          `- ${j.id} [${j.status}]${j.goalId ? ` goal=${j.goalId}` : ""} session=${j.sessionId || "pending"} events=${j.eventCount} | "${j.promptPreview}"`
       );
       return {
         content: [{ type: "text", text: lines.join("\n") }],
@@ -652,7 +968,6 @@ async function handleToolCall(name, args = {}, meta = {}, signal) {
 async function handleRequest(msg) {
   const { id, method, params } = msg;
 
-  // Notifications (no id)
   if (id === undefined || id === null) {
     if (method === "notifications/cancelled") {
       const reqId = params?.requestId;
@@ -679,7 +994,7 @@ async function handleRequest(msg) {
         },
         serverInfo: SERVER_INFO,
         instructions:
-          "Use codex_run for synchronous tasks, codex_resume to continue a prior Codex session_id, codex_review for Git code reviews, codex_start/codex_status/codex_cancel for long-running or parallel Codex workers, and codex_config/codex_info to inspect or update active preferences shared with the Codex Bridge sidecar panel.",
+          "Use codex_goal to create and track persistent multi-step goals & milestones, codex_run/codex_resume/codex_review for synchronous tasks, codex_start/codex_status/codex_cancel for persistent background workers with auto-callback support, and codex_config/codex_info to inspect or update active preferences shared with the Codex Bridge sidecar panel.",
       });
       return;
     }
@@ -738,7 +1053,6 @@ async function handleRequest(msg) {
   }
 }
 
-// Stdio newline-delimited JSON-RPC transport
 let inputBuffer = "";
 process.stdin.setEncoding("utf8");
 

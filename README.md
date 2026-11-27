@@ -4,9 +4,9 @@
 
 # Codex Bridge
 
-**An Antigravity plugin with an interactive control panel and zero-dependency MCP bridge to orchestrate your local OpenAI Codex CLI.**
+**An Antigravity plugin with an interactive control panel, persistent goal & milestone board, auto-callback progression loop, and zero-dependency MCP bridge to orchestrate your local OpenAI Codex CLI.**
 
-[![Version](https://img.shields.io/badge/version-1.1.0-7c3aed?style=flat-square)](./plugin.json)
+[![Version](https://img.shields.io/badge/version-1.2.0-7c3aed?style=flat-square)](./plugin.json)
 [![Node](https://img.shields.io/badge/node-%3E%3D18.0.0-22c55e?style=flat-square)](https://nodejs.org/)
 [![Dependencies](https://img.shields.io/badge/dependencies-zero-0ea5e9?style=flat-square)](#architecture)
 [![MCP](https://img.shields.io/badge/protocol-MCP%20Stdio-f59e0b?style=flat-square)](https://modelcontextprotocol.io/)
@@ -20,32 +20,34 @@
 
 ## Why Codex Bridge?
 
-**Codex Bridge** turns your local **OpenAI Codex CLI** into a first-class coding worker inside **Google Antigravity**.
+**Codex Bridge** turns your local **OpenAI Codex CLI** into a persistent, goal-driven coding & analysis worker inside **Google Antigravity** — built specifically for iterative workflows like **backend debugging/refactoring** and **meta-analysis / data pipelines** that require continuous investigation, execution, and verification.
 
-- Let **Antigravity** analyze requirements, inspect your codebase, draft clear specifications, and review final diffs.
-- Let **Codex** execute edits, run builds/tests, perform multi-turn fixes, and handle parallel background tasks — all through native **MCP tools** and a **live side-pane UI** without leaving your conversation.
+- Let **Antigravity** analyze requirements, design verifiable milestones, inspect diffs, and verify outcomes.
+- Let **Codex** execute edits, run backend tests/scripts, resume multi-turn sessions, and wake Antigravity automatically when background runs finish.
 
 ## Features
 
-- **Native Interactive Sidecar Panel** — Appears right inside Antigravity's **Plugins** side-pane menu for one-click control over:
+- **Native Interactive Sidecar Panel** — Appears right inside Antigravity's **Plugins** side-pane menu with two clean tabs (**Control** & **Goals & Jobs**):
   - **Model selection** (auto-populated from your local `~/.codex/models_cache.json`)
   - **Reasoning effort** (dynamically adapts to each model's supported levels: `low`, `medium`, `high`, `xhigh`, `max`, `ultra`)
-  - **Sandbox policy** (`read-only`, `workspace-write`, `danger-full-access`)
-  - **Workflow mode** (*Direct execution* vs. *Plan-first confirmation*)
-  - **Live run history** with duration, token usage, status badges, and one-click `Session ID` copy
-- **One-Click Plugin Toggle** — Enable or disable the MCP server, UI panel, `codex-worker` skill, and active rules together as a single unit from Antigravity's **Customizations** page.
-- **Automatic Codex Discovery** — Automatically locates the newest `codex.exe` bundled with Codex Desktop on Windows (`%LOCALAPPDATA%\OpenAI\Codex\bin\*\codex.exe`), falls back to `codex` on `PATH`, or respects a custom `CODEX_BIN` environment variable.
-- **Sync & Async Parallel Execution** — Use synchronous calls with live MCP progress streaming for quick tasks, or spawn multiple background Codex workers in parallel with long-polling and clean process-tree cancellation.
-- **Multi-Turn Session Continuity** — Every run captures its Codex `Session ID`, allowing follow-up iterations via `codex_resume` with full context preserved.
-- **Zero External Dependencies** — Pure Node.js ESM (`>= 18`). No `npm install`, no build step, instant startup, UTF-8 `stdin` prompting (immune to Windows shell quoting and length limits).
+  - **Progression mode** (switchable live):
+    - `manual` — No automatic callbacks; wait for your next prompt.
+    - `notify` — Automatically wakes Antigravity when a background Codex job finishes so it can verify and report findings.
+    - `autonomous` — Automatically verifies completed milestones, calls `codex_resume` on failure, or advances to the next pending milestone until done (guarded by a configurable `maxAutoIterations` cap and one-click **Pause** button).
+  - **Sandbox policy** (`read-only`, `workspace-write`, `danger-full-access`) & **Briefing workflow** (`direct` vs. `plan_first`)
+- **Persistent Goal & Milestone State Machine** — Goals, ordered milestones, verification commands, blockers, and linked `Session ID`s persist on disk (`goals.json`), surviving conversation compaction and restarts.
+- **Restart-Resilient Background Jobs** — Background jobs (`codex_start`) are persisted to `jobs.json` with live event counts and captured `Session ID`s; interrupted jobs after a restart can be resumed cleanly with one click via `codex_resume`.
+- **Automatic Codex Discovery** — Automatically locates the newest `codex.exe` bundled with Codex Desktop on Windows (survives hash-folder auto-updates), falls back to `codex` on `PATH`, or respects `CODEX_BIN`.
+- **Zero External Dependencies** — Pure Node.js ESM (`>= 18`). No `npm install`, no build step, instant startup, UTF-8 `stdin` prompting.
 
 ## Architecture
 
 ```mermaid
 flowchart LR
   User["User in Antigravity"] <--> Agent["Antigravity Agent"]
-  User <--> Panel["Sidecar Control Panel<br/>(sidecars/codex_panel)"]
-  Panel <--> Store["Shared Settings & History<br/>(plugin_data/codex-bridge)"]
+  User <--> Panel["Sidecar Control Panel & Goal Watcher<br/>(sidecars/codex_panel)"]
+  Panel -->|Auto-Callback on Job Done| Agent
+  Panel <--> Store["Persistent State<br/>(settings.json / goals.json / jobs.json)"]
   Agent <-->|MCP Stdio JSON-RPC| Server["Codex MCP Bridge<br/>(server/mcp-server.js)"]
   Store <--> Server
   Server <-->|JSONL Stream + UTF-8 stdin| Codex["Local OpenAI Codex CLI<br/>(codex exec / resume / review)"]
@@ -61,8 +63,6 @@ flowchart LR
 
 ### Install
 
-Clone this repository directly into Antigravity's global plugins directory:
-
 **macOS / Linux:**
 ```bash
 git clone https://github.com/yeyuhants-prog/codex-bridge.git ~/.gemini/config/plugins/codex-bridge
@@ -75,59 +75,50 @@ git clone https://github.com/yeyuhants-prog/codex-bridge.git "$env:USERPROFILE\.
 
 ### Enable & Open the Panel
 
-1. Open **Skills & Customizations** (自定义扩展) in Antigravity's left sidebar and confirm **Codex Bridge** is toggled **ON**.
+1. Open **Skills & Customizations** (自定义扩展) in Antigravity's left sidebar and ensure **Codex Bridge** is toggled **ON**.
 2. Open the interactive control panel from the right-hand **Plugins** (`插件`) menu → **Codex Bridge**.
-3. Pick your preferred **Codex model**, **reasoning effort**, **sandbox**, and **workflow mode** — changes save immediately and apply automatically to every subsequent Codex call.
+3. Pick your **Codex model**, **reasoning effort**, **progression mode** (`manual` / `notify` / `autonomous`), and **sandbox** — opening the panel in a conversation automatically binds it for completion callbacks.
 
-## MCP Tools
+## MCP Tools (9)
 
 | Tool | Description |
 | --- | --- |
-| `codex_run` | Run a task synchronously via `codex exec` using your active panel settings (or per-call overrides). Returns response text, `Session ID`, modified files, executed commands, and token usage. |
+| `codex_goal` | Create, inspect, update milestones, pause/resume, or delete persistent multi-step Goals shared with the Sidecar goal board. |
+| `codex_run` | Run a task synchronously via `codex exec` using active panel settings (or per-call overrides). Supports optional `goal_id` & `milestone_id`. |
 | `codex_resume` | Continue a previous Codex session by `session_id` (or `"last"`) with follow-up instructions. |
 | `codex_review` | Run Codex's built-in non-interactive Git code review (`uncommitted`, `base` branch, or `commit` SHA). |
-| `codex_start` | Start a Codex task asynchronously in the background and immediately return a `job_id` (ideal for long tasks or parallel workers). |
-| `codex_status` | Inspect progress events or final output of a background job (supports `wait_seconds` long-polling), or list all tracked jobs. |
+| `codex_start` | Launch a persistent background Codex worker and return `job_id` immediately; triggers auto-callback upon completion in `notify`/`autonomous` modes. |
+| `codex_status` | Inspect progress events, `Session ID`, or final output of a background job (including restart-interrupted jobs), with optional `wait_seconds` long-polling. |
 | `codex_cancel` | Terminate a running background Codex job along with its child process tree. |
-| `codex_config` | Read or update shared preferences (`model`, `reasoning_effort`, `sandbox`, `workflow_mode`) and list available local Codex models. |
-| `codex_info` | Health check displaying resolved Codex binary path, CLI version, active panel preferences, and background job summary. |
+| `codex_config` | Read or update shared preferences (`model`, `reasoning_effort`, `sandbox`, `workflow_mode`, `progression_mode`, `max_auto_iterations`) and list local Codex models. |
+| `codex_info` | Health check showing resolved Codex binary & version, active panel settings, bound conversation, active goal progress, and tracked jobs. |
 
 ## Example Prompts
 
-Once enabled, simply talk to Antigravity naturally:
-
-- **Health & config check:**
-  > *"Check Codex Bridge status and list my available local Codex models."*
-- **Architect + worker flow:**
-  > *"Inspect `src/auth/` and write a detailed specification, then dispatch Codex to implement refresh-token rotation and run the unit tests."*
+- **Continuous backend debugging:**
+  > *"Create a persistent Codex Bridge goal to reproduce the 500 error in `backend/auth`, fix the root cause, and pass `pytest`. Start milestone 1 in the background and keep verifying until all tests pass."*
+- **Iterative meta-analysis pipeline:**
+  > *"Set up a goal with milestones for cleaning the dataset, checking heterogeneity (I² / Q-test), running sensitivity analysis, and exporting forest plots. Dispatch Codex step-by-step and verify each output table."*
 - **Code review:**
-  > *"Have Codex review my uncommitted Git changes in this repository and summarize any bugs or edge cases."*
+  > *"Have Codex review my uncommitted Git changes in this repository and summarize bugs or edge cases."*
 - **Per-call model override:**
   > *"Use `gpt-6.2-astra` with `xhigh` reasoning effort and have Codex refactor the parser module."*
-- **Parallel background workers:**
-  > *"Launch two background Codex tasks in parallel: one to add API integration tests and another to update the OpenAPI docs."*
 
 ## Environment Variables
-
-All environment variables are optional:
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `CODEX_BIN` | Auto-discovered | Explicit path to the `codex` / `codex.exe` binary. |
 | `CODEX_HOME` | `~/.codex` | Directory containing Codex's `config.toml` and `models_cache.json`. |
-| `CODEX_BRIDGE_DATA_DIR` | `~/.gemini/antigravity/plugin_data/codex-bridge` | Directory storing shared `settings.json` and `history.json`. |
+| `CODEX_BRIDGE_DATA_DIR` | `~/.gemini/antigravity/plugin_data/codex-bridge` | Directory storing `settings.json`, `goals.json`, `jobs.json`, and `history.json`. |
 
 ## Testing
 
-Run the zero-token MCP protocol & configuration smoke test:
-
 ```bash
+# Zero-token MCP protocol, settings & persistent goal board smoke test
 npm test
-```
 
-Run an end-to-end live check against your local Codex CLI (read-only, ephemeral):
-
-```bash
+# End-to-end live check against your local Codex CLI (read-only, ephemeral)
 npm run test:live
 ```
 
@@ -142,10 +133,11 @@ codex-bridge/
 ├── server/
 │   ├── mcp-server.js           # Zero-dependency MCP Stdio JSON-RPC server
 │   ├── codex-runner.js         # Codex CLI auto-discovery, spawn & JSONL parser
-│   ├── job-manager.js          # Async background worker & process-tree manager
+│   ├── goal-store.js           # Persistent Goal & Milestone state machine
+│   ├── job-manager.js          # Persistent async worker & process-tree manager
 │   └── settings-store.js       # Shared preferences, history & model catalog reader
 ├── sidecars/
-│   └── codex_panel/            # Native Antigravity interactive side-pane UI
+│   └── codex_panel/            # Native Antigravity side-pane UI & callback watcher
 │       ├── sidecar.json
 │       ├── main.mjs
 │       ├── index.html
