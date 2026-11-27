@@ -6,7 +6,7 @@
 
 **带原生交互式控制面板、持久化目标板、完工自动回调闭环与零依赖 MCP 桥接服务的 Antigravity 插件，直接指挥你本机的 OpenAI Codex CLI 持续排查、验证与推进任务。**
 
-[![Version](https://img.shields.io/badge/version-1.4.0-7c3aed?style=flat-square)](./plugin.json)
+[![Version](https://img.shields.io/badge/version-1.5.0-7c3aed?style=flat-square)](./plugin.json)
 [![Node](https://img.shields.io/badge/node-%3E%3D18.0.0-22c55e?style=flat-square)](https://nodejs.org/)
 [![Dependencies](https://img.shields.io/badge/dependencies-zero-0ea5e9?style=flat-square)](#架构一览)
 [![MCP](https://img.shields.io/badge/protocol-MCP%20Stdio-f59e0b?style=flat-square)](https://modelcontextprotocol.io/)
@@ -20,6 +20,7 @@
 
 ## 核心特性
 
+- **主脑 + 打工人分工模式（`orchestrator` / `flexible`）**：默认开启 **主脑派活模式**——反重力发挥文本规划、写清晰可执行任务单、整合阶段汇报的长板（同时保留轻量工具与其他基础插件的正常使用），把重度编码、后端排查和数据分析脚本执行全部派给 Codex，并通过 `codex_start(conversation_id=...)` 形成自动汇报闭环。
 - **原生侧边栏交互面板（中 / EN 一键切换 + 控制台/目标双页签）**：直接出现在 Antigravity 右侧「插件」菜单中，右上角支持一键切换中英文界面与回调文案，并可视化实时调整：
   - **Codex 干活模型**（自动读取本机 `~/.codex/models_cache.json` 中的全部可用模型）
   - **思考深度（Reasoning Effort）**（随模型动态适配 `low / medium / high / xhigh / max / ultra`）

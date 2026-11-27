@@ -1,63 +1,56 @@
 ---
 name: codex-worker
 description: >-
-  Orchestrate local OpenAI Codex CLI via the codex-bridge MCP server to delegate
-  backend debugging, refactoring, meta-analysis pipelines, parallel sub-tasks,
-  persistent multi-step goals, and Git code reviews. Use when the user asks to
-  have Codex do work, track a continuous goal, configure Codex settings, or
-  collaborate alongside Antigravity.
+  Orchestrate local OpenAI Codex CLI via the codex-bridge MCP server in a
+  Mastermind (Gemini) + Worker (Codex) closed loop: delegate heavy coding,
+  backend debugging, and meta-analysis/data pipelines to Codex while Gemini
+  handles specification writing, lightweight context/plugin tools, verification,
+  and stage synthesis.
 ---
 
-# Codex Worker & Continuous Goal Orchestration Guide
+# Mastermind & Codex Worker Closed-Loop Guide
 
-When the **Codex Bridge** plugin is enabled, you have direct MCP tools and an
-interactive sidecar panel (`[Codex Bridge](sidecar://codex-bridge/codex_panel/)`)
-where the user selects the Codex model, reasoning effort, sandbox policy,
-workflow mode, and **progression mode** (`manual` / `notify` / `autonomous`).
+When **Codex Bridge** is enabled, Antigravity (Gemini) and local OpenAI Codex
+work as a complementary pair controlled from `[Codex Bridge](sidecar://codex-bridge/codex_panel/)`:
 
-## Tool Selection
+- **Gemini (Mastermind / 主脑)**: Excels at requirement clarification, clear text
+  synthesis, drafting crisp executable specs, using lightweight inspection tools
+  and other Antigravity plugins, verifying stage outputs, and judging whether
+  work stays aligned with the overall goal.
+- **Codex (Worker / 打工人)**: Excels at heavy code implementation, backend
+  debugging, running Python/R data & meta-analysis pipelines, and iterative test
+  execution.
 
-- **`codex_goal`**: Persistent goal & milestone board stored on disk (survives
-  conversation compaction and restarts). Use for any multi-step backend fix,
-  experiment, or meta-analysis workflow needing repeated verification.
-  - `create`: Define title, objective, `cwd`, `acceptance_criteria`, and ordered
-    `milestones` (each with a concrete `verification` command/check).
-  - `get` / `list`: Recover full goal state and linked `session_id` anytime.
-  - `update_milestone`: Mark `in_progress` / `done` / `blocked` with verification notes.
-  - `set_status`: Pause, resume (`active`), complete, or record `blockers`.
-- **`codex_run`**: Synchronous single task for quick steps (< 2–3 min).
-- **`codex_resume`**: Continue an existing Codex session (`session_id` or `"last"`)
-  to iterate on fixes without losing codebase context.
-- **`codex_start` + `codex_status` + `codex_cancel`**: Persistent background jobs.
-  Pass `goal_id` & `milestone_id` so the Sidecar panel tracks progress and triggers
-  an automatic callback back into this conversation when the job completes (in
-  `notify` or `autonomous` progression modes).
-- **`codex_review`**: Built-in Git code review (`uncommitted`, `base`, `commit`).
-- **`codex_config` / `codex_info`**: Inspect or update panel preferences and check
-  Codex binary health + active goal progress.
+## Closed-Loop Workflow
 
-## Continuous Verification Loop (Backend & Meta-Analysis Best Practices)
+1. **Context & Goal Setup (Mastermind)**
+   - Quickly inspect directory structure or key files yourself so your spec is
+     grounded in real paths (do not guess filenames).
+   - For multi-stage work, create a persistent goal via `codex_goal(action="create", ...)`
+     with concrete `milestones` and `verification` commands.
+   - If `Workflow Mode` is `plan_first`, show the concise task brief to the user
+     for confirmation before dispatching.
 
-1. **Always check `codex_info` first** when starting a complex multi-step task to
-   see the user's current `Workflow Mode`, `Progression Mode`, and any active Goal.
-2. **Respect the user's UI panel selections**: Omit `model`, `reasoning_effort`,
-   and `sandbox` unless the user explicitly overrides them for that call.
-3. **Define verifiable milestones**: For backend changes (unit/integration tests,
-   API curl checks, schema checks) and meta-analysis pipelines (data integrity,
-   effect-size reproducibility, heterogeneity stats, plot generation), give every
-   milestone an explicit `verification` command or assertion.
-4. **Handling `[Codex Bridge Auto-Callback]` messages**:
-   - Inspect Codex's output, modified files, and command exit codes.
-   - Verify the milestone's acceptance condition (either from Codex's test output
-     or by running a quick check yourself).
-   - Call `codex_goal(action="update_milestone", ...)` to persist the outcome.
-   - If **`notify`** mode: summarize verified results and ask before dispatching
-     the next step.
-   - If **`autonomous`** mode: while the goal is `active` and below `maxIterations`,
-     keep driving forward — call `codex_resume` if verification failed, or
-     `codex_start` for the next pending milestone. Stop and report clearly when all
-     milestones are `done`, `maxIterations` is reached, or a real decision/blocker
-     needs the user.
-5. **Recovering interrupted jobs**: If `codex_status` shows `interrupted` after a
-   restart, use the preserved `session_id` with `codex_resume` or `codex_start`
-   to pick up right where Codex left off.
+2. **Dispatch Executable Spec to Codex**
+   - Write a crystal-clear prompt specifying:
+     - **Objective** & **Target files / `cwd`**
+     - **Constraints & edge cases** (what NOT to touch, schemas, units)
+     - **Verification commands** Codex must run before finishing
+   - For tasks > 1–2 minutes or multi-stage goals, use **`codex_start`** and
+     **ALWAYS pass `conversation_id` = your `<user_information>` `Conversation ID`**
+     (along with `cwd`, `goal_id`, `milestone_id`).
+   - Omit `model`, `reasoning_effort`, and `sandbox` so the user's live Sidecar
+     panel selections apply automatically.
+
+3. **Receive `[Codex Bridge Auto-Callback]` & Steer**
+   - When Codex finishes, the Sidecar validates the locked `conversation_id` via
+     `agentapi` and delivers `[Codex Bridge Auto-Callback]` back into this chat.
+   - Verify deliverables (check key output files or test summaries), update the
+     milestone via `codex_goal(action="update_milestone")`, and evaluate goal
+     alignment:
+     - **`notify` mode**: Present a clean, synthesized progress report to the
+       user and recommend the next milestone.
+     - **`autonomous` mode**: If Codex drifted or verification failed, send
+       corrective instructions via `codex_start(resume_job_id="<job_id>", conversation_id="<conv_id>", prompt="...")`;
+       if verified and pending milestones remain, immediately dispatch the next
+       milestone until the goal is achieved or a human decision is needed.

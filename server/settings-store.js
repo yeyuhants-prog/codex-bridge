@@ -40,6 +40,7 @@ export function writeJsonAtomic(filePath, data) {
 
 export const DEFAULT_SETTINGS = {
   language: "zh", // "zh" | "en"
+  roleMode: "orchestrator", // "orchestrator" | "flexible"
   model: "", // "" means follow ~/.codex/config.toml default
   reasoningEffort: "", // "" means follow model/config default
   sandbox: "workspace-write",
@@ -53,6 +54,7 @@ export const DEFAULT_SETTINGS = {
 };
 
 const VALID_LANGUAGES = new Set(["zh", "en"]);
+const VALID_ROLE_MODES = new Set(["orchestrator", "flexible"]);
 
 const VALID_SANDBOXES = new Set([
   "read-only",
@@ -88,6 +90,9 @@ export function loadSettings() {
       language: VALID_LANGUAGES.has(raw.language)
         ? raw.language
         : DEFAULT_SETTINGS.language,
+      roleMode: VALID_ROLE_MODES.has(raw.roleMode)
+        ? raw.roleMode
+        : DEFAULT_SETTINGS.roleMode,
       model: typeof raw.model === "string" ? raw.model.trim() : "",
       reasoningEffort: VALID_EFFORTS.has(raw.reasoningEffort)
         ? raw.reasoningEffort
@@ -137,6 +142,10 @@ export function saveSettings(patch = {}) {
       patch.language !== undefined && VALID_LANGUAGES.has(patch.language)
         ? patch.language
         : current.language,
+    roleMode:
+      patch.roleMode !== undefined && VALID_ROLE_MODES.has(patch.roleMode)
+        ? patch.roleMode
+        : current.roleMode,
     model:
       patch.model !== undefined
         ? String(patch.model ?? "").trim()

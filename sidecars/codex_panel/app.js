@@ -10,6 +10,11 @@ const I18N = {
     notFoundMeta: "请检查本机 Codex 安装或设置 CODEX_BIN",
     tabControl: "控制台",
     tabGoals: "目标与任务",
+    roleTitle: "分工模式（主脑 vs 打工人）",
+    roleOrch: "主脑派活模式",
+    roleOrchSub: "反重力管文本规划与基础插件，重活全交 Codex",
+    roleFlex: "按需自由协作",
+    roleFlexSub: "仅在指定或需要时调用 Codex",
     modelTitle: "Codex 干活模型",
     modelDefaultHint: (m) => `Codex 默认: ${m}`,
     modelFollowDefault: (m) => `跟随 Codex 默认 (${m})`,
@@ -132,6 +137,11 @@ const I18N = {
     notFoundMeta: "Check local Codex installation or set CODEX_BIN",
     tabControl: "Controls",
     tabGoals: "Goals & Jobs",
+    roleTitle: "Role Division (Mastermind vs Worker)",
+    roleOrch: "Mastermind Mode",
+    roleOrchSub: "Gemini plans, synthesizes & uses basic tools; heavy work to Codex",
+    roleFlex: "Flexible Mode",
+    roleFlexSub: "Invoke Codex on demand",
     modelTitle: "Codex Model",
     modelDefaultHint: (m) => `Codex default: ${m}`,
     modelFollowDefault: (m) => `Follow Codex default (${m})`,
@@ -260,6 +270,7 @@ const el = {
   tabBadge: document.getElementById("tab-badge"),
   panelControl: document.getElementById("panel-control"),
   panelGoals: document.getElementById("panel-goals"),
+  roleGroup: document.getElementById("role-group"),
   modelSelect: document.getElementById("model-select"),
   modelDefaultHint: document.getElementById("model-default-hint"),
   modelDesc: document.getElementById("model-desc"),
@@ -473,6 +484,9 @@ function renderEfforts() {
 function renderSegments() {
   const dict = t();
   const { settings } = state;
+  for (const btn of el.roleGroup.querySelectorAll(".seg-btn")) {
+    btn.classList.toggle("active", btn.dataset.role === settings.roleMode);
+  }
   for (const btn of el.progressionGroup.querySelectorAll(".seg-btn")) {
     btn.classList.toggle(
       "active",
@@ -994,6 +1008,12 @@ el.btnLang.addEventListener("click", () => {
     I18N[nextLang].toastLangSwitched
   );
 });
+
+for (const btn of el.roleGroup.querySelectorAll(".seg-btn")) {
+  btn.addEventListener("click", () => {
+    updateSetting({ roleMode: btn.dataset.role });
+  });
+}
 
 el.modelSelect.addEventListener("change", () => {
   updateSetting({ model: el.modelSelect.value });

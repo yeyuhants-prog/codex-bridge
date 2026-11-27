@@ -313,7 +313,7 @@ function buildState(query = {}) {
   const history = loadHistory();
 
   return {
-    pluginVersion: "1.4.0",
+    pluginVersion: "1.5.0",
     codex: {
       found: Boolean(resolved),
       path: resolved?.path || null,
@@ -376,6 +376,7 @@ app.api(
   (data) => {
     const settings = saveSettings({
       language: data.language,
+      roleMode: data.roleMode,
       model: data.model,
       reasoningEffort: data.reasoningEffort,
       sandbox: data.sandbox,

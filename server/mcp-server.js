@@ -34,7 +34,7 @@ import {
 
 const SERVER_INFO = {
   name: "codex-mcp-bridge",
-  version: "1.4.0",
+  version: "1.5.0",
 };
 
 const SUPPORTED_PROTOCOL_VERSIONS = [
@@ -78,10 +78,14 @@ function sendProgress(progressToken, progress, message) {
 }
 
 /**
- * Extract trusted callback destination ONLY from Antigravity host metadata or host env.
- * Never falls back to mutable global settings.boundConversationId.
+ * Extract callback destination locked onto a job at dispatch time:
+ * 1) Antigravity host _meta (if present)
+ * 2) Antigravity host env (if present)
+ * 3) Explicit conversation_id passed by the calling conversation agent from its
+ *    <user_information> Conversation ID (Sidecar verifies conversation existence
+ *    via agentapi before delivering; never falls back to mutable global state).
  */
-function extractTrustedHostCallbackTarget(meta = {}) {
+function extractTrustedHostCallbackTarget(meta = {}, args = {}) {
   const metaConv =
     meta?.conversationId ||
     meta?.conversation_id ||
@@ -119,6 +123,15 @@ function extractTrustedHostCallbackTarget(meta = {}) {
       conversationId: envConv,
       projectId: envProj,
       source: "host_env",
+    });
+  }
+
+  if (typeof args?.conversation_id === "string" && args.conversation_id.trim()) {
+    return normalizeCallbackTarget({
+      conversationId: args.conversation_id.trim(),
+      projectId:
+        typeof args.project_id === "string" ? args.project_id.trim() : "",
+      source: "agent_conversation_id",
     });
   }
 
@@ -349,6 +362,16 @@ const TOOLS = [
           description:
             "Whether the Sidecar should auto-callback the locked source conversation on completion.",
         },
+        conversation_id: {
+          type: "string",
+          description:
+            "IMPORTANT: Pass your current Antigravity Conversation ID (from <user_information>) so completion auto-callbacks route strictly back to this conversation when Codex finishes.",
+        },
+        project_id: {
+          type: "string",
+          description:
+            "Optional Antigravity Project ID associated with conversation_id (auto-resolved via agentapi if omitted).",
+        },
         ...COMMON_RUN_PROPERTIES,
         timeout_seconds: {
           type: "number",
@@ -462,6 +485,12 @@ const TOOLS = [
           type: "string",
           enum: ["zh", "en"],
           description: "UI & callback language ('zh' for Chinese, 'en' for English).",
+        },
+        role_mode: {
+          type: "string",
+          enum: ["orchestrator", "flexible"],
+          description:
+            "'orchestrator' (default): Antigravity acts as the mastermind (planning, writing specs, synthesizing reports, using lightweight tools/plugins) while delegating heavy coding/execution to Codex; 'flexible': use Codex on demand.",
         },
         model: {
           type: "string",
@@ -598,6 +627,7 @@ async function handleToolCall(name, args = {}, meta = {}, signal) {
       `Codex Version: ${version}`,
       `Active Model: ${effectiveModel}`,
       `Reasoning Effort: ${effectiveEffort}`,
+      `Role Division: ${prefs.roleMode}`,
       `Sandbox Policy: ${prefs.sandbox}`,
       `Workflow Mode: ${prefs.workflowMode}`,
       `Progression Mode: ${prefs.progressionMode} (maxAutoIterations=${prefs.maxAutoIterations})`,
@@ -762,6 +792,7 @@ async function handleToolCall(name, args = {}, meta = {}, signal) {
   if (name === "codex_config") {
     const patch = {};
     if (args.language !== undefined) patch.language = args.language;
+    if (args.role_mode !== undefined) patch.roleMode = args.role_mode;
     if (args.model !== undefined) patch.model = args.model;
     if (args.reasoning_effort !== undefined)
       patch.reasoningEffort = args.reasoning_effort;
@@ -779,6 +810,7 @@ async function handleToolCall(name, args = {}, meta = {}, signal) {
     const lines = [
       `## Active Codex Bridge Preferences`,
       `- Language: ${updated.language}`,
+      `- Role Division: ${updated.roleMode}`,
       `- Model: ${updated.model || `(follow Codex default: ${toml.model || "auto"})`}`,
       `- Reasoning Effort: ${updated.reasoningEffort || `(follow default: ${toml.reasoningEffort || "auto"})`}`,
       `- Sandbox: ${updated.sandbox}`,
@@ -1031,7 +1063,7 @@ async function handleToolCall(name, args = {}, meta = {}, signal) {
   }
 
   if (name === "codex_start") {
-    const trustedTarget = extractTrustedHostCallbackTarget(meta);
+    const trustedTarget = extractTrustedHostCallbackTarget(meta, args);
 
     // Structured resume by previous job_id
     if (args.resume_job_id) {

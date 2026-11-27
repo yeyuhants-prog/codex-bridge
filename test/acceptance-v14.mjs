@@ -55,6 +55,15 @@ class McpClient {
         }
       }
     });
+    let stderr = "";
+    this.child.stderr.setEncoding("utf8");
+    this.child.stderr.on("data", (d) => (stderr += d));
+    this.child.on("close", (code) => {
+      for (const [, { reject }] of this.pending) {
+        reject(new Error(`MCP server exited unexpectedly (code=${code}): ${stderr.slice(0, 400)}`));
+      }
+      this.pending.clear();
+    });
   }
 
   async init() {
@@ -313,7 +322,7 @@ async function runTests() {
   fs.mkdirSync(projectDir, { recursive: true });
 
   const mocks = createMockBinaries(tmpRoot);
-  const sidecarPort = 47915;
+  const sidecarPort = 47925 + Math.floor(Math.random() * 400);
   const sidecarToken = "accept-tok-14";
   const baseEnv = {
     CODEX_BRIDGE_DATA_DIR: dataDir,
@@ -602,6 +611,67 @@ async function runTests() {
     const countAfterStop = readJsonl(mocks.mockCodexLog).length;
     assert.equal(countAfterStop, countBefore + 1, "Exactly ONE new Codex process spawned after stopping old PID");
     console.log("  PASS: running_detached preserved alive PID, mutex blocked all duplicate spawns, and stop->resume spawned exactly 1 process.");
+
+    // =========================================================================
+    // ACCEPTANCE TEST 6: Shared global MCP process (no host env) locks conversation_id & verifies via agentapi
+    // =========================================================================
+    console.log("=== TEST 6: Shared MCP process (no host env) closed-loop via conversation_id ===");
+    const mcpShared = new McpClient({
+      ...baseEnv,
+      ANTIGRAVITY_CONVERSATION_ID: "",
+      ANTIGRAVITY_PROJECT_ID: "",
+      ANTIGRAVITY_SOURCE_METADATA: "",
+      MOCK_SESSION_ID: "66666666-6666-4666-8666-666666666666",
+      MOCK_HOLD_MS: "100",
+    });
+    await mcpShared.init();
+
+    const deliveriesBefore6 = readJsonl(mocks.mockAgentLog).length;
+
+    // 6a: Valid conversation_id from Gemini mastermind -> verified by Sidecar agentapi -> delivered strictly to CONV_A
+    const sharedStart = await mcpShared.callTool("codex_start", {
+      prompt: "Heavy task from Mastermind in shared MCP server",
+      cwd: projectDir,
+      sandbox: "read-only",
+      conversation_id: CONV_A,
+    });
+    const job6aId = /Job ID: (codex_[a-f0-9]+)/.exec(sharedStart.content[0].text)[1];
+
+    // Conv B refreshes panel in the meantime
+    await fetch(`http://127.0.0.1:${sidecarPort}/api/state?conversationId=${CONV_B}`);
+
+    let job6a = null;
+    for (let i = 0; i < 30; i++) {
+      const st = await (await fetch(`http://127.0.0.1:${sidecarPort}/api/state`)).json();
+      job6a = st.jobs.find((j) => j.id === job6aId);
+      if (job6a && job6a.callbackStatus === "sent") break;
+      await sleep(150);
+    }
+    assert.equal(job6a.callbackStatus, "sent", "Shared MCP job with valid conversation_id must deliver callback");
+    const deliveriesAfter6a = readJsonl(mocks.mockAgentLog);
+    assert.equal(deliveriesAfter6a.length, deliveriesBefore6 + 1);
+    assert.equal(deliveriesAfter6a[deliveriesAfter6a.length - 1].convId, CONV_A);
+    assert.equal(deliveriesAfter6a[deliveriesAfter6a.length - 1].projId, PROJ_A, "ProjectId auto-resolved via agentapi");
+
+    // 6b: Non-existent / invalid conversation_id -> rejected by agentapi -> kept safely as unrouted in panel
+    const bogusStart = await mcpShared.callTool("codex_start", {
+      prompt: "Task with stale/nonexistent conversation_id",
+      cwd: projectDir,
+      sandbox: "read-only",
+      conversation_id: "99999999-dead-4999-8999-999999999999",
+    });
+    const job6bId = /Job ID: (codex_[a-f0-9]+)/.exec(bogusStart.content[0].text)[1];
+    let job6b = null;
+    for (let i = 0; i < 30; i++) {
+      const st = await (await fetch(`http://127.0.0.1:${sidecarPort}/api/state`)).json();
+      job6b = st.jobs.find((j) => j.id === job6bId);
+      if (job6b && job6b.status === "completed" && job6b.callbackStatus !== "pending") break;
+      await sleep(150);
+    }
+    assert.equal(job6b.callbackStatus, "unrouted", "Bogus conversation_id must be marked unrouted");
+    assert.equal(job6b.callbackSent, false);
+    mcpShared.close();
+    console.log("  PASS: Shared MCP closed-loop delivered to Conv A (auto-resolved projectId) and safely quarantined invalid conversation_id.");
 
     // =========================================================================
     // BONUS REAL CLI VERIFICATION (when --real-cli passed): Real read-only resume write denial

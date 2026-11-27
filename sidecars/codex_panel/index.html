@@ -38,6 +38,23 @@
 
     <!-- TAB 1: CONTROL PANEL -->
     <main id="panel-control" class="content">
+      <!-- Role Division -->
+      <section class="card">
+        <div class="card-head">
+          <span class="card-title" data-i18n="roleTitle">分工模式（主脑 vs 打工人）</span>
+        </div>
+        <div id="role-group" class="segment-row two-col" role="radiogroup" aria-label="Role Division">
+          <button type="button" class="seg-btn" data-role="orchestrator">
+            <span class="seg-label" data-i18n="roleOrch">主脑派活模式</span>
+            <span class="seg-sub" data-i18n="roleOrchSub">反重力管文本规划与基础插件，重活全交 Codex</span>
+          </button>
+          <button type="button" class="seg-btn" data-role="flexible">
+            <span class="seg-label" data-i18n="roleFlex">按需自由协作</span>
+            <span class="seg-sub" data-i18n="roleFlexSub">仅在指定或需要时调用 Codex</span>
+          </button>
+        </div>
+      </section>
+
       <!-- Model Picker -->
       <section class="card">
         <div class="card-head">

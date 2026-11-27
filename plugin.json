@@ -1,7 +1,7 @@
 {
   "name": "codex-bridge",
   "displayName": "Codex Bridge",
-  "version": "1.4.0",
+  "version": "1.5.0",
   "author": "yeyuhants-prog",
   "repository": "https://github.com/yeyuhants-prog/codex-bridge",
   "description": "Orchestrate local OpenAI Codex CLI from Antigravity with an interactive bilingual control panel, persistent goal & milestone board, per-job locked callbacks, cross-process session locks, and zero-dependency MCP tools.",
