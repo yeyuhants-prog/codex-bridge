@@ -65,6 +65,21 @@ function apiFetch(url, options = {}) {
   });
 }
 
+async function apiJson(url, options = {}) {
+  const res = await apiFetch(url, options);
+  const text = await res.text();
+  let data = null;
+  try {
+    data = text ? JSON.parse(text) : {};
+  } catch {
+    throw new Error(`HTTP ${res.status}: ${text.slice(0, 120) || "invalid response"}`);
+  }
+  if (!res.ok) {
+    throw new Error(data?.error || `HTTP ${res.status}`);
+  }
+  return data;
+}
+
 function getCurrentConvId() {
   return window.sidecar?.conversationId || "";
 }
@@ -294,17 +309,21 @@ function renderGoals() {
     checkBtn.textContent = msIcons[ms.status] || "";
     checkBtn.title = "点击切换完成状态";
     checkBtn.addEventListener("click", async () => {
-      const nextStatus = ms.status === "done" ? "pending" : "done";
-      await apiFetch("/api/goals/milestone", {
-        method: "POST",
-        body: JSON.stringify({
-          goalId: activeGoal.id,
-          milestoneId: ms.id,
-          status: nextStatus,
-        }),
-      });
-      await fetchState(true);
-      showToast(`里程碑 ${ms.id} 已标记为 ${nextStatus}`);
+      try {
+        const nextStatus = ms.status === "done" ? "pending" : "done";
+        await apiJson("/api/goals/milestone", {
+          method: "POST",
+          body: JSON.stringify({
+            goalId: activeGoal.id,
+            milestoneId: ms.id,
+            status: nextStatus,
+          }),
+        });
+        await fetchState(true);
+        showToast(`里程碑 ${ms.id} 已标记为 ${nextStatus}`);
+      } catch (err) {
+        showToast(`更新失败: ${err.message}`, true);
+      }
     });
 
     const body = document.createElement("div");
@@ -350,13 +369,17 @@ function renderGoals() {
   const isPaused = activeGoal.status === "paused";
   btnPause.textContent = isPaused ? "恢复推进" : "暂停自动推进";
   btnPause.addEventListener("click", async () => {
-    const nextStatus = isPaused ? "active" : "paused";
-    await apiFetch("/api/goals/status", {
-      method: "POST",
-      body: JSON.stringify({ goalId: activeGoal.id, status: nextStatus }),
-    });
-    await fetchState(true);
-    showToast(isPaused ? "目标已恢复为 active" : "目标已暂停，不再自动推进");
+    try {
+      const nextStatus = isPaused ? "active" : "paused";
+      await apiJson("/api/goals/status", {
+        method: "POST",
+        body: JSON.stringify({ goalId: activeGoal.id, status: nextStatus }),
+      });
+      await fetchState(true);
+      showToast(isPaused ? "目标已恢复为 active" : "目标已暂停，不再自动推进");
+    } catch (err) {
+      showToast(`操作失败: ${err.message}`, true);
+    }
   });
   actions.appendChild(btnPause);
 
@@ -365,12 +388,16 @@ function renderGoals() {
   btnDelete.className = "mini-btn danger";
   btnDelete.textContent = "删除";
   btnDelete.addEventListener("click", async () => {
-    await apiFetch("/api/goals/delete", {
-      method: "POST",
-      body: JSON.stringify({ goalId: activeGoal.id }),
-    });
-    await fetchState(true);
-    showToast("已删除目标");
+    try {
+      await apiJson("/api/goals/delete", {
+        method: "POST",
+        body: JSON.stringify({ goalId: activeGoal.id }),
+      });
+      await fetchState(true);
+      showToast("已删除目标");
+    } catch (err) {
+      showToast(`删除失败: ${err.message}`, true);
+    }
   });
   actions.appendChild(btnDelete);
 
@@ -608,17 +635,20 @@ el.btnBindConv.addEventListener("click", async () => {
     showToast("当前不在对话侧边栏内，无法获取对话 ID", true);
     return;
   }
-  const res = await apiFetch("/api/bind-conversation", {
-    method: "POST",
-    body: JSON.stringify({ conversationId: convId }),
-  });
-  const data = await res.json();
-  if (data.ok) {
-    state.settings = data.settings;
-    renderSegments();
-    showToast("已绑定当前对话，后台任务完工将自动回调 ✓");
-  } else {
-    showToast(data.error || "绑定失败", true);
+  try {
+    const data = await apiJson("/api/bind-conversation", {
+      method: "POST",
+      body: JSON.stringify({ conversationId: convId }),
+    });
+    if (data.ok) {
+      state.settings = data.settings;
+      renderSegments();
+      showToast("已绑定当前对话，后台任务完工将自动回调 ✓");
+    } else {
+      showToast(data.error || "绑定失败", true);
+    }
+  } catch (err) {
+    showToast(`绑定失败: ${err.message}`, true);
   }
 });
 
@@ -674,38 +704,45 @@ el.newGoalForm.addEventListener("submit", async (e) => {
     .filter(Boolean)
     .map((line) => ({ title: line }));
 
-  const res = await apiFetch("/api/goals", {
-    method: "POST",
-    body: JSON.stringify({
-      title,
-      cwd: el.goalCwd.value.trim(),
-      milestones,
-    }),
-  });
-  const data = await res.json();
-  if (data.ok) {
-    state.goalsStore = data.goalsStore;
-    el.goalTitle.value = "";
-    el.goalCwd.value = "";
-    el.goalMilestones.value = "";
-    el.newGoalForm.classList.add("hidden");
-    renderGoals();
-    renderHeader();
-    showToast("已创建持久化目标 ✓");
-  } else {
-    showToast(data.error || "创建失败", true);
+  try {
+    const data = await apiJson("/api/goals", {
+      method: "POST",
+      body: JSON.stringify({
+        title,
+        cwd: el.goalCwd.value.trim(),
+        milestones,
+      }),
+    });
+    if (data.ok) {
+      state.goalsStore = data.goalsStore;
+      el.goalTitle.value = "";
+      el.goalCwd.value = "";
+      el.goalMilestones.value = "";
+      el.newGoalForm.classList.add("hidden");
+      renderGoals();
+      renderHeader();
+      showToast("已创建持久化目标 ✓");
+    } else {
+      showToast(data.error || "创建失败", true);
+    }
+  } catch (err) {
+    showToast(`创建失败: ${err.message}`, true);
   }
 });
 
 el.goalSelect.addEventListener("change", async () => {
-  await apiFetch("/api/goals/status", {
-    method: "POST",
-    body: JSON.stringify({
-      goalId: el.goalSelect.value,
-      activateOnly: true,
-    }),
-  });
-  await fetchState(true);
+  try {
+    await apiJson("/api/goals/status", {
+      method: "POST",
+      body: JSON.stringify({
+        goalId: el.goalSelect.value,
+        activateOnly: true,
+      }),
+    });
+    await fetchState(true);
+  } catch (err) {
+    showToast(`切换失败: ${err.message}`, true);
+  }
 });
 
 async function sendToConversation(message) {
