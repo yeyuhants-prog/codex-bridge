@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "codex": {
+      "command": "node",
+      "args": [
+        "server/mcp-server.js"
+      ]
+    }
+  }
+}

@@ -1,0 +1,15 @@
+{
+  "name": "codex-bridge",
+  "version": "1.0.0",
+  "description": "Antigravity plugin & zero-dependency MCP stdio bridge for orchestrating local OpenAI Codex CLI.",
+  "type": "module",
+  "main": "server/mcp-server.js",
+  "scripts": {
+    "start": "node server/mcp-server.js",
+    "test": "node test/smoke-test.mjs",
+    "test:live": "node test/smoke-test.mjs --live"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
