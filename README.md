@@ -1,42 +1,164 @@
-# Codex Bridge — Antigravity Plugin
+<div align="center">
 
-一个零依赖、可一键开关且自带**可视化交互侧边栏面板**的 **Antigravity 插件**，通过内置的 MCP (Stdio) 桥接服务让 Antigravity 直接指挥你本机的 **OpenAI Codex CLI** 干活。
+<img src="./assets/logo.png" alt="Codex Bridge Logo" width="128" height="128" />
 
-## 特性
+# Codex Bridge
 
-- **原生交互式控制面板（Sidecar UI）**：出现在 Antigravity 右侧「插件」菜单中，支持实时点选：
-  - **Codex 模型**（自动读取本机 `~/.codex/models_cache.json` 中的全部可用模型）
-  - **思考深度（Reasoning Effort）**（动态适配所选模型的 `low / medium / high / xhigh / max / ultra` 档位）
-  - **执行权限（Sandbox）**（`read-only` / `workspace-write` / `danger-full-access`）
-  - **协作方式**（`直接派活执行` 或 `先出任务单确认再执行`）
-  - **快捷发活与最近执行记录**（查看耗时、Token 消耗，一键复制 `Session ID`）
-- **插件一键开关**：在 Antigravity `自定义扩展` 页面直接开关，开启后 UI 面板、MCP 服务、协作技能（`codex-worker`）与激活规则同步上线，关闭后整体停用。
-- **自动发现 Codex**：自动定位本机 Codex Desktop 内置的最新 `codex.exe`，也支持 `PATH` 或 `CODEX_BIN` 环境变量。
-- **零外部依赖**：纯 Node.js ESM（Node >= 18），免 `npm install`，克隆即用。
+**An Antigravity plugin with an interactive control panel and zero-dependency MCP bridge to orchestrate your local OpenAI Codex CLI.**
 
-## 提供的 8 个 MCP 工具
+[![Version](https://img.shields.io/badge/version-1.1.0-7c3aed?style=flat-square)](./plugin.json)
+[![Node](https://img.shields.io/badge/node-%3E%3D18.0.0-22c55e?style=flat-square)](https://nodejs.org/)
+[![Dependencies](https://img.shields.io/badge/dependencies-zero-0ea5e9?style=flat-square)](#architecture)
+[![MCP](https://img.shields.io/badge/protocol-MCP%20Stdio-f59e0b?style=flat-square)](https://modelcontextprotocol.io/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-64748b?style=flat-square)](./LICENSE)
 
-| 工具 | 用途 |
-| --- | --- |
-| `codex_run` | 同步执行 Codex 任务（自动应用面板中选定的模型、思考深度与沙箱权限） |
-| `codex_resume` | 按 `session_id`（或 `"last"`）延续上次 Codex 会话 |
-| `codex_review` | 调用 `codex exec review` 对 Git 仓库做代码审查 |
-| `codex_start` | 后台异步启动 Codex 任务并立即返回 `job_id` |
-| `codex_status` | 查看后台任务实时进度或最终结果（支持 `wait_seconds` 长轮询） |
-| `codex_cancel` | 终止正在运行的后台 Codex 任务（清理整棵子进程树） |
-| `codex_config` | 读取/更新与侧边栏 UI 共享的默认模型、思考深度、沙箱和协作模式，并列出本地可用模型 |
-| `codex_info` | 健康检查，显示 `codex.exe` 路径、版本、当前生效的面板配置与任务概览 |
+**English** · [简体中文](./README.zh-CN.md)
 
-## 安装方式
+</div>
 
+---
+
+## Why Codex Bridge?
+
+**Codex Bridge** turns your local **OpenAI Codex CLI** into a first-class coding worker inside **Google Antigravity**.
+
+- Let **Antigravity** analyze requirements, inspect your codebase, draft clear specifications, and review final diffs.
+- Let **Codex** execute edits, run builds/tests, perform multi-turn fixes, and handle parallel background tasks — all through native **MCP tools** and a **live side-pane UI** without leaving your conversation.
+
+## Features
+
+- **Native Interactive Sidecar Panel** — Appears right inside Antigravity's **Plugins** side-pane menu for one-click control over:
+  - **Model selection** (auto-populated from your local `~/.codex/models_cache.json`)
+  - **Reasoning effort** (dynamically adapts to each model's supported levels: `low`, `medium`, `high`, `xhigh`, `max`, `ultra`)
+  - **Sandbox policy** (`read-only`, `workspace-write`, `danger-full-access`)
+  - **Workflow mode** (*Direct execution* vs. *Plan-first confirmation*)
+  - **Live run history** with duration, token usage, status badges, and one-click `Session ID` copy
+- **One-Click Plugin Toggle** — Enable or disable the MCP server, UI panel, `codex-worker` skill, and active rules together as a single unit from Antigravity's **Customizations** page.
+- **Automatic Codex Discovery** — Automatically locates the newest `codex.exe` bundled with Codex Desktop on Windows (`%LOCALAPPDATA%\OpenAI\Codex\bin\*\codex.exe`), falls back to `codex` on `PATH`, or respects a custom `CODEX_BIN` environment variable.
+- **Sync & Async Parallel Execution** — Use synchronous calls with live MCP progress streaming for quick tasks, or spawn multiple background Codex workers in parallel with long-polling and clean process-tree cancellation.
+- **Multi-Turn Session Continuity** — Every run captures its Codex `Session ID`, allowing follow-up iterations via `codex_resume` with full context preserved.
+- **Zero External Dependencies** — Pure Node.js ESM (`>= 18`). No `npm install`, no build step, instant startup, UTF-8 `stdin` prompting (immune to Windows shell quoting and length limits).
+
+## Architecture
+
+```mermaid
+flowchart LR
+  User["User in Antigravity"] <--> Agent["Antigravity Agent"]
+  User <--> Panel["Sidecar Control Panel<br/>(sidecars/codex_panel)"]
+  Panel <--> Store["Shared Settings & History<br/>(plugin_data/codex-bridge)"]
+  Agent <-->|MCP Stdio JSON-RPC| Server["Codex MCP Bridge<br/>(server/mcp-server.js)"]
+  Store <--> Server
+  Server <-->|JSONL Stream + UTF-8 stdin| Codex["Local OpenAI Codex CLI<br/>(codex exec / resume / review)"]
+```
+
+## Quick Start
+
+### Prerequisites
+
+- **Google Antigravity** (Desktop or CLI)
+- **Node.js `>= 18`**
+- **OpenAI Codex** (Codex Desktop app or `codex` CLI installed and signed in)
+
+### Install
+
+Clone this repository directly into Antigravity's global plugins directory:
+
+**macOS / Linux:**
 ```bash
 git clone https://github.com/yeyuhants-prog/codex-bridge.git ~/.gemini/config/plugins/codex-bridge
 ```
 
-## 自测
+**Windows (PowerShell):**
+```powershell
+git clone https://github.com/yeyuhants-prog/codex-bridge.git "$env:USERPROFILE\.gemini\config\plugins\codex-bridge"
+```
+
+### Enable & Open the Panel
+
+1. Open **Skills & Customizations** (自定义扩展) in Antigravity's left sidebar and confirm **Codex Bridge** is toggled **ON**.
+2. Open the interactive control panel from the right-hand **Plugins** (`插件`) menu → **Codex Bridge**.
+3. Pick your preferred **Codex model**, **reasoning effort**, **sandbox**, and **workflow mode** — changes save immediately and apply automatically to every subsequent Codex call.
+
+## MCP Tools
+
+| Tool | Description |
+| --- | --- |
+| `codex_run` | Run a task synchronously via `codex exec` using your active panel settings (or per-call overrides). Returns response text, `Session ID`, modified files, executed commands, and token usage. |
+| `codex_resume` | Continue a previous Codex session by `session_id` (or `"last"`) with follow-up instructions. |
+| `codex_review` | Run Codex's built-in non-interactive Git code review (`uncommitted`, `base` branch, or `commit` SHA). |
+| `codex_start` | Start a Codex task asynchronously in the background and immediately return a `job_id` (ideal for long tasks or parallel workers). |
+| `codex_status` | Inspect progress events or final output of a background job (supports `wait_seconds` long-polling), or list all tracked jobs. |
+| `codex_cancel` | Terminate a running background Codex job along with its child process tree. |
+| `codex_config` | Read or update shared preferences (`model`, `reasoning_effort`, `sandbox`, `workflow_mode`) and list available local Codex models. |
+| `codex_info` | Health check displaying resolved Codex binary path, CLI version, active panel preferences, and background job summary. |
+
+## Example Prompts
+
+Once enabled, simply talk to Antigravity naturally:
+
+- **Health & config check:**
+  > *"Check Codex Bridge status and list my available local Codex models."*
+- **Architect + worker flow:**
+  > *"Inspect `src/auth/` and write a detailed specification, then dispatch Codex to implement refresh-token rotation and run the unit tests."*
+- **Code review:**
+  > *"Have Codex review my uncommitted Git changes in this repository and summarize any bugs or edge cases."*
+- **Per-call model override:**
+  > *"Use `gpt-6.2-astra` with `xhigh` reasoning effort and have Codex refactor the parser module."*
+- **Parallel background workers:**
+  > *"Launch two background Codex tasks in parallel: one to add API integration tests and another to update the OpenAPI docs."*
+
+## Environment Variables
+
+All environment variables are optional:
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `CODEX_BIN` | Auto-discovered | Explicit path to the `codex` / `codex.exe` binary. |
+| `CODEX_HOME` | `~/.codex` | Directory containing Codex's `config.toml` and `models_cache.json`. |
+| `CODEX_BRIDGE_DATA_DIR` | `~/.gemini/antigravity/plugin_data/codex-bridge` | Directory storing shared `settings.json` and `history.json`. |
+
+## Testing
+
+Run the zero-token MCP protocol & configuration smoke test:
 
 ```bash
 npm test
-# 如需真实调用一次只读 codex_run：
+```
+
+Run an end-to-end live check against your local Codex CLI (read-only, ephemeral):
+
+```bash
 npm run test:live
 ```
+
+## Project Structure
+
+```text
+codex-bridge/
+├── plugin.json                 # Antigravity plugin manifest
+├── mcp_config.json             # Portable MCP server definition
+├── assets/
+│   └── logo.png                # Plugin icon (512×512 transparent PNG)
+├── server/
+│   ├── mcp-server.js           # Zero-dependency MCP Stdio JSON-RPC server
+│   ├── codex-runner.js         # Codex CLI auto-discovery, spawn & JSONL parser
+│   ├── job-manager.js          # Async background worker & process-tree manager
+│   └── settings-store.js       # Shared preferences, history & model catalog reader
+├── sidecars/
+│   └── codex_panel/            # Native Antigravity interactive side-pane UI
+│       ├── sidecar.json
+│       ├── main.mjs
+│       ├── index.html
+│       ├── app.js
+│       └── styles.css
+├── skills/
+│   └── codex-worker/SKILL.md   # Orchestration skill for Antigravity
+├── rules/
+│   └── AGENTS.md               # Active rules while plugin is enabled
+└── test/
+    └── smoke-test.mjs          # End-to-end MCP smoke test
+```
+
+## License
+
+Released under the [MIT License](./LICENSE).

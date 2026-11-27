@@ -1,6 +1,7 @@
 {
   "name": "codex-bridge",
   "version": "1.1.0",
+  "license": "MIT",
   "description": "Antigravity plugin & zero-dependency MCP stdio bridge for orchestrating local OpenAI Codex CLI.",
   "type": "module",
   "main": "server/mcp-server.js",
