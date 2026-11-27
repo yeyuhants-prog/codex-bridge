@@ -34,10 +34,7 @@ const I18N = {
     progAuto: "持续自动推进",
     progAutoSub: "自动验收→返工/下一步",
     maxIterLabel: "自动推进轮次上限",
-    bindConvBtn: "绑定当前对话",
-    boundCurrent: "已绑定当前对话 ✓",
-    boundOther: (id) => `已绑定对话 ${id}…`,
-    unbound: "未绑定回调对话",
+    perJobRoutingBadge: "按任务锁定原对话 ✓",
     sandboxTitle: "执行权限（Sandbox）与派活方式",
     sbReadOnly: "只读分析",
     sbWrite: "工作区可写",
@@ -71,10 +68,22 @@ const I18N = {
     jobsTitle: "后台 Codex 任务（断点可续接）",
     jobsCount: (n) => `${n} 个`,
     emptyJobs: "暂无后台任务记录（使用 codex_start 启动后会实时显示）。",
-    cbSent: "已自动回调 ✓",
-    cbPending: "完工将自动回调",
-    resumeSessionBtn: "续跑 Session",
+    cbSent: "已回调原对话 ✓",
+    cbFailed: "回调失败",
+    cbPending: "完工将回调原对话",
+    cbUnrouted: "仅面板查看（无绑定来源）",
+    cbSkipped: "未启用回调",
+    retryCbBtn: "重试回调",
+    resumeJobBtn: "结构化续跑",
+    stopJobBtn: "停止原进程",
+    noSessionHint: "无 Session ID（需人工处理）",
+    detachedBanner: (pid) => `原进程仍在运行 (PID ${pid || "?"})，请等待结束或先停止后再续跑`,
     checkProgressBtn: "查进度",
+    toastResumedNew: (id) => `已启动续跑任务 ${id}（保留原目录与权限）✓`,
+    toastResumedReused: (id, st) => `该 Session 已有活跃任务 ${id} (${st})，未重复启动`,
+    toastStopped: (id) => `已停止任务 ${id} 并释放 Session 锁 ✓`,
+    toastRetryOk: (id) => `已成功补发回调到原对话 (${id}) ✓`,
+    toastRetryFail: (m) => `重试回调失败: ${m}`,
     historyTitle: "最近执行记录",
     historyCount: (n) => `${n} 条`,
     emptyHistory: "还没有执行记录，派 Codex 干一单后会显示在这里～",
@@ -147,10 +156,7 @@ const I18N = {
     progAuto: "Autonomous",
     progAutoSub: "Verify → fix or advance milestones",
     maxIterLabel: "Max auto-iterations",
-    bindConvBtn: "Bind Conversation",
-    boundCurrent: "Bound to this chat ✓",
-    boundOther: (id) => `Bound to ${id}…`,
-    unbound: "No conversation bound",
+    perJobRoutingBadge: "Per-job locked routing ✓",
     sandboxTitle: "Sandbox Policy & Briefing Mode",
     sbReadOnly: "Read-only",
     sbWrite: "Workspace Write",
@@ -184,10 +190,22 @@ const I18N = {
     jobsTitle: "Background Codex Jobs (Resumable)",
     jobsCount: (n) => `${n}`,
     emptyJobs: "No background jobs yet (jobs launched via codex_start appear here).",
-    cbSent: "Callback sent ✓",
-    cbPending: "Will auto-callback",
-    resumeSessionBtn: "Resume Session",
+    cbSent: "Delivered to source chat ✓",
+    cbFailed: "Callback failed",
+    cbPending: "Will callback source chat",
+    cbUnrouted: "Panel-only (no bound source)",
+    cbSkipped: "Callback off",
+    retryCbBtn: "Retry Callback",
+    resumeJobBtn: "Resume Job",
+    stopJobBtn: "Stop Process",
+    noSessionHint: "No Session ID (manual)",
+    detachedBanner: (pid) => `Original process still running (PID ${pid || "?"}). Wait or stop before resuming.`,
     checkProgressBtn: "Check Status",
+    toastResumedNew: (id) => `Started resumed job ${id} (preserved cwd & sandbox) ✓`,
+    toastResumedReused: (id, st) => `Session already active in ${id} (${st}); reused instead of spawning a duplicate`,
+    toastStopped: (id) => `Stopped job ${id} & released session lock ✓`,
+    toastRetryOk: (id) => `Callback retried & delivered to source chat (${id}) ✓`,
+    toastRetryFail: (m) => `Retry callback failed: ${m}`,
     historyTitle: "Recent Runs",
     historyCount: (n) => `${n}`,
     emptyHistory: "No recent runs yet.",
@@ -251,7 +269,6 @@ const el = {
   progressionGroup: document.getElementById("progression-group"),
   bindBadge: document.getElementById("bind-badge"),
   maxIterInput: document.getElementById("max-iter-input"),
-  btnBindConv: document.getElementById("btn-bind-conv"),
   sandboxGroup: document.getElementById("sandbox-group"),
   workflowGroup: document.getElementById("workflow-group"),
   toggleEphemeral: document.getElementById("toggle-ephemeral"),
@@ -375,7 +392,9 @@ function renderHeader() {
     el.codexMeta.textContent = dict.notFoundMeta;
   }
 
-  const runningJobs = (state.jobs || []).filter((j) => j.status === "running").length;
+  const runningJobs = (state.jobs || []).filter(
+    (j) => j.status === "running" || j.status === "running_detached"
+  ).length;
   const activeGoals = (state.goalsStore?.goals || []).filter((g) => g.status === "active").length;
   const badgeNum = runningJobs || activeGoals;
   el.tabBadge.textContent = String(badgeNum);
@@ -472,17 +491,8 @@ function renderSegments() {
   el.toggleEphemeral.checked = Boolean(settings.ephemeral);
   el.maxIterInput.value = String(settings.maxAutoIterations || 12);
 
-  const curConv = getCurrentConvId();
-  if (settings.boundConversationId) {
-    const isCurrent = curConv && settings.boundConversationId === curConv;
-    el.bindBadge.textContent = isCurrent
-      ? dict.boundCurrent
-      : dict.boundOther(settings.boundConversationId.slice(0, 8));
-    el.bindBadge.className = "hint ok";
-  } else {
-    el.bindBadge.textContent = dict.unbound;
-    el.bindBadge.className = "hint";
-  }
+  el.bindBadge.textContent = dict.perJobRoutingBadge;
+  el.bindBadge.className = "hint ok";
 }
 
 function renderGoals() {
@@ -698,7 +708,7 @@ function renderJobs() {
     return;
   }
 
-  for (const job of jobs.slice(0, 8)) {
+  for (const job of jobs.slice(0, 10)) {
     const row = document.createElement("div");
     row.className = "history-item";
 
@@ -711,55 +721,158 @@ function renderJobs() {
     left.appendChild(badge);
     left.appendChild(
       document.createTextNode(
-        ` ${job.id}${job.goalId ? ` · ${job.goalId}` : ""}`
+        ` ${job.id}${job.parentJobId ? ` ← ${job.parentJobId}` : ""}${job.goalId ? ` · ${job.goalId}` : ""}`
       )
     );
     const right = document.createElement("span");
-    right.textContent = `${job.eventCount || 0} events · ${formatTime(job.startedAt)}`;
+    right.textContent = `${job.sandbox || "workspace-write"} · ${job.eventCount || 0} ev · ${formatTime(job.startedAt)}`;
     top.append(left, right);
 
     const prompt = document.createElement("div");
     prompt.className = "history-prompt";
     prompt.textContent = job.promptPreview || dict.noPromptPreview;
 
+    const subline = document.createElement("div");
+    subline.className = "job-subline";
+    subline.textContent = [
+      job.cwd || "",
+      job.sessionId ? `sid:${job.sessionId.slice(0, 8)}…` : dict.noSessionHint,
+    ]
+      .filter(Boolean)
+      .join(" · ");
+
+    row.append(top, prompt, subline);
+
+    if (job.status === "running_detached") {
+      const alert = document.createElement("div");
+      alert.className = "job-alert";
+      alert.textContent = dict.detachedBanner(job.pid);
+      row.appendChild(alert);
+    }
+
+    if (job.callbackStatus === "failed" && job.callbackError) {
+      const errBanner = document.createElement("div");
+      errBanner.className = "job-alert error";
+      errBanner.textContent = `${dict.cbFailed}: ${job.callbackError}`;
+      row.appendChild(errBanner);
+    }
+
     const foot = document.createElement("div");
     foot.className = "history-foot";
-    const cbNote = job.callbackSent
-      ? dict.cbSent
-      : job.notifyOnComplete && job.status === "running"
-        ? dict.cbPending
-        : job.model || "default";
-    const metaText = document.createElement("span");
-    metaText.textContent = cbNote;
-    foot.appendChild(metaText);
+
+    const cbTag = document.createElement("span");
+    const cbStatus = job.callbackStatus || (job.callbackSent ? "sent" : "skipped");
+    cbTag.className = `cb-tag ${cbStatus}`;
+    if (cbStatus === "sent") {
+      cbTag.textContent = dict.cbSent;
+    } else if (cbStatus === "failed") {
+      cbTag.textContent = dict.cbFailed;
+    } else if (cbStatus === "unrouted") {
+      cbTag.textContent = dict.cbUnrouted;
+      if (job.callbackError) cbTag.title = job.callbackError;
+    } else if (cbStatus === "pending") {
+      cbTag.textContent = dict.cbPending;
+    } else {
+      cbTag.textContent = dict.cbSkipped;
+    }
+    foot.appendChild(cbTag);
 
     const footActions = document.createElement("div");
     footActions.className = "foot-actions";
 
-    if (job.sessionId) {
+    if (cbStatus === "failed" && job.callbackTarget?.conversationId) {
+      const retryBtn = document.createElement("button");
+      retryBtn.type = "button";
+      retryBtn.className = "copy-sid";
+      retryBtn.textContent = dict.retryCbBtn;
+      retryBtn.addEventListener("click", async () => {
+        try {
+          const data = await apiJson("/api/jobs/retry-callback", {
+            method: "POST",
+            body: JSON.stringify({ jobId: job.id }),
+          });
+          if (data.jobs) state.jobs = data.jobs;
+          renderJobs();
+          if (data.ok) {
+            showToast(t().toastRetryOk(job.id));
+          } else {
+            showToast(t().toastRetryFail(data.error || data.status), true);
+          }
+        } catch (err) {
+          showToast(t().toastRetryFail(err.message), true);
+        }
+      });
+      footActions.appendChild(retryBtn);
+    }
+
+    const isActiveJob =
+      job.status === "running" || job.status === "running_detached";
+
+    if (isActiveJob) {
+      const stopBtn = document.createElement("button");
+      stopBtn.type = "button";
+      stopBtn.className = "copy-sid";
+      stopBtn.textContent = dict.stopJobBtn;
+      stopBtn.addEventListener("click", async () => {
+        try {
+          const data = await apiJson("/api/jobs/stop", {
+            method: "POST",
+            body: JSON.stringify({ jobId: job.id }),
+          });
+          if (data.jobs) state.jobs = data.jobs;
+          renderAll();
+          if (data.ok) {
+            showToast(t().toastStopped(job.id));
+          } else {
+            showToast(t().toastActionErr(data.error || "stop failed"), true);
+          }
+        } catch (err) {
+          showToast(t().toastActionErr(err.message), true);
+        }
+      });
+      footActions.appendChild(stopBtn);
+
+      if (job.status === "running") {
+        const checkBtn = document.createElement("button");
+        checkBtn.type = "button";
+        checkBtn.className = "copy-sid";
+        checkBtn.textContent = dict.checkProgressBtn;
+        checkBtn.addEventListener("click", async () => {
+          await sendToConversation(t().msgCheckJob(job.id));
+        });
+        footActions.appendChild(checkBtn);
+      }
+    } else if (job.sessionId && job.sessionId !== "last") {
+      // Structured resume by old job_id directly via Sidecar backend (preserves cwd, sandbox, goal, milestone)
       const resumeBtn = document.createElement("button");
       resumeBtn.type = "button";
       resumeBtn.className = "copy-sid";
-      resumeBtn.textContent = dict.resumeSessionBtn;
+      resumeBtn.textContent = dict.resumeJobBtn;
       resumeBtn.addEventListener("click", async () => {
-        await sendToConversation(t().msgResumeJob(job.sessionId, job.id));
+        try {
+          const data = await apiJson("/api/jobs/resume", {
+            method: "POST",
+            body: JSON.stringify({
+              jobId: job.id,
+              conversationId: getCurrentConvId(),
+            }),
+          });
+          if (data.jobs) state.jobs = data.jobs;
+          renderAll();
+          if (data.reused) {
+            showToast(t().toastResumedReused(data.job.id, data.job.status));
+          } else {
+            showToast(t().toastResumedNew(data.job.id));
+          }
+        } catch (err) {
+          showToast(t().toastActionErr(err.message), true);
+        }
       });
       footActions.appendChild(resumeBtn);
     }
 
-    if (job.status === "running") {
-      const checkBtn = document.createElement("button");
-      checkBtn.type = "button";
-      checkBtn.className = "copy-sid";
-      checkBtn.textContent = dict.checkProgressBtn;
-      checkBtn.addEventListener("click", async () => {
-        await sendToConversation(t().msgCheckJob(job.id));
-      });
-      footActions.appendChild(checkBtn);
-    }
-
     foot.appendChild(footActions);
-    row.append(top, prompt, foot);
+    row.appendChild(foot);
     el.jobsList.appendChild(row);
   }
 }
@@ -895,29 +1008,6 @@ for (const btn of el.progressionGroup.querySelectorAll(".seg-btn")) {
 el.maxIterInput.addEventListener("change", () => {
   const val = Math.max(1, Math.min(100, parseInt(el.maxIterInput.value, 10) || 12));
   updateSetting({ maxAutoIterations: val });
-});
-
-el.btnBindConv.addEventListener("click", async () => {
-  const convId = getCurrentConvId();
-  if (!convId) {
-    showToast(t().toastNoConv, true);
-    return;
-  }
-  try {
-    const data = await apiJson("/api/bind-conversation", {
-      method: "POST",
-      body: JSON.stringify({ conversationId: convId }),
-    });
-    if (data.ok) {
-      state.settings = data.settings;
-      renderSegments();
-      showToast(t().toastBound);
-    } else {
-      showToast(data.error || t().toastActionErr("bind"), true);
-    }
-  } catch (err) {
-    showToast(t().toastActionErr(err.message), true);
-  }
 });
 
 for (const btn of el.sandboxGroup.querySelectorAll(".seg-btn")) {

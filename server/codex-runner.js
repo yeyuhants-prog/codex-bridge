@@ -5,6 +5,50 @@ import os from "node:os";
 
 const IS_WINDOWS = process.platform === "win32";
 
+export const SANDBOX_RANK = {
+  "read-only": 0,
+  "workspace-write": 1,
+  "danger-full-access": 2,
+};
+
+/**
+ * Validate sandbox permission transitions when resuming a prior session/job.
+ * - Defaults to preserving originalSandbox when requestedSandbox is omitted.
+ * - Tightening permissions is always allowed.
+ * - Widening permissions requires explicit allowEscalation === true.
+ */
+export function resolveResumeSandbox({
+  requestedSandbox,
+  originalSandbox,
+  fallbackSandbox = "workspace-write",
+  allowEscalation = false,
+} = {}) {
+  const orig =
+    originalSandbox && Object.hasOwn(SANDBOX_RANK, originalSandbox)
+      ? originalSandbox
+      : null;
+
+  if (!requestedSandbox) {
+    return orig || fallbackSandbox;
+  }
+
+  if (!Object.hasOwn(SANDBOX_RANK, requestedSandbox)) {
+    throw new Error(`Invalid sandbox mode: ${requestedSandbox}`);
+  }
+
+  if (
+    orig &&
+    SANDBOX_RANK[requestedSandbox] > SANDBOX_RANK[orig] &&
+    !allowEscalation
+  ) {
+    throw new Error(
+      `Refusing to widen sandbox on resume from '${orig}' to '${requestedSandbox}'. Pass allow_sandbox_escalation=true to explicitly confirm.`
+    );
+  }
+
+  return requestedSandbox;
+}
+
 /**
  * Resolve the Codex CLI binary path.
  * Priority:
@@ -18,7 +62,6 @@ export function resolveCodexBinary() {
     return { path: envBin, source: "CODEX_BIN" };
   }
 
-  // Check PATH
   try {
     const locator = IS_WINDOWS ? "where.exe" : "which";
     const out = execFileSync(locator, ["codex"], {
@@ -37,7 +80,6 @@ export function resolveCodexBinary() {
     // Not on PATH; continue to desktop app discovery.
   }
 
-  // Check Windows Codex Desktop bundled binaries
   if (IS_WINDOWS) {
     const localAppData =
       process.env.LOCALAPPDATA || path.join(os.homedir(), "AppData", "Local");
@@ -76,6 +118,41 @@ export function getCodexVersion(codexPath) {
   }
 }
 
+export function killPidTree(pid) {
+  const n = Number(pid);
+  if (!Number.isInteger(n) || n <= 0) return false;
+  if (IS_WINDOWS) {
+    try {
+      execFileSync("taskkill", ["/pid", String(n), "/T", "/F"], {
+        stdio: "ignore",
+        windowsHide: true,
+        timeout: 5000,
+      });
+      return true;
+    } catch {
+      try {
+        process.kill(n, "SIGKILL");
+        return true;
+      } catch {
+        return false;
+      }
+    }
+  }
+  try {
+    process.kill(n, "SIGTERM");
+    setTimeout(() => {
+      try {
+        process.kill(n, "SIGKILL");
+      } catch {
+        // ignore
+      }
+    }, 2000).unref();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export function killProcessTree(child) {
   if (!child || child.exitCode !== null || child.killed) return;
   if (IS_WINDOWS && child.pid) {
@@ -105,21 +182,24 @@ export function killProcessTree(child) {
   }
 }
 
-function appendCommonConfigArgs(args, opts) {
+function appendCommonConfigArgs(args, opts, { allowProfile = true } = {}) {
   if (opts.model) {
     args.push("-m", String(opts.model));
   }
-  if (opts.profile) {
+  if (allowProfile && opts.profile) {
     args.push("-p", String(opts.profile));
   }
   const configList = Array.isArray(opts.config) ? [...opts.config] : [];
   if (
     opts.reasoningEffort &&
-    !configList.some((kv) =>
-      typeof kv === "string" && kv.trim().startsWith("model_reasoning_effort=")
+    !configList.some(
+      (kv) =>
+        typeof kv === "string" && kv.trim().startsWith("model_reasoning_effort=")
     )
   ) {
-    configList.push(`model_reasoning_effort="${String(opts.reasoningEffort).trim()}"`);
+    configList.push(
+      `model_reasoning_effort="${String(opts.reasoningEffort).trim()}"`
+    );
   }
   for (const kv of configList) {
     if (typeof kv === "string" && kv.trim()) {
@@ -169,24 +249,50 @@ export function buildCodexArgs(mode, opts) {
         }
       }
     }
-    appendCommonConfigArgs(args, opts);
+    appendCommonConfigArgs(args, opts, { allowProfile: true });
     args.push("-");
     return { args, stdinPrompt: opts.prompt || "" };
   }
 
   if (mode === "resume") {
+    const sid = typeof opts.sessionId === "string" ? opts.sessionId.trim() : "";
+    if (!sid || sid === "last") {
+      if (opts.allowLastFallback !== true) {
+        throw new Error(
+          "An exact Codex session_id is required to resume (automatic fallback to 'last' is disabled)."
+        );
+      }
+    }
+    // IMPORTANT: Codex CLI requires -C / --cd and -s / --sandbox BEFORE the `resume` subcommand.
+    if (opts.cwd) {
+      args.push("-C", opts.cwd);
+    }
+    const sandbox = opts.sandbox || "workspace-write";
+    if (!opts.dangerouslyBypassSandbox) {
+      args.push("-s", sandbox);
+    }
+    if (Array.isArray(opts.addDirs)) {
+      for (const dir of opts.addDirs) {
+        if (typeof dir === "string" && dir.trim()) {
+          args.push("--add-dir", dir.trim());
+        }
+      }
+    }
     args.push("resume", "--json");
-    appendCommonConfigArgs(args, opts);
-    if (!opts.sessionId || opts.sessionId === "last") {
+    appendCommonConfigArgs(args, opts, { allowProfile: false });
+    if (!sid || sid === "last") {
       args.push("--last");
     } else {
-      args.push(String(opts.sessionId));
+      args.push(sid);
     }
     args.push("-");
     return { args, stdinPrompt: opts.prompt || "" };
   }
 
   if (mode === "review") {
+    if (opts.cwd) {
+      args.push("-C", opts.cwd);
+    }
     args.push("review", "--json");
     if (opts.uncommitted) {
       args.push("--uncommitted");
@@ -198,7 +304,7 @@ export function buildCodexArgs(mode, opts) {
     if (opts.title) {
       args.push("--title", String(opts.title));
     }
-    appendCommonConfigArgs(args, { ...opts, skipGitRepoCheck: false });
+    appendCommonConfigArgs(args, { ...opts, skipGitRepoCheck: false }, { allowProfile: false });
     if (opts.prompt && opts.prompt.trim()) {
       args.push("-");
       return { args, stdinPrompt: opts.prompt };
@@ -209,9 +315,6 @@ export function buildCodexArgs(mode, opts) {
   throw new Error(`Unsupported Codex mode: ${mode}`);
 }
 
-/**
- * Summarize a Codex JSONL event for progress notifications and structured output.
- */
 function summarizeEvent(evt) {
   if (!evt || typeof evt !== "object") return null;
   const type = evt.type || "unknown";
@@ -263,11 +366,6 @@ function summarizeEvent(evt) {
 const RECOVERABLE_ERROR_RE =
   /reconnecting|stream disconnected|retrying|temporarily unavailable|connection reset|econnreset/i;
 
-/**
- * Pure verdict helper (exported for unit tests).
- * Distinguishes fatal turn failures from transient reconnect warnings or
- * post-completion shutdown exit codes when `turn.completed` already succeeded.
- */
 export function evaluateRunOutcome({
   exitCode,
   timedOut,
@@ -285,7 +383,6 @@ export function evaluateRunOutcome({
   }
 
   if (turnCompleted) {
-    // Earlier transient errors that did not prevent turn.completed are downgraded to warnings.
     if (finalErrors.length > 0) {
       for (const e of finalErrors) {
         finalWarnings.push(`Recovered before turn.completed: ${e}`);
@@ -304,18 +401,6 @@ export function evaluateRunOutcome({
   return { ok, errors: finalErrors, warnings: finalWarnings };
 }
 
-/**
- * Run a Codex CLI invocation and parse its JSONL event stream.
- *
- * @param {object} options
- * @param {"run"|"resume"|"review"} options.mode
- * @param {string} [options.cwd]
- * @param {string} [options.prompt]
- * @param {number} [options.timeoutMs]
- * @param {AbortSignal} [options.signal]
- * @param {(info: { eventCount: number, summary: string, event: any }) => void} [options.onProgress]
- * @param {(child: import("node:child_process").ChildProcess) => void} [options.onSpawn]
- */
 export function runCodex(options) {
   const resolved = resolveCodexBinary();
   if (!resolved) {
@@ -331,10 +416,13 @@ export function runCodex(options) {
     return Promise.reject(new Error(`Working directory does not exist: ${cwd}`));
   }
 
-  const { args, stdinPrompt } = buildCodexArgs(options.mode, {
-    ...options,
-    cwd,
-  });
+  let built;
+  try {
+    built = buildCodexArgs(options.mode, { ...options, cwd });
+  } catch (err) {
+    return Promise.reject(err);
+  }
+  const { args, stdinPrompt } = built;
 
   const timeoutMs =
     typeof options.timeoutMs === "number" && options.timeoutMs > 0
@@ -343,7 +431,13 @@ export function runCodex(options) {
 
   return new Promise((resolve, reject) => {
     const startedAt = Date.now();
-    const child = spawn(resolved.path, args, {
+    // On Windows, .cmd/.bat shims (e.g. mock test scripts) need cmd.exe /c if CODEX_BIN ends in .cmd/.bat
+    const isBatchScript =
+      IS_WINDOWS && /\.(cmd|bat)$/i.test(resolved.path);
+    const spawnCmd = isBatchScript ? process.env.ComSpec || "cmd.exe" : resolved.path;
+    const spawnArgs = isBatchScript ? ["/c", resolved.path, ...args] : args;
+
+    const child = spawn(spawnCmd, spawnArgs, {
       cwd,
       env: { ...process.env },
       stdio: ["pipe", "pipe", "pipe"],
@@ -351,11 +445,11 @@ export function runCodex(options) {
     });
 
     if (typeof options.onSpawn === "function") {
-      options.onSpawn(child);
+      options.onSpawn(child, { args });
     }
 
     const state = {
-      sessionId: null,
+      sessionId: options.sessionId && options.sessionId !== "last" ? options.sessionId : null,
       messages: [],
       commands: [],
       fileChanges: [],
@@ -539,7 +633,9 @@ export function runCodex(options) {
         signal,
         durationMs,
         codexBinary: resolved.path,
+        cliArgs: args,
         cwd,
+        sandbox: options.sandbox || "workspace-write",
         sessionId: state.sessionId,
         lastMessage,
         messages: state.messages,
@@ -556,7 +652,6 @@ export function runCodex(options) {
       });
     });
 
-    // Write prompt to stdin and close it so Codex starts immediately.
     if (stdinPrompt !== null && stdinPrompt !== undefined) {
       child.stdin.write(stdinPrompt, "utf8");
     }
@@ -579,6 +674,7 @@ export function formatCodexResult(result) {
     statusLine,
     `Session ID: ${result.sessionId || "(none)"}`,
     `Working Dir: ${result.cwd}`,
+    `Sandbox: ${result.sandbox || "workspace-write"}`,
     `Duration: ${(result.durationMs / 1000).toFixed(1)}s`,
   ];
 

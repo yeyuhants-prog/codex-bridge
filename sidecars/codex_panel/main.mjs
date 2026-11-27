@@ -25,8 +25,10 @@ import {
   deleteGoal,
 } from "../../server/goal-store.js";
 import {
-  readPersistedJobs,
-  markJobCallbackSent,
+  JobManager,
+  normalizeCallbackTarget,
+  reconcilePersistedJobs,
+  updateJobCallbackState,
 } from "../../server/job-manager.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -35,46 +37,55 @@ const LOGO_PATH = join(PLUGIN_ROOT, "assets", "logo.png");
 const ID_RE = /^[0-9a-f-]{8,}$/i;
 
 const app = new SidecarApp();
+const jobManager = new JobManager();
 
 function readText(file) {
   return readFileSync(join(__dirname, file), "utf-8");
 }
 
-function resolveProjectIdForConversation(conversationId) {
-  if (!conversationId || !ID_RE.test(conversationId)) return "";
+/**
+ * Validate a conversationId against Antigravity's agentapi metadata endpoint
+ * and return its authoritative { conversationId, projectId } or { valid: false }.
+ */
+function verifyConversationTarget(conversationId, fallbackProjectId = "") {
+  if (!conversationId || !ID_RE.test(conversationId)) {
+    return { valid: false, reason: "Invalid conversationId format." };
+  }
   try {
     const data = app.getConversationMetadata(conversationId);
+    if (data && data.error) {
+      return { valid: false, reason: String(data.error) };
+    }
     const metaEvent =
       data?.response?.conversationMetadata ||
-      data?.response?.conversation_metadata;
+      data?.response?.conversation_metadata ||
+      data?.conversationMetadata ||
+      data?.conversation_metadata;
     const meta = metaEvent?.metadata;
-    return meta?.projectId || meta?.project_id || "";
-  } catch {
-    return "";
+    if (!meta) {
+      return {
+        valid: false,
+        reason: "Conversation metadata not found or expired.",
+      };
+    }
+    const projectId =
+      meta.projectId || meta.project_id || fallbackProjectId || "";
+    return { valid: true, conversationId, projectId };
+  } catch (err) {
+    return {
+      valid: false,
+      reason: err?.message || "Failed to verify conversation metadata.",
+    };
   }
-}
-
-function maybeBindConversation(conversationId, explicitProjectId = "") {
-  if (!conversationId || !ID_RE.test(conversationId)) return null;
-  const current = loadSettings();
-  if (
-    current.boundConversationId === conversationId &&
-    (current.boundProjectId || !explicitProjectId)
-  ) {
-    return current;
-  }
-  const projectId =
-    explicitProjectId || resolveProjectIdForConversation(conversationId) || "";
-  return saveSettings({
-    boundConversationId: conversationId,
-    boundProjectId: projectId,
-  });
 }
 
 function buildCallbackMessage(job, settings, goal) {
   const summary = job.resultSummary || {};
   const mode = settings.progressionMode;
   const isEn = settings.language === "en";
+  const hasExactSession = Boolean(
+    job.sessionId && String(job.sessionId).trim() && job.sessionId !== "last"
+  );
   const isAutonomousEligible =
     mode === "autonomous" &&
     goal &&
@@ -88,11 +99,14 @@ function buildCallbackMessage(job, settings, goal) {
       : `[Codex Bridge Auto-Callback] 后台 Codex 任务已完成（${job.status}）`,
     ``,
     `- **Job ID**: \`${job.id}\``,
-    `- **Status**: \`${job.status}\` | **Model**: \`${job.model || "default"}\` | **Effort**: \`${job.reasoningEffort || "default"}\``,
-    `- **Session ID**: \`${job.sessionId || "(none)"}\``,
+    `- **Status**: \`${job.status}\` | **Model**: \`${job.model || "default"}\` | **Effort**: \`${job.reasoningEffort || "default"}\` | **Sandbox**: \`${job.sandbox || "workspace-write"}\``,
+    `- **Session ID**: \`${hasExactSession ? job.sessionId : "(none)"}\``,
     `- **Working Dir**: \`${job.cwd}\``,
   ];
 
+  if (job.parentJobId) {
+    lines.push(`- **Resumed From**: \`${job.parentJobId}\``);
+  }
   if (summary.durationMs) {
     lines.push(`- **Duration**: ${(summary.durationMs / 1000).toFixed(1)}s`);
   }
@@ -138,11 +152,19 @@ function buildCallbackMessage(job, settings, goal) {
 
   lines.push("");
   if (isAutonomousEligible) {
-    lines.push(
-      isEn
-        ? `**Progression Instruction (Autonomous Mode)**: Immediately verify the result & milestone checks, update the milestone via \`codex_goal(action="update_milestone")\`; if verification failed, call \`codex_resume(session_id="${job.sessionId || "last"}")\` to fix it, or if passed and pending milestones remain, call \`codex_start\` for the next milestone until complete (pause & report if user input is required).`
-        : `**推进指令（目标持续自动推进模式）**：请立刻验收上述结果与里程碑验证条件，调用 \`codex_goal(action="update_milestone")\` 更新里程碑状态；若未通过则用 \`codex_resume(session_id="${job.sessionId || "last"}")\` 返工，若已通过且还有待办里程碑，请自动调用 \`codex_start\` 推进下一阶段直到目标达成（如遇需用户决策的阻塞点则暂停并汇报）。`
-    );
+    if (hasExactSession) {
+      lines.push(
+        isEn
+          ? `**Progression Instruction (Autonomous Mode)**: Immediately verify the result & milestone checks, update the milestone via \`codex_goal(action="update_milestone")\`; if verification failed, call \`codex_start(resume_job_id="${job.id}", prompt="...")\` (exact Session ID: \`${job.sessionId}\`) to fix it, or if passed and pending milestones remain, call \`codex_start\` for the next milestone until complete (pause & report if user input is required).`
+          : `**推进指令（目标持续自动推进模式）**：请立刻验收上述结果与里程碑验证条件，调用 \`codex_goal(action="update_milestone")\` 更新里程碑状态；若未通过请调用 \`codex_start(resume_job_id="${job.id}", prompt="...")\`（确切 Session ID: \`${job.sessionId}\`）返工，若已通过且还有待办里程碑，请自动调用 \`codex_start\` 推进下一阶段直到目标达成（如遇需用户决策的阻塞点则暂停并汇报）。`
+      );
+    } else {
+      lines.push(
+        isEn
+          ? `**Progression Notice**: This job has no verified Session ID, so automatic resume is disabled. Inspect the result, update milestone status, and ask the user before starting a new session.`
+          : `**推进提示**：该任务缺少确切的 Session ID，已禁用自动续跑（不再回退到 last）。请先核验结果并汇报给用户由人工处理。`
+      );
+    }
   } else if (mode === "autonomous" && goal && goal.status !== "active") {
     lines.push(
       isEn
@@ -171,63 +193,115 @@ function buildCallbackMessage(job, settings, goal) {
   return lines.join("\n");
 }
 
+/**
+ * Deliver a callback strictly to job.callbackTarget (never falls back to any global/current conversation).
+ * Marks `sent` ONLY AFTER confirmed delivery. Failures stay visibly marked `failed` for manual retry.
+ */
+function deliverCallbackForJob(job, settings) {
+  const target = normalizeCallbackTarget(job.callbackTarget);
+  if (!target) {
+    const updated = updateJobCallbackState(job.id, {
+      callbackStatus: "unrouted",
+      callbackSent: false,
+      callbackError:
+        "No trusted source conversation locked on this job; result kept in panel.",
+    });
+    return { ok: false, status: "unrouted", job: updated };
+  }
+
+  // Verify the locked conversation is still valid before sending
+  const verified = verifyConversationTarget(
+    target.conversationId,
+    target.projectId
+  );
+  if (!verified.valid) {
+    const updated = updateJobCallbackState(job.id, {
+      callbackStatus: "unrouted",
+      callbackSent: false,
+      callbackError: `Locked source conversation unavailable (${verified.reason}); result kept in panel.`,
+    });
+    return { ok: false, status: "unrouted", error: verified.reason, job: updated };
+  }
+
+  // Mark `sending` (NOT `sent`) before invoking agentapi
+  updateJobCallbackState(job.id, {
+    callbackStatus: "sending",
+    callbackSent: false,
+    callbackError: null,
+    incrementAttempts: true,
+  });
+
+  const goal = job.goalId ? getGoal(job.goalId) : getGoal();
+  const message = buildCallbackMessage(job, settings, goal);
+
+  try {
+    const sendRes = app.sendMessage(verified.conversationId, message, {
+      projectId: verified.projectId || undefined,
+    });
+    if (sendRes && sendRes.error) {
+      throw new Error(String(sendRes.error));
+    }
+    const updated = updateJobCallbackState(job.id, {
+      callbackStatus: "sent",
+      callbackSent: true,
+      callbackAt: new Date().toISOString(),
+      callbackError: null,
+    });
+    console.log(
+      `[codex-panel] Delivered callback for job ${job.id} -> conv ${verified.conversationId} (${settings.progressionMode})`
+    );
+    return { ok: true, status: "sent", job: updated };
+  } catch (err) {
+    const errMsg = err?.message || String(err);
+    const updated = updateJobCallbackState(job.id, {
+      callbackStatus: "failed",
+      callbackSent: false,
+      callbackError: errMsg,
+    });
+    console.error(
+      `[codex-panel] Callback delivery failed for job ${job.id} -> conv ${verified.conversationId}:`,
+      errMsg
+    );
+    return { ok: false, status: "failed", error: errMsg, job: updated };
+  }
+}
+
 let watcherBusy = false;
 async function checkAndDispatchCallbacks() {
   if (watcherBusy) return;
   watcherBusy = true;
   try {
     const settings = loadSettings();
+    const jobs = reconcilePersistedJobs(jobManager._localRunningIds);
     if (settings.progressionMode === "manual") return;
-    const convId = settings.boundConversationId || app.config.conversationId || "";
-    if (!convId || !ID_RE.test(convId)) return;
 
-    const jobs = readPersistedJobs();
     const pending = jobs.filter(
       (j) =>
         j &&
         j.notifyOnComplete &&
+        j.callbackStatus === "pending" &&
         !j.callbackSent &&
-        j.status !== "running" &&
-        j.status !== "cancelled" &&
-        j.status !== "interrupted"
+        (j.status === "completed" ||
+          j.status === "failed" ||
+          j.status === "timed_out")
     );
 
-    if (pending.length === 0) return;
-
     for (const job of pending) {
-      // Mark before sending so restarts or transient errors never duplicate callbacks.
-      markJobCallbackSent(job.id);
-      const goal = job.goalId ? getGoal(job.goalId) : getGoal();
-      const message = buildCallbackMessage(job, settings, goal);
-      try {
-        const projectId =
-          settings.boundProjectId ||
-          resolveProjectIdForConversation(convId) ||
-          undefined;
-        app.sendMessage(convId, message, { projectId });
-        console.log(
-          `[codex-panel] Dispatched auto-callback for job ${job.id} -> conv ${convId} (${settings.progressionMode})`
-        );
-      } catch (err) {
-        markJobCallbackSent(job.id, { error: err?.message || String(err) });
-        console.error(
-          `[codex-panel] Failed auto-callback for job ${job.id}:`,
-          err?.message || err
-        );
-      }
+      deliverCallbackForJob(job, settings);
     }
   } finally {
     watcherBusy = false;
   }
 }
 
+/**
+ * PURE READ-ONLY state snapshot.
+ * Never mutates settings.json or any global conversation binding!
+ */
 function buildState(query = {}) {
   const convFromQuery =
     typeof query.conversationId === "string" ? query.conversationId.trim() : "";
   const convId = convFromQuery || app.config.conversationId || "";
-  if (convId && ID_RE.test(convId)) {
-    maybeBindConversation(convId);
-  }
 
   const resolved = resolveCodexBinary();
   const version = resolved ? getCodexVersion(resolved.path) : null;
@@ -235,11 +309,11 @@ function buildState(query = {}) {
   const tomlDefaults = readCodexTomlDefaults();
   const settings = loadSettings();
   const goalsStore = listGoals();
-  const jobs = readPersistedJobs();
+  const jobs = reconcilePersistedJobs(jobManager._localRunningIds);
   const history = loadHistory();
 
   return {
-    pluginVersion: "1.3.0",
+    pluginVersion: "1.4.0",
     codex: {
       found: Boolean(resolved),
       path: resolved?.path || null,
@@ -294,6 +368,7 @@ app.api(
   "GET"
 );
 
+// Pure read-only state endpoint
 app.api("/api/state", (data) => buildState(data), "GET");
 
 app.api(
@@ -316,25 +391,116 @@ app.api(
 );
 
 app.api(
-  "/api/bind-conversation",
-  (data) => {
-    const convId = String(
-      data.conversationId || app.config.conversationId || ""
-    ).trim();
-    if (!convId) {
-      return { ok: false, error: "No conversationId available to bind." };
-    }
-    const settings = maybeBindConversation(convId, data.projectId || "");
+  "/api/reset",
+  () => {
+    const settings = resetSettings();
     return { ok: true, settings };
   },
   "POST"
 );
 
+// Structured background resume by old job_id (inherits exact sessionId, cwd, sandbox, goal, milestone)
 app.api(
-  "/api/reset",
-  () => {
-    const settings = resetSettings();
-    return { ok: true, settings };
+  "/api/jobs/resume",
+  (data) => {
+    const oldJobId = typeof data.jobId === "string" ? data.jobId.trim() : "";
+    if (!oldJobId) {
+      return new Response(
+        JSON.stringify({ ok: false, error: "jobId is required." }),
+        { status: 400, contentType: "application/json" }
+      );
+    }
+
+    // Lock trusted callback target from host conversation if provided & verified;
+    // otherwise resumeFromJob inherits oldJob.callbackTarget if valid.
+    let callbackTarget = null;
+    const reqConv =
+      (typeof data.conversationId === "string" && data.conversationId.trim()) ||
+      app.config.conversationId ||
+      "";
+    if (reqConv && ID_RE.test(reqConv)) {
+      const verified = verifyConversationTarget(reqConv);
+      if (verified.valid) {
+        callbackTarget = {
+          conversationId: verified.conversationId,
+          projectId: verified.projectId,
+          source: "sidecar_host",
+        };
+      }
+    }
+
+    try {
+      const { job, reused, reason } = jobManager.resumeFromJob(oldJobId, {
+        prompt: data.prompt,
+        sandbox: data.sandbox,
+        allowSandboxEscalation: Boolean(data.allowSandboxEscalation),
+        callbackTarget,
+      });
+      return {
+        ok: true,
+        reused,
+        reason: reason || null,
+        job: jobManager._serializeJob(job),
+        jobs: reconcilePersistedJobs(jobManager._localRunningIds),
+      };
+    } catch (err) {
+      return new Response(
+        JSON.stringify({ ok: false, error: err?.message || String(err) }),
+        { status: 400, contentType: "application/json" }
+      );
+    }
+  },
+  "POST"
+);
+
+// Stop a running or detached-running job by PID and release its session lock
+app.api(
+  "/api/jobs/stop",
+  async (data) => {
+    const jobId = typeof data.jobId === "string" ? data.jobId.trim() : "";
+    if (!jobId) {
+      return new Response(
+        JSON.stringify({ ok: false, error: "jobId is required." }),
+        { status: 400, contentType: "application/json" }
+      );
+    }
+    const res = await jobManager.stopJob(jobId);
+    return {
+      ok: Boolean(res.cancelled || res.alreadyFinished),
+      ...res,
+      jobs: reconcilePersistedJobs(jobManager._localRunningIds),
+    };
+  },
+  "POST"
+);
+
+// Retry a failed callback strictly to the job's locked callbackTarget (never to another conversation)
+app.api(
+  "/api/jobs/retry-callback",
+  (data) => {
+    const jobId = typeof data.jobId === "string" ? data.jobId.trim() : "";
+    if (!jobId) {
+      return new Response(
+        JSON.stringify({ ok: false, error: "jobId is required." }),
+        { status: 400, contentType: "application/json" }
+      );
+    }
+    const jobs = reconcilePersistedJobs(jobManager._localRunningIds);
+    const job = jobs.find((j) => j.id === jobId);
+    if (!job) {
+      return new Response(
+        JSON.stringify({ ok: false, error: `Job not found: ${jobId}` }),
+        { status: 404, contentType: "application/json" }
+      );
+    }
+    if (job.callbackStatus === "sent") {
+      return { ok: true, status: "sent", alreadySent: true, job, jobs };
+    }
+    const res = deliverCallbackForJob(job, loadSettings());
+    return {
+      ...res,
+      jobs: reconcilePersistedJobs(jobManager._localRunningIds),
+    };
   },
   "POST"
 );
@@ -401,11 +567,15 @@ app.api(
   "POST"
 );
 
-// Start background callback watcher (skip if explicitly disabled in unit tests)
+// Start background callback watcher
+const watcherMs = Math.max(
+  200,
+  Number(process.env.CODEX_PANEL_WATCHER_MS) || 2500
+);
 if (process.env.CODEX_PANEL_DISABLE_WATCHER !== "1") {
   setInterval(() => {
     void checkAndDispatchCallbacks();
-  }, 2500).unref();
+  }, watcherMs).unref();
 }
 
 app.run();

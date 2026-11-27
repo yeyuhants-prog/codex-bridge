@@ -6,7 +6,7 @@
 
 **带原生交互式控制面板、持久化目标板、完工自动回调闭环与零依赖 MCP 桥接服务的 Antigravity 插件，直接指挥你本机的 OpenAI Codex CLI 持续排查、验证与推进任务。**
 
-[![Version](https://img.shields.io/badge/version-1.3.0-7c3aed?style=flat-square)](./plugin.json)
+[![Version](https://img.shields.io/badge/version-1.4.0-7c3aed?style=flat-square)](./plugin.json)
 [![Node](https://img.shields.io/badge/node-%3E%3D18.0.0-22c55e?style=flat-square)](https://nodejs.org/)
 [![Dependencies](https://img.shields.io/badge/dependencies-zero-0ea5e9?style=flat-square)](#架构一览)
 [![MCP](https://img.shields.io/badge/protocol-MCP%20Stdio-f59e0b?style=flat-square)](https://modelcontextprotocol.io/)
@@ -29,7 +29,8 @@
     - `持续自动推进 (autonomous)` — 后台任务完工后自动触发反重力验收、更新里程碑、未通过则 `codex_resume` 返工，通过则自动推进下一里程碑（带最大自动轮次上限与一键「暂停自动推进」保护）。
   - **执行权限（Sandbox）**与**派活方式**（`直接派活` / `先出任务单确认`）
 - **持久化目标与里程碑状态机（`goals.json`）**：总目标、子里程碑、验证命令、卡点与关联 `Session ID` 全部落盘保存，长对话压缩或重启不丢进度。
-- **后台任务持久化与断点续接（`jobs.json`）**：服务重启后中断的任务仍保留 `Session ID` 与最近日志，可在面板一键「续跑 Session」。
+- **按任务锁定回调目标与失败重试**：派活时从 Antigravity 可信宿主上下文锁定每个任务的 `conversationId` / `projectId`（`/api/state` 严格只读，彻底杜绝切换对话时串回调）；投递失败不会误标「已回调」，支持在面板一键定向重试回原对话。
+- **跨进程会话互斥锁与结构化续跑**：后台任务落盘至 `jobs.json` 并按 `Session ID` 加原子文件锁（`locks/`）；服务重启时若原 `codex.exe` 进程仍存活则标为 `running_detached`（等待结束或显式停止前禁止重复续跑）。通过 `resume_job_id` 或面板「结构化续跑」会继承原 `session_id`、`cwd`、`sandbox`、`goal_id` 与 `milestone_id`，并将 `-C` / `-s` 置于 `resume` 之前，默认沿用原权限且拦截未确认的提权。
 - **自动发现本机 Codex**：Windows 下自动定位 Codex Desktop 最新版 `codex.exe`（自动更新换哈希目录无缝兼容），同时支持 `PATH` 和 `CODEX_BIN`。
 - **零外部依赖**：纯 Node.js ESM（`>= 18`），免 `npm install`，通过 UTF-8 `stdin` 传提示词。
 

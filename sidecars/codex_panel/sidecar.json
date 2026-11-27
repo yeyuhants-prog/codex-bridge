@@ -2,11 +2,11 @@
   "command": "node",
   "args": ["main.mjs"],
   "env": {
-    "CODEX_PANEL_VERSION": "1.3.0"
+    "CODEX_PANEL_VERSION": "1.4.0"
   },
   "restart_policy": "always",
   "display_name": "Codex Bridge",
-  "description": "Interactive control panel & goal progression board (EN/中文): select Codex model, reasoning effort, sandbox, progression mode, and track persistent goals & background jobs.",
+  "description": "Interactive control panel & goal progression board (EN/中文): per-job locked callbacks, cross-process session locks, structured job resume, model/effort/sandbox controls & persistent goals.",
   "has_web_ui": true,
   "agent_permissions": {
     "allows_user_interactions": true

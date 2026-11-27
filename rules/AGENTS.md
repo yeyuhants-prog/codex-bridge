@@ -9,4 +9,4 @@ The **Codex Bridge** plugin is enabled. You have access to the `codex-bridge` MC
   - When a `[Codex Bridge Auto-Callback]` message arrives in the conversation after a background job finishes: inspect the result & modified files, run or verify acceptance checks, update the milestone via `codex_goal(action="update_milestone")`, and:
     - In **`notify`** mode: report the verified findings clearly and ask/propose the next step.
     - In **`autonomous`** mode: if the goal is still `active` and under `maxIterations`, immediately continue by calling `codex_resume` (to fix issues) or `codex_start` (for the next pending milestone) until all acceptance criteria pass or a genuine blocker requires user input.
-- Always specify `cwd` explicitly and reuse `session_id` with `codex_resume` for follow-up turns.
+- Always specify `cwd` explicitly. When resuming an existing job, prefer `codex_start(resume_job_id=...)` or `codex_resume(resume_job_id=...)` so original `session_id`, `cwd`, `sandbox`, `goal_id`, and `milestone_id` are inherited safely (never pass `"last"`).

@@ -4,8 +4,9 @@ import {
   getCodexVersion,
   runCodex,
   formatCodexResult,
+  resolveResumeSandbox,
 } from "./codex-runner.js";
-import { JobManager } from "./job-manager.js";
+import { JobManager, normalizeCallbackTarget } from "./job-manager.js";
 import {
   loadSettings,
   saveSettings,
@@ -25,10 +26,15 @@ import {
   deleteGoal,
   formatGoalSummary,
 } from "./goal-store.js";
+import {
+  acquireSessionLock,
+  updateSessionLockPid,
+  releaseSessionLock,
+} from "./session-lock.js";
 
 const SERVER_INFO = {
   name: "codex-mcp-bridge",
-  version: "1.3.0",
+  version: "1.4.0",
 };
 
 const SUPPORTED_PROTOCOL_VERSIONS = [
@@ -71,6 +77,54 @@ function sendProgress(progressToken, progress, message) {
   });
 }
 
+/**
+ * Extract trusted callback destination ONLY from Antigravity host metadata or host env.
+ * Never falls back to mutable global settings.boundConversationId.
+ */
+function extractTrustedHostCallbackTarget(meta = {}) {
+  const metaConv =
+    meta?.conversationId ||
+    meta?.conversation_id ||
+    meta?.["com.google.antigravity/conversationId"] ||
+    meta?.["antigravity/conversationId"] ||
+    "";
+  const metaProj =
+    meta?.projectId ||
+    meta?.project_id ||
+    meta?.["com.google.antigravity/projectId"] ||
+    meta?.["antigravity/projectId"] ||
+    "";
+
+  if (metaConv) {
+    return normalizeCallbackTarget({
+      conversationId: metaConv,
+      projectId: metaProj,
+      source: "mcp_meta",
+    });
+  }
+
+  let envConv = process.env.ANTIGRAVITY_CONVERSATION_ID || "";
+  const envProj = process.env.ANTIGRAVITY_PROJECT_ID || "";
+  if (!envConv && process.env.ANTIGRAVITY_SOURCE_METADATA) {
+    try {
+      const parsed = JSON.parse(process.env.ANTIGRAVITY_SOURCE_METADATA);
+      envConv = parsed?.tool?.conversationId || parsed?.conversationId || "";
+    } catch {
+      // ignore
+    }
+  }
+
+  if (envConv) {
+    return normalizeCallbackTarget({
+      conversationId: envConv,
+      projectId: envProj,
+      source: "host_env",
+    });
+  }
+
+  return null;
+}
+
 const COMMON_RUN_PROPERTIES = {
   cwd: {
     type: "string",
@@ -81,7 +135,7 @@ const COMMON_RUN_PROPERTIES = {
     type: "string",
     enum: ["read-only", "workspace-write", "danger-full-access"],
     description:
-      "Sandbox policy for Codex shell commands. Omit to use the active Codex Bridge UI panel setting.",
+      "Sandbox policy for Codex shell commands. Omit to use the active Codex Bridge UI panel setting (or original job's sandbox when resuming).",
   },
   model: {
     type: "string",
@@ -172,14 +226,19 @@ const TOOLS = [
   {
     name: "codex_resume",
     description:
-      "Continue a previous Codex session synchronously by session_id (or 'last' for the most recent session) with follow-up instructions, preserving Codex's full conversation context.",
+      "Continue a previous Codex session synchronously with follow-up instructions. Pass either `resume_job_id` (recommended: inherits original session_id, cwd, sandbox, goal & milestone) or an exact `session_id` + explicit `cwd`. Enforces per-session mutual exclusion and blocks accidental sandbox widening unless `allow_sandbox_escalation: true`.",
     inputSchema: {
       type: "object",
       properties: {
+        resume_job_id: {
+          type: "string",
+          description:
+            "Recommended: previous job_id to resume from (automatically inherits exact session_id, cwd, sandbox, goal_id, milestone_id).",
+        },
         session_id: {
           type: "string",
           description:
-            "Session UUID returned by a prior codex_run/codex_start, or 'last' to resume the most recent session.",
+            "Exact Codex session UUID (required if resume_job_id is not provided; 'last' is rejected to prevent resuming the wrong session).",
         },
         prompt: {
           type: "string",
@@ -187,7 +246,15 @@ const TOOLS = [
         },
         cwd: {
           type: "string",
-          description: "Working directory for the resumed session.",
+          description:
+            "Absolute working directory (required when resuming by session_id without resume_job_id or goal_id).",
+        },
+        sandbox: COMMON_RUN_PROPERTIES.sandbox,
+        allow_sandbox_escalation: {
+          type: "boolean",
+          default: false,
+          description:
+            "Must be true to widen sandbox permissions relative to the original job (narrowing is always allowed).",
         },
         model: COMMON_RUN_PROPERTIES.model,
         reasoning_effort: COMMON_RUN_PROPERTIES.reasoning_effort,
@@ -202,7 +269,7 @@ const TOOLS = [
           description: "Maximum seconds to wait before aborting (default 600).",
         },
       },
-      required: ["session_id", "prompt"],
+      required: ["prompt"],
     },
   },
   {
@@ -252,23 +319,35 @@ const TOOLS = [
   {
     name: "codex_start",
     description:
-      "Launch a Codex task asynchronously in the background and immediately return a job_id. Persisted to disk; when progression mode is 'notify' or 'autonomous', the Sidecar automatically sends a callback message back to Antigravity upon completion so verification and milestone progression continue seamlessly.",
+      "Launch a persistent background Codex job and immediately return a job_id. Supports resuming an earlier job via `resume_job_id` (inherits exact session_id, cwd, sandbox, goal & milestone) with cross-process per-session mutual exclusion. Locks its callback target from trusted host context at dispatch time.",
     inputSchema: {
       type: "object",
       properties: {
         prompt: {
           type: "string",
-          description: "Detailed task instructions for Codex.",
+          description:
+            "Detailed task instructions for Codex (optional when resume_job_id is given).",
+        },
+        resume_job_id: {
+          type: "string",
+          description:
+            "Recommended for resume: creates a linked background job inheriting original session_id, cwd, sandbox, goal_id & milestone_id.",
         },
         session_id: {
           type: "string",
           description:
-            "Optional: if provided, starts an async `codex exec resume` on this session_id instead of a brand-new session.",
+            "Optional exact session UUID to resume (requires explicit cwd if resume_job_id is not set; 'last' is rejected).",
+        },
+        allow_sandbox_escalation: {
+          type: "boolean",
+          default: false,
+          description:
+            "Must be true to widen sandbox permissions relative to the original job.",
         },
         notify_on_complete: {
           type: "boolean",
           description:
-            "Whether the Sidecar should automatically notify the bound Antigravity conversation when this job finishes. Defaults to true unless progression_mode is 'manual'.",
+            "Whether the Sidecar should auto-callback the locked source conversation on completion.",
         },
         ...COMMON_RUN_PROPERTIES,
         timeout_seconds: {
@@ -277,13 +356,12 @@ const TOOLS = [
           description: "Maximum runtime in seconds (default 1800 = 30 min).",
         },
       },
-      required: ["prompt"],
     },
   },
   {
     name: "codex_status",
     description:
-      "Check status, live progress events, session_id, or final output of a background Codex job started with codex_start (also inspects jobs persisted across restarts). Optionally waits up to wait_seconds.",
+      "Check status, live progress events, detached running PID state, callback delivery status, session_id, or final output of a background Codex job. Optionally waits up to wait_seconds.",
     inputSchema: {
       type: "object",
       properties: {
@@ -303,13 +381,14 @@ const TOOLS = [
   },
   {
     name: "codex_cancel",
-    description: "Cancel a running background Codex job by job_id.",
+    description:
+      "Stop a running or detached-running (`running_detached`) background Codex job by job_id and release its session lock.",
     inputSchema: {
       type: "object",
       properties: {
         job_id: {
           type: "string",
-          description: "The job_id to cancel.",
+          description: "The job_id to cancel/stop.",
         },
       },
       required: ["job_id"],
@@ -318,7 +397,7 @@ const TOOLS = [
   {
     name: "codex_goal",
     description:
-      "Manage persistent multi-step Goals & Milestones shared with the Codex Bridge Sidecar panel (survives restarts and conversation compaction). Use this for ongoing backend debugging, refactors, or meta-analysis pipelines that require iterative verification.",
+      "Manage persistent multi-step Goals & Milestones shared with the Codex Bridge Sidecar panel (survives restarts and conversation compaction).",
     inputSchema: {
       type: "object",
       properties: {
@@ -337,22 +416,10 @@ const TOOLS = [
           default: "get",
           description: "Operation to perform on the persistent goal board.",
         },
-        goal_id: {
-          type: "string",
-          description: "Target goal_id (defaults to the active goal).",
-        },
-        title: {
-          type: "string",
-          description: "Title for a new goal or new milestone.",
-        },
-        objective: {
-          type: "string",
-          description: "Detailed goal description/objective (for create).",
-        },
-        cwd: {
-          type: "string",
-          description: "Working directory for the goal (for create).",
-        },
+        goal_id: { type: "string", description: "Target goal_id (defaults to active goal)." },
+        title: { type: "string", description: "Title for a new goal or new milestone." },
+        objective: { type: "string", description: "Detailed goal description (for create)." },
+        cwd: { type: "string", description: "Working directory for the goal (for create)." },
         acceptance_criteria: {
           type: "array",
           items: { type: "string" },
@@ -371,39 +438,23 @@ const TOOLS = [
           },
           description: "Initial ordered milestones list (for create).",
         },
-        milestone_id: {
-          type: "string",
-          description: "Target milestone id like 'm1' (for update_milestone).",
-        },
-        status: {
-          type: "string",
-          description:
-            "New status: goal ('active'|'paused'|'completed'|'failed') or milestone ('pending'|'in_progress'|'done'|'blocked'|'skipped').",
-        },
-        verification: {
-          type: "string",
-          description: "Verification command or check for a milestone.",
-        },
-        notes: {
-          type: "string",
-          description: "Verification outcome, findings, or notes.",
-        },
+        milestone_id: { type: "string", description: "Target milestone id like 'm1'." },
+        status: { type: "string", description: "New goal or milestone status." },
+        verification: { type: "string", description: "Verification command or check." },
+        notes: { type: "string", description: "Verification outcome or notes." },
         blockers: {
           type: "array",
           items: { type: "string" },
           description: "Current blockers list (for set_status).",
         },
-        max_iterations: {
-          type: "number",
-          description: "Max automatic progression iterations for this goal (default 12).",
-        },
+        max_iterations: { type: "number", description: "Max automatic progression iterations." },
       },
     },
   },
   {
     name: "codex_config",
     description:
-      "Read or update persistent Codex Bridge preferences (model, reasoning_effort, sandbox, workflow_mode, progression_mode, max_auto_iterations) shared with the Codex Bridge UI panel, and list available local Codex models.",
+      "Read or update persistent Codex Bridge preferences (language, model, reasoning_effort, sandbox, workflow_mode, progression_mode, max_auto_iterations) shared with the Codex Bridge UI panel, and list available local Codex models.",
     inputSchema: {
       type: "object",
       properties: {
@@ -438,7 +489,7 @@ const TOOLS = [
           type: "string",
           enum: ["manual", "notify", "autonomous"],
           description:
-            "Goal progression mode: 'manual' (no auto-callback), 'notify' (auto-notify Antigravity when background Codex job finishes), 'autonomous' (auto-verify and continuously advance goal milestones until done or paused).",
+            "Goal progression mode: 'manual', 'notify', or 'autonomous'.",
         },
         max_auto_iterations: {
           type: "number",
@@ -455,7 +506,7 @@ const TOOLS = [
   {
     name: "codex_info",
     description:
-      "Check Codex Bridge health: shows resolved codex.exe path & version, active UI panel preferences (model, reasoning effort, sandbox, workflow mode, progression mode), active goal progress, and tracked background jobs.",
+      "Check Codex Bridge health: shows resolved codex.exe path & version, active UI panel preferences, active goal progress, and tracked background jobs.",
     inputSchema: {
       type: "object",
       properties: {},
@@ -526,6 +577,7 @@ async function handleToolCall(name, args = {}, meta = {}, signal) {
     const prefs = loadSettings();
     const toml = readCodexTomlDefaults();
     const activeGoal = getGoal();
+    const hostTarget = extractTrustedHostCallbackTarget(meta);
     const effectiveModel =
       prefs.model || `${toml.model || "default"} (Codex 默认)`;
     const effectiveEffort =
@@ -534,6 +586,10 @@ async function handleToolCall(name, args = {}, meta = {}, signal) {
     const goalLine = activeGoal
       ? `${activeGoal.title} (${activeGoal.id}) [${activeGoal.status}, ${activeGoal.milestones.filter((m) => m.status === "done").length}/${activeGoal.milestones.length} done]`
       : "(none)";
+
+    const runningCount = jobs.filter(
+      (j) => j.status === "running" || j.status === "running_detached"
+    ).length;
 
     const text = [
       `Bridge: ${SERVER_INFO.name} v${SERVER_INFO.version}`,
@@ -546,9 +602,9 @@ async function handleToolCall(name, args = {}, meta = {}, signal) {
       `Workflow Mode: ${prefs.workflowMode}`,
       `Progression Mode: ${prefs.progressionMode} (maxAutoIterations=${prefs.maxAutoIterations})`,
       `UI Language: ${prefs.language}`,
-      `Bound Conversation: ${prefs.boundConversationId || "(open Sidecar panel to bind)"}`,
+      `Trusted Host Context: ${hostTarget ? `${hostTarget.conversationId} (${hostTarget.source})` : "(unavailable in shared MCP process; per-job callbacks stay in panel unless started with host context)"}`,
       `Active Goal: ${goalLine}`,
-      `Tracked Jobs: ${jobs.length} (${jobs.filter((j) => j.status === "running").length} running)`,
+      `Tracked Jobs: ${jobs.length} (${runningCount} active)`,
     ].join("\n");
     return {
       content: [{ type: "text", text }],
@@ -628,9 +684,7 @@ async function handleToolCall(name, args = {}, meta = {}, signal) {
     if (action === "update_milestone") {
       if (!args.milestone_id) {
         return {
-          content: [
-            { type: "text", text: "Error: 'milestone_id' is required." },
-          ],
+          content: [{ type: "text", text: "Error: 'milestone_id' is required." }],
           isError: true,
         };
       }
@@ -784,42 +838,158 @@ async function handleToolCall(name, args = {}, meta = {}, signal) {
   }
 
   if (name === "codex_resume") {
-    if (!args.session_id || !args.prompt) {
+    if (!args.prompt || typeof args.prompt !== "string") {
+      return {
+        content: [{ type: "text", text: "Error: 'prompt' is required." }],
+        isError: true,
+      };
+    }
+
+    const prefs = loadSettings();
+    let oldJob = null;
+    if (args.resume_job_id) {
+      oldJob = await jobManager.getStatus(args.resume_job_id, 0);
+      if (!oldJob) {
+        return {
+          content: [
+            { type: "text", text: `Error: Previous job not found: ${args.resume_job_id}` },
+          ],
+          isError: true,
+        };
+      }
+    }
+
+    const sid = (
+      (typeof args.session_id === "string" && args.session_id.trim()) ||
+      (oldJob?.sessionId || "").trim()
+    );
+    if (!sid || sid === "last") {
       return {
         content: [
           {
             type: "text",
-            text: "Error: both 'session_id' and 'prompt' are required.",
+            text: "Error: An exact session_id (or a valid resume_job_id with a recorded session_id) is required; 'last' fallback is disabled.",
           },
         ],
         isError: true,
       };
     }
+
+    // Inherit cwd, goalId, milestoneId, sandbox from oldJob when available
+    const linkedGoal = (args.goal_id || oldJob?.goalId)
+      ? getGoal(args.goal_id || oldJob?.goalId)
+      : null;
+    const cwd = args.cwd || oldJob?.cwd || linkedGoal?.cwd;
+    if (!cwd) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: "Error: 'cwd' is required when resuming without a prior resume_job_id or goal_id (refusing to default to the plugin server directory).",
+          },
+        ],
+        isError: true,
+      };
+    }
+
+    let effectiveSandbox;
+    try {
+      effectiveSandbox = resolveResumeSandbox({
+        requestedSandbox: args.sandbox,
+        originalSandbox: oldJob?.sandbox,
+        fallbackSandbox: prefs.sandbox || "workspace-write",
+        allowEscalation: Boolean(args.allow_sandbox_escalation),
+      });
+    } catch (err) {
+      return {
+        content: [{ type: "text", text: `Error: ${err.message}` }],
+        isError: true,
+      };
+    }
+
+    // Cross-process per-session mutual exclusion
+    const syncLockId = `sync_${Date.now()}_${Math.random().toString(16).slice(2, 8)}`;
+    const active = jobManager.findActiveJobForSession(sid);
+    if (active) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Session ${sid} is already active in job ${active.id} (status=${active.status}, PID=${active.pid || "?"}). Wait for it to finish or stop it with codex_cancel(job_id="${active.id}") before resuming.`,
+          },
+        ],
+        isError: true,
+      };
+    }
+    const lockRes = acquireSessionLock(sid, {
+      jobId: syncLockId,
+      ownerPid: process.pid,
+      cwd,
+    });
+    if (!lockRes.acquired) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Session ${sid} is currently locked by active job ${lockRes.existing?.jobId || "unknown"} (PID=${lockRes.existing?.pid || "?"}). Refusing concurrent resume.`,
+          },
+        ],
+        isError: true,
+      };
+    }
+
     const opts = {
       mode: "resume",
-      sessionId: args.session_id,
+      sessionId: sid,
       prompt: args.prompt,
-      ...mapCommonOptions(args),
+      cwd,
+      sandbox: effectiveSandbox,
+      model: args.model || oldJob?.model || prefs.model || undefined,
+      reasoningEffort:
+        args.reasoning_effort ||
+        oldJob?.reasoningEffort ||
+        prefs.reasoningEffort ||
+        undefined,
+      goalId: args.goal_id || oldJob?.goalId || undefined,
+      milestoneId: args.milestone_id || oldJob?.milestoneId || undefined,
+      images: args.images,
+      config: args.config,
+      skipGitRepoCheck:
+        args.skip_git_repo_check !== undefined
+          ? Boolean(args.skip_git_repo_check)
+          : prefs.skipGitRepoCheck,
+      timeoutMs:
+        typeof args.timeout_seconds === "number" && args.timeout_seconds > 0
+          ? args.timeout_seconds * 1000
+          : 600_000,
     };
-    const result = await runCodex({
-      ...opts,
-      signal,
-      onProgress: ({ eventCount, summary }) => {
-        sendProgress(progressToken, eventCount, summary);
-      },
-    });
-    if (opts.goalId) {
-      recordGoalExecution(opts.goalId, {
-        milestoneId: opts.milestoneId,
-        sessionId: result.sessionId || args.session_id,
-        incrementIteration: true,
+
+    try {
+      const result = await runCodex({
+        ...opts,
+        signal,
+        onSpawn: (child) => {
+          if (child.pid) updateSessionLockPid(sid, syncLockId, child.pid);
+        },
+        onProgress: ({ eventCount, summary }) => {
+          sendProgress(progressToken, eventCount, summary);
+        },
       });
+      if (opts.goalId) {
+        recordGoalExecution(opts.goalId, {
+          milestoneId: opts.milestoneId,
+          sessionId: result.sessionId || sid,
+          incrementIteration: true,
+        });
+      }
+      recordRunHistory("resume", opts, result);
+      return {
+        content: [{ type: "text", text: formatCodexResult(result) }],
+        isError: !result.ok,
+      };
+    } finally {
+      releaseSessionLock(sid, syncLockId, { force: true });
     }
-    recordRunHistory("resume", opts, result);
-    return {
-      content: [{ type: "text", text: formatCodexResult(result) }],
-      isError: !result.ok,
-    };
   }
 
   if (name === "codex_review") {
@@ -861,31 +1031,109 @@ async function handleToolCall(name, args = {}, meta = {}, signal) {
   }
 
   if (name === "codex_start") {
+    const trustedTarget = extractTrustedHostCallbackTarget(meta);
+
+    // Structured resume by previous job_id
+    if (args.resume_job_id) {
+      const { job, reused } = jobManager.resumeFromJob(args.resume_job_id, {
+        prompt: args.prompt,
+        sandbox: args.sandbox,
+        allowSandboxEscalation: Boolean(args.allow_sandbox_escalation),
+        model: args.model,
+        reasoningEffort: args.reasoning_effort,
+        goalId: args.goal_id,
+        milestoneId: args.milestone_id,
+        callbackTarget: trustedTarget,
+        notifyOnComplete: args.notify_on_complete,
+        timeoutMs:
+          typeof args.timeout_seconds === "number" && args.timeout_seconds > 0
+            ? args.timeout_seconds * 1000
+            : undefined,
+        config: args.config,
+        images: args.images,
+      });
+
+      const lines = reused
+        ? [
+            `Session is already active — reused existing job instead of spawning a duplicate.`,
+            `Job ID: ${job.id}`,
+            `Status: ${job.status}`,
+            `PID: ${job.pid || "(spawning)"}`,
+            `Session ID: ${job.sessionId}`,
+          ]
+        : [
+            `Started resumed background Codex job.`,
+            `Job ID: ${job.id}`,
+            `Parent Job: ${job.parentJobId}`,
+            `Session ID: ${job.sessionId}`,
+            `Working Dir: ${job.cwd}`,
+            `Sandbox: ${job.sandbox}`,
+            `Callback: ${job.callbackStatus}${job.callbackTarget ? ` -> ${job.callbackTarget.conversationId}` : ""}`,
+          ];
+      return { content: [{ type: "text", text: lines.join("\n") }] };
+    }
+
     if (!args.prompt || typeof args.prompt !== "string") {
       return {
         content: [{ type: "text", text: "Error: 'prompt' is required." }],
         isError: true,
       };
     }
+
     const mode = args.session_id ? "resume" : "run";
-    const opts = {
+    const common = mapCommonOptions(args);
+    if (mode === "resume") {
+      if (args.session_id.trim() === "last") {
+        return {
+          content: [
+            {
+              type: "text",
+              text: "Error: 'last' fallback is disabled; pass an exact session_id or resume_job_id.",
+            },
+          ],
+          isError: true,
+        };
+      }
+      if (!common.cwd) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: "Error: 'cwd' is required when resuming by session_id without resume_job_id.",
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+
+    const { job, reused } = jobManager.startJob({
       mode,
       sessionId: args.session_id,
       prompt: args.prompt,
       notifyOnComplete: args.notify_on_complete,
-      ...mapCommonOptions(args),
-    };
-    const job = jobManager.startJob(opts);
-    job.promise.then(() => {
-      if (job.result) recordRunHistory(mode, opts, job.result);
+      callbackTarget: trustedTarget,
+      ...common,
     });
-    const prefs = loadSettings();
+
+    if (reused) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Session ${job.sessionId} is already active in job ${job.id} (status=${job.status}, PID=${job.pid || "?"}). Returned existing job instead of starting a second process.`,
+          },
+        ],
+      };
+    }
+
     const lines = [
       `Started background Codex job.`,
       `Job ID: ${job.id}`,
       `Mode: ${job.mode}`,
-      `Model: ${opts.model || "(codex default)"}`,
-      `Reasoning Effort: ${opts.reasoningEffort || "(default)"}`,
+      `Model: ${job.model || "(codex default)"}`,
+      `Reasoning Effort: ${job.reasoningEffort || "(default)"}`,
+      `Sandbox: ${job.sandbox}`,
       `Working Dir: ${job.cwd}`,
     ];
     if (job.goalId) {
@@ -894,10 +1142,10 @@ async function handleToolCall(name, args = {}, meta = {}, signal) {
       );
     }
     lines.push(
-      `Auto-Callback: ${job.notifyOnComplete ? `${prefs.progressionMode} (${prefs.boundConversationId ? "conversation bound" : "open Codex Bridge panel once to bind conversation"})` : "off"}`
+      `Callback: ${job.callbackStatus}${job.callbackTarget ? ` -> ${job.callbackTarget.conversationId}` : " (result stays in panel)"}`
     );
     lines.push(
-      `Use codex_status(job_id="${job.id}", wait_seconds=30) to poll progress or let the auto-callback wake you when finished.`
+      `Use codex_status(job_id="${job.id}", wait_seconds=30) to poll progress.`
     );
     return {
       content: [{ type: "text", text: lines.join("\n") }],
@@ -914,7 +1162,7 @@ async function handleToolCall(name, args = {}, meta = {}, signal) {
       }
       const lines = jobs.map(
         (j) =>
-          `- ${j.id} [${j.status}]${j.goalId ? ` goal=${j.goalId}` : ""} session=${j.sessionId || "pending"} events=${j.eventCount} | "${j.promptPreview}"`
+          `- ${j.id} [${j.status}]${j.pid ? ` pid=${j.pid}` : ""} sandbox=${j.sandbox}${j.goalId ? ` goal=${j.goalId}` : ""} cb=${j.callbackStatus} session=${j.sessionId || "pending"} | "${j.promptPreview}"`
       );
       return {
         content: [{ type: "text", text: lines.join("\n") }],
@@ -945,7 +1193,7 @@ async function handleToolCall(name, args = {}, meta = {}, signal) {
         isError: true,
       };
     }
-    const res = jobManager.cancelJob(args.job_id);
+    const res = await jobManager.stopJob(args.job_id);
     if (!res.found) {
       return {
         content: [{ type: "text", text: `Job not found: ${args.job_id}` }],
@@ -962,8 +1210,14 @@ async function handleToolCall(name, args = {}, meta = {}, signal) {
         ],
       };
     }
+    if (!res.cancelled) {
+      return {
+        content: [{ type: "text", text: res.error || `Failed to stop job ${args.job_id}.` }],
+        isError: true,
+      };
+    }
     return {
-      content: [{ type: "text", text: `Cancelled job ${args.job_id}.` }],
+      content: [{ type: "text", text: `Stopped job ${args.job_id} and released its session lock.` }],
     };
   }
 
@@ -1002,7 +1256,7 @@ async function handleRequest(msg) {
         },
         serverInfo: SERVER_INFO,
         instructions:
-          "Use codex_goal to create and track persistent multi-step goals & milestones, codex_run/codex_resume/codex_review for synchronous tasks, codex_start/codex_status/codex_cancel for persistent background workers with auto-callback support, and codex_config/codex_info to inspect or update active preferences shared with the Codex Bridge sidecar panel.",
+          "Use codex_goal to create and track persistent multi-step goals & milestones, codex_run/codex_resume/codex_review for synchronous tasks, codex_start/codex_status/codex_cancel for persistent background workers with per-job locked callbacks and cross-process session locks, and codex_config/codex_info to inspect or update active preferences.",
       });
       return;
     }
