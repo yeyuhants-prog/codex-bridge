@@ -1,7 +1,7 @@
 {
   "name": "codex-bridge",
   "displayName": "Codex Bridge",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "author": "yeyuhants-prog",
   "repository": "https://github.com/yeyuhants-prog/codex-bridge",
   "description": "通过 MCP 桥接本机 OpenAI Codex CLI，在开启本插件后可直接指挥 Codex 执行编码任务、延续多轮会话、进行 Git 代码审查以及并行运行后台任务。",

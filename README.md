@@ -1,38 +1,37 @@
 # Codex Bridge — Antigravity Plugin
 
-一个零依赖、可一键开关的 **Antigravity 插件**，通过内置的 MCP (Stdio) 桥接服务让 Antigravity 直接指挥你本机的 **OpenAI Codex CLI** 干活。
+一个零依赖、可一键开关且自带**可视化交互侧边栏面板**的 **Antigravity 插件**，通过内置的 MCP (Stdio) 桥接服务让 Antigravity 直接指挥你本机的 **OpenAI Codex CLI** 干活。
 
 ## 特性
 
-- **插件一键开关**：在 Antigravity 插件页直接开启/关闭，开启后 MCP 服务、协作技能（`codex-worker`）与激活规则一起生效，关闭后整体停用。
-- **自动发现 Codex**：自动定位本机 Codex Desktop 内置的最新 `codex.exe`（`%LOCALAPPDATA%\OpenAI\Codex\bin\*\codex.exe`），也支持 `PATH` 或通过环境变量 `CODEX_BIN` 手动指定。
-- **零外部依赖**：纯 Node.js ESM（Node >= 18），免 `npm install`，跨平台路径配置，克隆即用。
-- **同步 + 异步并行**：短任务实时推送进度同步返回；耗时任务或并行派活可通过 `codex_start` / `codex_status` / `codex_cancel` 后台管理。
-- **多轮会话延续**：支持按 `session_id`（或 `"last"`）用 `codex_resume` 接着上次的上下文继续改代码。
+- **原生交互式控制面板（Sidecar UI）**：出现在 Antigravity 右侧「插件」菜单中，支持实时点选：
+  - **Codex 模型**（自动读取本机 `~/.codex/models_cache.json` 中的全部可用模型）
+  - **思考深度（Reasoning Effort）**（动态适配所选模型的 `low / medium / high / xhigh / max / ultra` 档位）
+  - **执行权限（Sandbox）**（`read-only` / `workspace-write` / `danger-full-access`）
+  - **协作方式**（`直接派活执行` 或 `先出任务单确认再执行`）
+  - **快捷发活与最近执行记录**（查看耗时、Token 消耗，一键复制 `Session ID`）
+- **插件一键开关**：在 Antigravity `自定义扩展` 页面直接开关，开启后 UI 面板、MCP 服务、协作技能（`codex-worker`）与激活规则同步上线，关闭后整体停用。
+- **自动发现 Codex**：自动定位本机 Codex Desktop 内置的最新 `codex.exe`，也支持 `PATH` 或 `CODEX_BIN` 环境变量。
+- **零外部依赖**：纯 Node.js ESM（Node >= 18），免 `npm install`，克隆即用。
 
-## 提供的 7 个 MCP 工具
+## 提供的 8 个 MCP 工具
 
 | 工具 | 用途 |
 | --- | --- |
-| `codex_run` | 同步执行 Codex 任务（默认 `workspace-write` 沙箱），返回回复、`Session ID`、改动文件清单、执行命令与 Token 统计 |
+| `codex_run` | 同步执行 Codex 任务（自动应用面板中选定的模型、思考深度与沙箱权限） |
 | `codex_resume` | 按 `session_id`（或 `"last"`）延续上次 Codex 会话 |
-| `codex_review` | 调用 `codex exec review` 对 Git 仓库做代码审查（支持未提交改动、对比分支、指定 commit） |
+| `codex_review` | 调用 `codex exec review` 对 Git 仓库做代码审查 |
 | `codex_start` | 后台异步启动 Codex 任务并立即返回 `job_id` |
 | `codex_status` | 查看后台任务实时进度或最终结果（支持 `wait_seconds` 长轮询） |
 | `codex_cancel` | 终止正在运行的后台 Codex 任务（清理整棵子进程树） |
-| `codex_info` | 健康检查，显示当前解析到的 `codex.exe` 路径、版本与任务概览 |
+| `codex_config` | 读取/更新与侧边栏 UI 共享的默认模型、思考深度、沙箱和协作模式，并列出本地可用模型 |
+| `codex_info` | 健康检查，显示 `codex.exe` 路径、版本、当前生效的面板配置与任务概览 |
 
 ## 安装方式
-
-将本仓库克隆到 Antigravity 的全局插件目录：
 
 ```bash
 git clone https://github.com/yeyuhants-prog/codex-bridge.git ~/.gemini/config/plugins/codex-bridge
 ```
-
-（Windows PowerShell 下为 `C:\Users\<用户名>\.gemini\config\plugins\codex-bridge`）
-
-安装后即可在 Antigravity 的 Customizations / Plugins 页面随时开关 **Codex Bridge**。
 
 ## 自测
 

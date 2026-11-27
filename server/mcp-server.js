@@ -6,10 +6,17 @@ import {
   formatCodexResult,
 } from "./codex-runner.js";
 import { JobManager } from "./job-manager.js";
+import {
+  loadSettings,
+  saveSettings,
+  appendHistory,
+  readCodexTomlDefaults,
+  readCodexModelsCatalog,
+} from "./settings-store.js";
 
 const SERVER_INFO = {
   name: "codex-mcp-bridge",
-  version: "1.0.0",
+  version: "1.1.0",
 };
 
 const SUPPORTED_PROTOCOL_VERSIONS = [
@@ -61,14 +68,19 @@ const COMMON_RUN_PROPERTIES = {
   sandbox: {
     type: "string",
     enum: ["read-only", "workspace-write", "danger-full-access"],
-    default: "workspace-write",
     description:
-      "Sandbox policy for Codex shell commands. Use 'read-only' for analysis/Q&A, 'workspace-write' (default) for editing files & running workspace tests, or 'danger-full-access' only when explicitly needed.",
+      "Sandbox policy for Codex shell commands. Omit to use the active Codex Bridge UI panel setting (defaults to 'workspace-write').",
   },
   model: {
     type: "string",
     description:
-      "Optional model override for Codex (e.g. 'gpt-5.4', 'o3'). Omit to use your default Codex config.",
+      "Optional model override for Codex (e.g. 'gpt-6.2-sol', 'gpt-6.2-astra'). Omit to use the model selected in the Codex Bridge UI panel or ~/.codex/config.toml.",
+  },
+  reasoning_effort: {
+    type: "string",
+    enum: ["low", "medium", "high", "xhigh", "max", "ultra"],
+    description:
+      "Optional reasoning effort override for Codex. Omit to use the level selected in the Codex Bridge UI panel or Codex default.",
   },
   profile: {
     type: "string",
@@ -93,7 +105,6 @@ const COMMON_RUN_PROPERTIES = {
   },
   ephemeral: {
     type: "boolean",
-    default: false,
     description: "If true, do not persist the Codex session to disk.",
   },
   worktree: {
@@ -103,9 +114,8 @@ const COMMON_RUN_PROPERTIES = {
   },
   skip_git_repo_check: {
     type: "boolean",
-    default: true,
     description:
-      "Allow Codex to run outside a Git repository (default: true).",
+      "Allow Codex to run outside a Git repository (defaults to UI panel setting / true).",
   },
   output_schema: {
     type: "string",
@@ -118,7 +128,7 @@ const TOOLS = [
   {
     name: "codex_run",
     description:
-      "Run a task synchronously with local OpenAI Codex CLI (`codex exec`) and return its final response, session_id (for follow-up via codex_resume), modified files, executed commands, and token usage. Best for tasks finishing within a few minutes; for very long or parallel tasks, use codex_start.",
+      "Run a task synchronously with local OpenAI Codex CLI (`codex exec`) using the model, reasoning effort, and sandbox configured in the Codex Bridge UI panel (unless explicitly overridden). Returns final response, session_id, modified files, executed commands, and token usage.",
     inputSchema: {
       type: "object",
       properties: {
@@ -158,6 +168,7 @@ const TOOLS = [
           description: "Working directory for the resumed session.",
         },
         model: COMMON_RUN_PROPERTIES.model,
+        reasoning_effort: COMMON_RUN_PROPERTIES.reasoning_effort,
         images: COMMON_RUN_PROPERTIES.images,
         config: COMMON_RUN_PROPERTIES.config,
         skip_git_repo_check: COMMON_RUN_PROPERTIES.skip_git_repo_check,
@@ -201,9 +212,10 @@ const TOOLS = [
         prompt: {
           type: "string",
           description:
-            "Optional custom review instructions (note: Codex may treat custom prompt as an alternative to target flags depending on CLI version).",
+            "Optional custom review instructions.",
         },
         model: COMMON_RUN_PROPERTIES.model,
+        reasoning_effort: COMMON_RUN_PROPERTIES.reasoning_effort,
         config: COMMON_RUN_PROPERTIES.config,
         timeout_seconds: {
           type: "number",
@@ -276,9 +288,46 @@ const TOOLS = [
     },
   },
   {
+    name: "codex_config",
+    description:
+      "Read or update the persistent Codex Bridge preferences (model, reasoning_effort, sandbox, workflow_mode) shared with the Codex Bridge UI panel, and list available local Codex models.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        model: {
+          type: "string",
+          description:
+            "Set default Codex model slug (pass empty string '' to follow ~/.codex/config.toml).",
+        },
+        reasoning_effort: {
+          type: "string",
+          enum: ["", "low", "medium", "high", "xhigh", "max", "ultra"],
+          description:
+            "Set default reasoning effort (pass '' to follow model/config default).",
+        },
+        sandbox: {
+          type: "string",
+          enum: ["read-only", "workspace-write", "danger-full-access"],
+          description: "Set default sandbox policy.",
+        },
+        workflow_mode: {
+          type: "string",
+          enum: ["direct", "plan_first"],
+          description:
+            "Set collaboration mode: 'direct' executes immediately; 'plan_first' drafts a detailed brief for user confirmation before invoking Codex.",
+        },
+        list_models: {
+          type: "boolean",
+          default: true,
+          description: "Include available local Codex models in the output.",
+        },
+      },
+    },
+  },
+  {
     name: "codex_info",
     description:
-      "Check Codex MCP bridge health: shows the resolved codex.exe binary path, CLI version, and active/recent background jobs.",
+      "Check Codex Bridge health: shows resolved codex.exe path & version, active UI panel preferences (model, reasoning effort, sandbox, workflow mode), and tracked background jobs.",
     inputSchema: {
       type: "object",
       properties: {},
@@ -287,26 +336,51 @@ const TOOLS = [
 ];
 
 function mapCommonOptions(args) {
+  const prefs = loadSettings();
   return {
     cwd: args.cwd,
-    sandbox: args.sandbox,
-    model: args.model,
+    sandbox: args.sandbox || prefs.sandbox || "workspace-write",
+    model: args.model || prefs.model || undefined,
+    reasoningEffort:
+      args.reasoning_effort || prefs.reasoningEffort || undefined,
     profile: args.profile,
     addDirs: args.add_dirs,
     images: args.images,
     config: args.config,
-    ephemeral: Boolean(args.ephemeral),
+    ephemeral:
+      args.ephemeral !== undefined ? Boolean(args.ephemeral) : prefs.ephemeral,
     worktree: Boolean(args.worktree),
     skipGitRepoCheck:
-      args.skip_git_repo_check === undefined
-        ? true
-        : Boolean(args.skip_git_repo_check),
+      args.skip_git_repo_check !== undefined
+        ? Boolean(args.skip_git_repo_check)
+        : prefs.skipGitRepoCheck,
     outputSchema: args.output_schema,
     timeoutMs:
       typeof args.timeout_seconds === "number" && args.timeout_seconds > 0
         ? args.timeout_seconds * 1000
         : undefined,
   };
+}
+
+function recordRunHistory(mode, opts, result) {
+  appendHistory({
+    mode,
+    status: result.ok
+      ? "completed"
+      : result.cancelled
+        ? "cancelled"
+        : result.timedOut
+          ? "timed_out"
+          : "failed",
+    model: opts.model || "(codex default)",
+    reasoningEffort: opts.reasoningEffort || "(default)",
+    sandbox: opts.sandbox || "workspace-write",
+    cwd: result.cwd || opts.cwd || process.cwd(),
+    sessionId: result.sessionId || null,
+    durationMs: result.durationMs || 0,
+    usage: result.usage || null,
+    promptPreview: String(opts.prompt || "").replace(/\s+/g, " ").slice(0, 140),
+  });
 }
 
 async function handleToolCall(name, args = {}, meta = {}, signal) {
@@ -316,16 +390,65 @@ async function handleToolCall(name, args = {}, meta = {}, signal) {
     const resolved = resolveCodexBinary();
     const version = resolved ? getCodexVersion(resolved.path) : "not found";
     const jobs = jobManager.listJobs();
+    const prefs = loadSettings();
+    const toml = readCodexTomlDefaults();
+    const effectiveModel =
+      prefs.model || `${toml.model || "default"} (Codex 默认)`;
+    const effectiveEffort =
+      prefs.reasoningEffort ||
+      `${toml.reasoningEffort || "default"} (Codex 默认)`;
     const text = [
       `Bridge: ${SERVER_INFO.name} v${SERVER_INFO.version}`,
       `Node: ${process.version}`,
       `Codex Binary: ${resolved ? `${resolved.path} (${resolved.source})` : "NOT FOUND"}`,
       `Codex Version: ${version}`,
+      `Active Model: ${effectiveModel}`,
+      `Reasoning Effort: ${effectiveEffort}`,
+      `Sandbox Policy: ${prefs.sandbox}`,
+      `Workflow Mode: ${prefs.workflowMode}`,
       `Tracked Jobs: ${jobs.length} (${jobs.filter((j) => j.status === "running").length} running)`,
     ].join("\n");
     return {
       content: [{ type: "text", text }],
       isError: !resolved,
+    };
+  }
+
+  if (name === "codex_config") {
+    const patch = {};
+    if (args.model !== undefined) patch.model = args.model;
+    if (args.reasoning_effort !== undefined)
+      patch.reasoningEffort = args.reasoning_effort;
+    if (args.sandbox !== undefined) patch.sandbox = args.sandbox;
+    if (args.workflow_mode !== undefined)
+      patch.workflowMode = args.workflow_mode;
+
+    const updated =
+      Object.keys(patch).length > 0 ? saveSettings(patch) : loadSettings();
+    const toml = readCodexTomlDefaults();
+    const lines = [
+      `## Active Codex Bridge Preferences`,
+      `- Model: ${updated.model || `(follow Codex default: ${toml.model || "auto"})`}`,
+      `- Reasoning Effort: ${updated.reasoningEffort || `(follow default: ${toml.reasoningEffort || "auto"})`}`,
+      `- Sandbox: ${updated.sandbox}`,
+      `- Workflow Mode: ${updated.workflowMode}`,
+      `- Ephemeral: ${updated.ephemeral}`,
+    ];
+
+    if (args.list_models !== false) {
+      const models = readCodexModelsCatalog();
+      if (models.length > 0) {
+        lines.push(`\n## Available Local Codex Models (${models.length})`);
+        for (const m of models) {
+          const efforts = m.efforts.map((e) => e.effort).join(", ");
+          lines.push(
+            `- \`${m.slug}\` (${m.displayName})${efforts ? ` — efforts: ${efforts}` : ""}`
+          );
+        }
+      }
+    }
+    return {
+      content: [{ type: "text", text: lines.join("\n") }],
     };
   }
 
@@ -336,15 +459,19 @@ async function handleToolCall(name, args = {}, meta = {}, signal) {
         isError: true,
       };
     }
-    const result = await runCodex({
+    const opts = {
       mode: "run",
       prompt: args.prompt,
       ...mapCommonOptions(args),
+    };
+    const result = await runCodex({
+      ...opts,
       signal,
       onProgress: ({ eventCount, summary }) => {
         sendProgress(progressToken, eventCount, summary);
       },
     });
+    recordRunHistory("run", opts, result);
     return {
       content: [{ type: "text", text: formatCodexResult(result) }],
       isError: !result.ok,
@@ -363,16 +490,20 @@ async function handleToolCall(name, args = {}, meta = {}, signal) {
         isError: true,
       };
     }
-    const result = await runCodex({
+    const opts = {
       mode: "resume",
       sessionId: args.session_id,
       prompt: args.prompt,
       ...mapCommonOptions(args),
+    };
+    const result = await runCodex({
+      ...opts,
       signal,
       onProgress: ({ eventCount, summary }) => {
         sendProgress(progressToken, eventCount, summary);
       },
     });
+    recordRunHistory("resume", opts, result);
     return {
       content: [{ type: "text", text: formatCodexResult(result) }],
       isError: !result.ok,
@@ -386,7 +517,8 @@ async function handleToolCall(name, args = {}, meta = {}, signal) {
         isError: true,
       };
     }
-    const result = await runCodex({
+    const common = mapCommonOptions(args);
+    const opts = {
       mode: "review",
       cwd: args.cwd,
       uncommitted: Boolean(args.uncommitted),
@@ -394,17 +526,22 @@ async function handleToolCall(name, args = {}, meta = {}, signal) {
       commit: args.commit,
       title: args.title,
       prompt: args.prompt,
-      model: args.model,
+      model: common.model,
+      reasoningEffort: common.reasoningEffort,
       config: args.config,
       timeoutMs:
         typeof args.timeout_seconds === "number" && args.timeout_seconds > 0
           ? args.timeout_seconds * 1000
           : 600_000,
+    };
+    const result = await runCodex({
+      ...opts,
       signal,
       onProgress: ({ eventCount, summary }) => {
         sendProgress(progressToken, eventCount, summary);
       },
     });
+    recordRunHistory("review", opts, result);
     return {
       content: [{ type: "text", text: formatCodexResult(result) }],
       isError: !result.ok,
@@ -419,16 +556,22 @@ async function handleToolCall(name, args = {}, meta = {}, signal) {
       };
     }
     const mode = args.session_id ? "resume" : "run";
-    const job = jobManager.startJob({
+    const opts = {
       mode,
       sessionId: args.session_id,
       prompt: args.prompt,
       ...mapCommonOptions(args),
+    };
+    const job = jobManager.startJob(opts);
+    job.promise.then(() => {
+      if (job.result) recordRunHistory(mode, opts, job.result);
     });
     const text = [
       `Started background Codex job.`,
       `Job ID: ${job.id}`,
       `Mode: ${job.mode}`,
+      `Model: ${opts.model || "(codex default)"}`,
+      `Reasoning Effort: ${opts.reasoningEffort || "(default)"}`,
       `Working Dir: ${job.cwd}`,
       `Use codex_status(job_id="${job.id}", wait_seconds=30) to monitor progress or collect the result.`,
     ].join("\n");
@@ -536,7 +679,7 @@ async function handleRequest(msg) {
         },
         serverInfo: SERVER_INFO,
         instructions:
-          "Use codex_run for synchronous tasks, codex_resume to continue a prior Codex session_id, codex_review for Git code reviews, and codex_start/codex_status/codex_cancel for long-running or parallel Codex workers.",
+          "Use codex_run for synchronous tasks, codex_resume to continue a prior Codex session_id, codex_review for Git code reviews, codex_start/codex_status/codex_cancel for long-running or parallel Codex workers, and codex_config/codex_info to inspect or update active preferences shared with the Codex Bridge sidecar panel.",
       });
       return;
     }
@@ -616,7 +759,6 @@ process.stdin.on("data", (chunk) => {
       continue;
     }
 
-    // Dispatch concurrently so status/cancel/ping never block behind a long codex_run.
     void handleRequest(msg);
   }
 });

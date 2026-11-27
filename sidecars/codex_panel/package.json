@@ -1,0 +1,6 @@
+{
+  "name": "codex_panel",
+  "version": "1.1.0",
+  "type": "module",
+  "description": "Interactive sidecar control panel for Codex Bridge"
+}

@@ -79,8 +79,8 @@ async function main() {
     const toolsRes = await client.request("tools/list");
     const toolNames = toolsRes.tools.map((t) => t.name);
     console.log("2) tools/list OK:", toolNames.join(", "));
-    if (toolNames.length !== 7) {
-      throw new Error(`Expected 7 tools, got ${toolNames.length}`);
+    if (toolNames.length !== 8) {
+      throw new Error(`Expected 8 tools, got ${toolNames.length}`);
     }
 
     const infoRes = await client.request("tools/call", {
@@ -90,6 +90,15 @@ async function main() {
     console.log("3) codex_info OK:\n" + infoRes.content[0].text);
     if (infoRes.isError) {
       throw new Error("codex_info returned isError=true");
+    }
+
+    const cfgRes = await client.request("tools/call", {
+      name: "codex_config",
+      arguments: { list_models: true },
+    });
+    console.log("4) codex_config OK (length=" + cfgRes.content[0].text.length + ")");
+    if (cfgRes.isError) {
+      throw new Error("codex_config returned isError=true");
     }
 
     if (LIVE) {

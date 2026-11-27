@@ -112,11 +112,18 @@ function appendCommonConfigArgs(args, opts) {
   if (opts.profile) {
     args.push("-p", String(opts.profile));
   }
-  if (Array.isArray(opts.config)) {
-    for (const kv of opts.config) {
-      if (typeof kv === "string" && kv.trim()) {
-        args.push("-c", kv.trim());
-      }
+  const configList = Array.isArray(opts.config) ? [...opts.config] : [];
+  if (
+    opts.reasoningEffort &&
+    !configList.some((kv) =>
+      typeof kv === "string" && kv.trim().startsWith("model_reasoning_effort=")
+    )
+  ) {
+    configList.push(`model_reasoning_effort="${String(opts.reasoningEffort).trim()}"`);
+  }
+  for (const kv of configList) {
+    if (typeof kv === "string" && kv.trim()) {
+      args.push("-c", kv.trim());
     }
   }
   if (Array.isArray(opts.images)) {
