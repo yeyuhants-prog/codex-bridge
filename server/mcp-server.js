@@ -28,7 +28,7 @@ import {
 
 const SERVER_INFO = {
   name: "codex-mcp-bridge",
-  version: "1.2.0",
+  version: "1.3.0",
 };
 
 const SUPPORTED_PROTOCOL_VERSIONS = [
@@ -407,6 +407,11 @@ const TOOLS = [
     inputSchema: {
       type: "object",
       properties: {
+        language: {
+          type: "string",
+          enum: ["zh", "en"],
+          description: "UI & callback language ('zh' for Chinese, 'en' for English).",
+        },
         model: {
           type: "string",
           description:
@@ -540,6 +545,7 @@ async function handleToolCall(name, args = {}, meta = {}, signal) {
       `Sandbox Policy: ${prefs.sandbox}`,
       `Workflow Mode: ${prefs.workflowMode}`,
       `Progression Mode: ${prefs.progressionMode} (maxAutoIterations=${prefs.maxAutoIterations})`,
+      `UI Language: ${prefs.language}`,
       `Bound Conversation: ${prefs.boundConversationId || "(open Sidecar panel to bind)"}`,
       `Active Goal: ${goalLine}`,
       `Tracked Jobs: ${jobs.length} (${jobs.filter((j) => j.status === "running").length} running)`,
@@ -701,6 +707,7 @@ async function handleToolCall(name, args = {}, meta = {}, signal) {
 
   if (name === "codex_config") {
     const patch = {};
+    if (args.language !== undefined) patch.language = args.language;
     if (args.model !== undefined) patch.model = args.model;
     if (args.reasoning_effort !== undefined)
       patch.reasoningEffort = args.reasoning_effort;
@@ -717,6 +724,7 @@ async function handleToolCall(name, args = {}, meta = {}, signal) {
     const toml = readCodexTomlDefaults();
     const lines = [
       `## Active Codex Bridge Preferences`,
+      `- Language: ${updated.language}`,
       `- Model: ${updated.model || `(follow Codex default: ${toml.model || "auto"})`}`,
       `- Reasoning Effort: ${updated.reasoningEffort || `(follow default: ${toml.reasoningEffort || "auto"})`}`,
       `- Sandbox: ${updated.sandbox}`,

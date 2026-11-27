@@ -162,6 +162,32 @@ h1 {
   color: #fff;
 }
 
+.hero-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.lang-btn {
+  height: 30px;
+  padding: 0 9px;
+  border-radius: 8px;
+  border: 1px solid var(--cb-border);
+  background: var(--cb-surface);
+  color: var(--cb-fg);
+  cursor: pointer;
+  font-size: 11.5px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  transition: background 0.15s, border-color 0.15s;
+}
+
+.lang-btn:hover {
+  background: var(--cb-surface-hover);
+  border-color: var(--cb-brand);
+}
+
 .icon-btn {
   width: 30px;
   height: 30px;

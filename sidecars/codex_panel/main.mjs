@@ -74,6 +74,7 @@ function maybeBindConversation(conversationId, explicitProjectId = "") {
 function buildCallbackMessage(job, settings, goal) {
   const summary = job.resultSummary || {};
   const mode = settings.progressionMode;
+  const isEn = settings.language === "en";
   const isAutonomousEligible =
     mode === "autonomous" &&
     goal &&
@@ -82,7 +83,9 @@ function buildCallbackMessage(job, settings, goal) {
       (goal.maxIterations || settings.maxAutoIterations || 12);
 
   const lines = [
-    `[Codex Bridge Auto-Callback] 后台 Codex 任务已完成（${job.status}）`,
+    isEn
+      ? `[Codex Bridge Auto-Callback] Background Codex job finished (${job.status})`
+      : `[Codex Bridge Auto-Callback] 后台 Codex 任务已完成（${job.status}）`,
     ``,
     `- **Job ID**: \`${job.id}\``,
     `- **Status**: \`${job.status}\` | **Model**: \`${job.model || "default"}\` | **Effort**: \`${job.reasoningEffort || "default"}\``,
@@ -113,26 +116,38 @@ function buildCallbackMessage(job, settings, goal) {
       .slice(0, 12)
       .map((f) => `  - [${f.kind || "modified"}] ${f.path}`)
       .join("\n");
-    lines.push(`\n**改动文件 (${summary.fileChanges.length})**:\n${files}`);
+    lines.push(
+      isEn
+        ? `\n**File Changes (${summary.fileChanges.length})**:\n${files}`
+        : `\n**改动文件 (${summary.fileChanges.length})**:\n${files}`
+    );
   }
 
   if (summary.lastMessage) {
     const preview = summary.lastMessage.slice(0, 1800);
     lines.push(
-      `\n**Codex 回复摘要**:\n${preview}${summary.lastMessage.length > 1800 ? "\n...(已截断，可调用 codex_status 查看完整输出)" : ""}`
+      isEn
+        ? `\n**Codex Summary**:\n${preview}${summary.lastMessage.length > 1800 ? "\n...(truncated; call codex_status for full output)" : ""}`
+        : `\n**Codex 回复摘要**:\n${preview}${summary.lastMessage.length > 1800 ? "\n...(已截断，可调用 codex_status 查看完整输出)" : ""}`
     );
   } else if (job.error) {
-    lines.push(`\n**错误信息**: ${job.error}`);
+    lines.push(
+      isEn ? `\n**Error**: ${job.error}` : `\n**错误信息**: ${job.error}`
+    );
   }
 
   lines.push("");
   if (isAutonomousEligible) {
     lines.push(
-      `**推进指令（目标持续自动推进模式）**：请立刻验收上述结果与里程碑验证条件，调用 \`codex_goal(action="update_milestone")\` 更新里程碑状态；若未通过则用 \`codex_resume(session_id="${job.sessionId || "last"}")\` 返工，若已通过且还有待办里程碑，请自动调用 \`codex_start\` 推进下一阶段直到目标达成（如遇需用户决策的阻塞点则暂停并汇报）。`
+      isEn
+        ? `**Progression Instruction (Autonomous Mode)**: Immediately verify the result & milestone checks, update the milestone via \`codex_goal(action="update_milestone")\`; if verification failed, call \`codex_resume(session_id="${job.sessionId || "last"}")\` to fix it, or if passed and pending milestones remain, call \`codex_start\` for the next milestone until complete (pause & report if user input is required).`
+        : `**推进指令（目标持续自动推进模式）**：请立刻验收上述结果与里程碑验证条件，调用 \`codex_goal(action="update_milestone")\` 更新里程碑状态；若未通过则用 \`codex_resume(session_id="${job.sessionId || "last"}")\` 返工，若已通过且还有待办里程碑，请自动调用 \`codex_start\` 推进下一阶段直到目标达成（如遇需用户决策的阻塞点则暂停并汇报）。`
     );
   } else if (mode === "autonomous" && goal && goal.status !== "active") {
     lines.push(
-      `**推进提示**：目标当前状态为 \`${goal.status}\`，已停止自动推进。请先向用户汇报本次验收结果。`
+      isEn
+        ? `**Progression Notice**: Goal status is \`${goal.status}\`, so autonomous progression stopped. Please report the verification summary to the user.`
+        : `**推进提示**：目标当前状态为 \`${goal.status}\`，已停止自动推进。请先向用户汇报本次验收结果。`
     );
   } else if (
     mode === "autonomous" &&
@@ -141,11 +156,15 @@ function buildCallbackMessage(job, settings, goal) {
       (goal.maxIterations || settings.maxAutoIterations || 12)
   ) {
     lines.push(
-      `**推进提示**：已达到目标最大自动轮次上限（${goal.iterationCount}/${goal.maxIterations || settings.maxAutoIterations}），已自动暂停。请汇报当前进展与验收结果，询问用户是否继续。`
+      isEn
+        ? `**Progression Notice**: Reached max automatic iterations (${goal.iterationCount}/${goal.maxIterations || settings.maxAutoIterations}). Auto-paused; report current progress and ask whether to continue.`
+        : `**推进提示**：已达到目标最大自动轮次上限（${goal.iterationCount}/${goal.maxIterations || settings.maxAutoIterations}），已自动暂停。请汇报当前进展与验收结果，询问用户是否继续。`
     );
   } else {
     lines.push(
-      `**推进指令（完工自动验收模式）**：请验收上述 Codex 执行结果、更新对应里程碑状态（如有），向用户清晰汇报发现与结论，并给出下一步建议。`
+      isEn
+        ? `**Progression Instruction (Notify & Verify Mode)**: Verify the Codex output above, update any linked milestone, present verified findings clearly, and propose the next step.`
+        : `**推进指令（完工自动验收模式）**：请验收上述 Codex 执行结果、更新对应里程碑状态（如有），向用户清晰汇报发现与结论，并给出下一步建议。`
     );
   }
 
@@ -220,7 +239,7 @@ function buildState(query = {}) {
   const history = loadHistory();
 
   return {
-    pluginVersion: "1.2.0",
+    pluginVersion: "1.3.0",
     codex: {
       found: Boolean(resolved),
       path: resolved?.path || null,
@@ -281,6 +300,7 @@ app.api(
   "/api/settings",
   (data) => {
     const settings = saveSettings({
+      language: data.language,
       model: data.model,
       reasoningEffort: data.reasoningEffort,
       sandbox: data.sandbox,

@@ -2,7 +2,7 @@ import { spawn } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const SERVER_PATH =
@@ -99,15 +99,62 @@ async function main() {
     const cfgRes = await client.request("tools/call", {
       name: "codex_config",
       arguments: {
+        language: "en",
         progression_mode: "autonomous",
         max_auto_iterations: 15,
         list_models: true,
       },
     });
     console.log("4) codex_config OK (length=" + cfgRes.content[0].text.length + ")");
-    if (cfgRes.isError || !cfgRes.content[0].text.includes("autonomous")) {
-      throw new Error("codex_config failed to update progression_mode");
+    if (
+      cfgRes.isError ||
+      !cfgRes.content[0].text.includes("autonomous") ||
+      !cfgRes.content[0].text.includes("Language: en")
+    ) {
+      throw new Error("codex_config failed to update language/progression_mode");
     }
+
+    // Unit-test false-failed fix in evaluateRunOutcome
+    const runnerMod = await import(
+      pathToFileURL(path.resolve(path.dirname(SERVER_PATH), "codex-runner.js")).href
+    );
+    const v1 = runnerMod.evaluateRunOutcome({
+      exitCode: 0,
+      timedOut: false,
+      cancelled: false,
+      turnCompleted: true,
+      turnFailed: false,
+      errors: ["Reconnecting... 1/5"],
+      warnings: [],
+    });
+    if (!v1.ok || v1.errors.length !== 0 || v1.warnings.length === 0) {
+      throw new Error("Expected recovered turn.completed to be ok=true with warning");
+    }
+    const v2 = runnerMod.evaluateRunOutcome({
+      exitCode: 1,
+      timedOut: false,
+      cancelled: false,
+      turnCompleted: true,
+      turnFailed: false,
+      errors: [],
+      warnings: [],
+    });
+    if (!v2.ok || v2.warnings.length === 0) {
+      throw new Error("Expected post-turn.completed non-zero exit to be ok=true with warning");
+    }
+    const v3 = runnerMod.evaluateRunOutcome({
+      exitCode: 0,
+      timedOut: false,
+      cancelled: false,
+      turnCompleted: false,
+      turnFailed: true,
+      errors: ["fatal turn failure"],
+      warnings: [],
+    });
+    if (v3.ok) {
+      throw new Error("Expected turn.failed to be ok=false");
+    }
+    console.log("4b) evaluateRunOutcome false-failed unit tests OK");
 
     const goalCreate = await client.request("tools/call", {
       name: "codex_goal",

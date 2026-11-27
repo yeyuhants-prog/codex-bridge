@@ -6,7 +6,7 @@
 
 **带原生交互式控制面板、持久化目标板、完工自动回调闭环与零依赖 MCP 桥接服务的 Antigravity 插件，直接指挥你本机的 OpenAI Codex CLI 持续排查、验证与推进任务。**
 
-[![Version](https://img.shields.io/badge/version-1.2.0-7c3aed?style=flat-square)](./plugin.json)
+[![Version](https://img.shields.io/badge/version-1.3.0-7c3aed?style=flat-square)](./plugin.json)
 [![Node](https://img.shields.io/badge/node-%3E%3D18.0.0-22c55e?style=flat-square)](https://nodejs.org/)
 [![Dependencies](https://img.shields.io/badge/dependencies-zero-0ea5e9?style=flat-square)](#架构一览)
 [![MCP](https://img.shields.io/badge/protocol-MCP%20Stdio-f59e0b?style=flat-square)](https://modelcontextprotocol.io/)
@@ -20,7 +20,7 @@
 
 ## 核心特性
 
-- **原生侧边栏交互面板（控制台 + 目标与任务双页签）**：直接出现在 Antigravity 右侧「插件」菜单中，可视化实时调整：
+- **原生侧边栏交互面板（中 / EN 一键切换 + 控制台/目标双页签）**：直接出现在 Antigravity 右侧「插件」菜单中，右上角支持一键切换中英文界面与回调文案，并可视化实时调整：
   - **Codex 干活模型**（自动读取本机 `~/.codex/models_cache.json` 中的全部可用模型）
   - **思考深度（Reasoning Effort）**（随模型动态适配 `low / medium / high / xhigh / max / ultra`）
   - **目标推进模式（Progression Mode）**（随时切换）：

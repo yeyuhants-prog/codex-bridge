@@ -260,6 +260,50 @@ function summarizeEvent(evt) {
   return type;
 }
 
+const RECOVERABLE_ERROR_RE =
+  /reconnecting|stream disconnected|retrying|temporarily unavailable|connection reset|econnreset/i;
+
+/**
+ * Pure verdict helper (exported for unit tests).
+ * Distinguishes fatal turn failures from transient reconnect warnings or
+ * post-completion shutdown exit codes when `turn.completed` already succeeded.
+ */
+export function evaluateRunOutcome({
+  exitCode,
+  timedOut,
+  cancelled,
+  turnCompleted,
+  turnFailed,
+  errors = [],
+  warnings = [],
+}) {
+  const finalErrors = [...errors];
+  const finalWarnings = [...warnings];
+
+  if (timedOut || cancelled || turnFailed) {
+    return { ok: false, errors: finalErrors, warnings: finalWarnings };
+  }
+
+  if (turnCompleted) {
+    // Earlier transient errors that did not prevent turn.completed are downgraded to warnings.
+    if (finalErrors.length > 0) {
+      for (const e of finalErrors) {
+        finalWarnings.push(`Recovered before turn.completed: ${e}`);
+      }
+      finalErrors.length = 0;
+    }
+    if (exitCode !== 0 && exitCode !== null) {
+      finalWarnings.push(
+        `Process exited with code ${exitCode} after turn.completed`
+      );
+    }
+    return { ok: true, errors: finalErrors, warnings: finalWarnings };
+  }
+
+  const ok = exitCode === 0 && finalErrors.length === 0;
+  return { ok, errors: finalErrors, warnings: finalWarnings };
+}
+
 /**
  * Run a Codex CLI invocation and parse its JSONL event stream.
  *
@@ -316,6 +360,9 @@ export function runCodex(options) {
       commands: [],
       fileChanges: [],
       errors: [],
+      warnings: [],
+      turnCompleted: false,
+      turnFailed: false,
       usage: null,
       eventCount: 0,
       recentEvents: [],
@@ -354,12 +401,22 @@ export function runCodex(options) {
 
       if (evt.type === "thread.started" && evt.thread_id) {
         state.sessionId = evt.thread_id;
-      } else if (evt.type === "turn.completed" && evt.usage) {
-        state.usage = evt.usage;
-      } else if (evt.type === "turn.failed" || evt.type === "error") {
+      } else if (evt.type === "turn.completed") {
+        state.turnCompleted = true;
+        if (evt.usage) state.usage = evt.usage;
+      } else if (evt.type === "turn.failed") {
+        state.turnFailed = true;
         const msg =
           evt.error?.message || evt.message || JSON.stringify(evt);
         state.errors.push(msg);
+      } else if (evt.type === "error") {
+        const msg =
+          evt.error?.message || evt.message || JSON.stringify(evt);
+        if (RECOVERABLE_ERROR_RE.test(msg)) {
+          state.warnings.push(msg);
+        } else {
+          state.errors.push(msg);
+        }
       } else if (evt.type === "item.completed" && evt.item) {
         const item = evt.item;
         if (item.type === "agent_message" && typeof item.text === "string") {
@@ -466,14 +523,18 @@ export function runCodex(options) {
           ? state.messages[state.messages.length - 1]
           : state.rawStdoutLines.join("\n").trim();
 
-      const ok =
-        code === 0 &&
-        !state.timedOut &&
-        !state.cancelled &&
-        state.errors.length === 0;
+      const verdict = evaluateRunOutcome({
+        exitCode: code,
+        timedOut: state.timedOut,
+        cancelled: state.cancelled,
+        turnCompleted: state.turnCompleted,
+        turnFailed: state.turnFailed,
+        errors: state.errors,
+        warnings: state.warnings,
+      });
 
       resolve({
-        ok,
+        ok: verdict.ok,
         exitCode: code,
         signal,
         durationMs,
@@ -485,7 +546,8 @@ export function runCodex(options) {
         commands: state.commands,
         fileChanges: state.fileChanges,
         usage: state.usage,
-        errors: state.errors,
+        errors: verdict.errors,
+        warnings: verdict.warnings,
         stderr: state.stderr.trim(),
         timedOut: state.timedOut,
         cancelled: state.cancelled,
@@ -550,6 +612,12 @@ export function formatCodexResult(result) {
       .map((c) => `- \`${c.command}\` (exit ${c.exitCode ?? "?"})`)
       .join("\n");
     sections.push(`## Commands Executed (${result.commands.length})\n\n${list}`);
+  }
+
+  if (result.warnings?.length) {
+    sections.push(
+      `## Warnings (Non-Fatal)\n\n${result.warnings.map((w) => `- ${w}`).join("\n")}`
+    );
   }
 
   if (result.errors?.length) {

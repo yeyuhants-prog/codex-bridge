@@ -39,6 +39,7 @@ export function writeJsonAtomic(filePath, data) {
 }
 
 export const DEFAULT_SETTINGS = {
+  language: "zh", // "zh" | "en"
   model: "", // "" means follow ~/.codex/config.toml default
   reasoningEffort: "", // "" means follow model/config default
   sandbox: "workspace-write",
@@ -50,6 +51,8 @@ export const DEFAULT_SETTINGS = {
   ephemeral: false,
   skipGitRepoCheck: true,
 };
+
+const VALID_LANGUAGES = new Set(["zh", "en"]);
 
 const VALID_SANDBOXES = new Set([
   "read-only",
@@ -82,6 +85,9 @@ export function loadSettings() {
     const raw = JSON.parse(fs.readFileSync(filePath, "utf8"));
     const maxIter = Number(raw.maxAutoIterations);
     return {
+      language: VALID_LANGUAGES.has(raw.language)
+        ? raw.language
+        : DEFAULT_SETTINGS.language,
       model: typeof raw.model === "string" ? raw.model.trim() : "",
       reasoningEffort: VALID_EFFORTS.has(raw.reasoningEffort)
         ? raw.reasoningEffort
@@ -127,6 +133,10 @@ export function saveSettings(patch = {}) {
       : undefined;
 
   const next = {
+    language:
+      patch.language !== undefined && VALID_LANGUAGES.has(patch.language)
+        ? patch.language
+        : current.language,
     model:
       patch.model !== undefined
         ? String(patch.model ?? "").trim()

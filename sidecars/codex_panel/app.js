@@ -1,11 +1,230 @@
-const EFFORT_LABELS = {
-  "": "跟随默认",
-  low: "低 (low)",
-  medium: "中 (medium)",
-  high: "高 (high)",
-  xhigh: "超高 (xhigh)",
-  max: "极高 (max)",
-  ultra: "极限 (ultra)",
+const I18N = {
+  zh: {
+    langToggle: "EN",
+    langToggleTitle: "Switch to English",
+    refreshTitle: "刷新状态、模型与目标",
+    statusChecking: "检测中…",
+    statusConnected: "已连接",
+    statusNotFound: "未找到 Codex",
+    loadingMeta: "正在读取本机 Codex 环境与模型列表",
+    notFoundMeta: "请检查本机 Codex 安装或设置 CODEX_BIN",
+    tabControl: "控制台",
+    tabGoals: "目标与任务",
+    modelTitle: "Codex 干活模型",
+    modelDefaultHint: (m) => `Codex 默认: ${m}`,
+    modelFollowDefault: (m) => `跟随 Codex 默认 (${m})`,
+    modelCustom: (m) => `${m} (自定义)`,
+    effortTitle: "思考深度（Reasoning Effort）",
+    effortHint: (e) => `当前默认: ${e}`,
+    effortFollowDesc: (e) => `跟随默认（${e}）`,
+    efforts: {
+      "": "跟随默认",
+      low: "低 (low)",
+      medium: "中 (medium)",
+      high: "高 (high)",
+      xhigh: "超高 (xhigh)",
+      max: "极高 (max)",
+      ultra: "极限 (ultra)",
+    },
+    progressionTitle: "目标推进模式（Progression）",
+    progManual: "手动推进",
+    progManualSub: "干完不回调，等你指示",
+    progNotify: "完工自动验收",
+    progNotifySub: "后台跑完自动唤醒汇报",
+    progAuto: "持续自动推进",
+    progAutoSub: "自动验收→返工/下一步",
+    maxIterLabel: "自动推进轮次上限",
+    bindConvBtn: "绑定当前对话",
+    boundCurrent: "已绑定当前对话 ✓",
+    boundOther: (id) => `已绑定对话 ${id}…`,
+    unbound: "未绑定回调对话",
+    sandboxTitle: "执行权限（Sandbox）与派活方式",
+    sbReadOnly: "只读分析",
+    sbWrite: "工作区可写",
+    sbFull: "完全权限",
+    wfDirect: "直接派活执行",
+    wfDirectSub: "拆解后立即交给 Codex",
+    wfPlan: "先出任务单确认",
+    wfPlanSub: "你点头后再启动 Codex",
+    ephemeralLabel: "临时会话模式（不写入 Codex 历史会话）",
+    resetBtn: "恢复默认",
+    quickTitle: "快捷派活给反重力 → Codex",
+    quickPlaceholder: "描述你想让 Codex 持续排查、验证或修改的后端/Meta分析任务…",
+    sendTaskBtn: "发送任务给反重力",
+    checkStatusBtn: "对话自检",
+    goalBoardTitle: "持久化目标板（Goal & Milestones）",
+    newGoalBtn: "+ 新建目标",
+    goalTitlePlaceholder: "目标标题，例如：排查后端鉴权 500 报错并补全单测",
+    goalCwdPlaceholder: "项目目录（可选，留空自动使用当前工作区）",
+    goalMilestonesPlaceholder: "子里程碑（每行一条），例如：\n复现 500 错误并定位根因\n修复代码并跑通 pytest\n验证接口回归无副作用",
+    createGoalBtn: "创建并设为当前目标",
+    cancelBtn: "取消",
+    emptyGoal: "暂无持久化目标。点右上角「+ 新建目标」或直接在对话中让反重力创建目标板～",
+    goalMeta: (id, done, total, iter, max) => `${id} · 进度 ${done}/${total} · 自动轮次 ${iter}/${max}`,
+    msToggleTitle: "点击切换完成状态",
+    msVerifyPrefix: "验证: ",
+    msNotesPrefix: "备注: ",
+    continueGoalBtn: "让反重力继续推进此目标",
+    resumeGoalBtn: "恢复推进",
+    pauseGoalBtn: "暂停自动推进",
+    deleteBtn: "删除",
+    jobsTitle: "后台 Codex 任务（断点可续接）",
+    jobsCount: (n) => `${n} 个`,
+    emptyJobs: "暂无后台任务记录（使用 codex_start 启动后会实时显示）。",
+    cbSent: "已自动回调 ✓",
+    cbPending: "完工将自动回调",
+    resumeSessionBtn: "续跑 Session",
+    checkProgressBtn: "查进度",
+    historyTitle: "最近执行记录",
+    historyCount: (n) => `${n} 条`,
+    emptyHistory: "还没有执行记录，派 Codex 干一单后会显示在这里～",
+    noPromptPreview: "(无提示词预览)",
+    copySessionBtn: "复制 Session",
+    toastRefreshed: "已刷新 Codex 状态、模型与目标板",
+    toastSaved: "配置已保存并实时生效 ✓",
+    toastReset: "已恢复默认设置",
+    toastLangSwitched: "已切换为中文界面 ✓",
+    toastBound: "已绑定当前对话，后台任务完工将自动回调 ✓",
+    toastNoConv: "当前不在对话侧边栏内，无法获取对话 ID",
+    toastGoalCreated: "已创建持久化目标 ✓",
+    toastGoalDeleted: "已删除目标",
+    toastGoalResumed: "目标已恢复为 active",
+    toastGoalPaused: "目标已暂停，不再自动推进",
+    toastMsUpdated: (id, st) => `里程碑 ${id} 已标记为 ${st}`,
+    toastCopiedSid: (id) => `已复制 Session ID: ${id}…`,
+    toastSent: "已发送到当前反重力对话 ✓",
+    toastNoSidecarMsg: "当前页面不在对话侧边栏中，无法直接发消息",
+    toastNeedTask: "请先输入想让 Codex 执行的任务内容",
+    toastLoadErr: (m) => `加载失败: ${m}`,
+    toastSaveErr: (m) => `保存失败: ${m}`,
+    toastResetErr: (m) => `重置失败: ${m}`,
+    toastActionErr: (m) => `操作失败: ${m}`,
+    toastSendErr: (m) => `发送失败: ${m}`,
+    msgContinueGoal: (id, title, prog) =>
+      `请调用 codex_goal(action="get", goal_id="${id}") 读取目标「${title}」的当前进度与关联 Session，按照当前推进模式（${prog}）继续推进下一个未完成的里程碑并验收。`,
+    msgResumeJob: (sid, jid) =>
+      `请使用 \`codex_resume(session_id="${sid}")\` 续接后台任务 \`${jid}\` 的上下文，检查当前进度并继续完成剩余工作。`,
+    msgCheckJob: (jid) =>
+      `请调用 \`codex_status(job_id="${jid}")\` 查看这个后台 Codex 任务的最新进度。`,
+    msgDispatchPlan: (prog, raw) =>
+      `请先为以下需求建好持久化目标板（codex_goal）并输出详细任务单给我确认，确认后按当前推进模式（${prog}）派给 Codex 执行：\n\n${raw}`,
+    msgDispatchDirect: (prog, raw) =>
+      `请先为以下需求建好持久化目标板（codex_goal），然后按当前推进模式（${prog}）直接调用 Codex Bridge 派给 Codex 执行并持续验证：\n\n${raw}`,
+    msgCheckStatus: "请调用 codex_info 检查当前 Codex Bridge 的模型、推进模式、目标进度与连接状态。",
+  },
+  en: {
+    langToggle: "中文",
+    langToggleTitle: "切换为中文",
+    refreshTitle: "Refresh status, models & goals",
+    statusChecking: "Checking…",
+    statusConnected: "Connected",
+    statusNotFound: "Codex Not Found",
+    loadingMeta: "Loading local Codex runtime & model catalog",
+    notFoundMeta: "Check local Codex installation or set CODEX_BIN",
+    tabControl: "Controls",
+    tabGoals: "Goals & Jobs",
+    modelTitle: "Codex Model",
+    modelDefaultHint: (m) => `Codex default: ${m}`,
+    modelFollowDefault: (m) => `Follow Codex default (${m})`,
+    modelCustom: (m) => `${m} (custom)`,
+    effortTitle: "Reasoning Effort",
+    effortHint: (e) => `Default: ${e}`,
+    effortFollowDesc: (e) => `Follow default (${e})`,
+    efforts: {
+      "": "Default",
+      low: "Low",
+      medium: "Medium",
+      high: "High",
+      xhigh: "Extra High",
+      max: "Max",
+      ultra: "Ultra",
+    },
+    progressionTitle: "Goal Progression Mode",
+    progManual: "Manual",
+    progManualSub: "No auto-callback; wait for prompt",
+    progNotify: "Notify & Verify",
+    progNotifySub: "Wake Antigravity when job finishes",
+    progAuto: "Autonomous",
+    progAutoSub: "Verify → fix or advance milestones",
+    maxIterLabel: "Max auto-iterations",
+    bindConvBtn: "Bind Conversation",
+    boundCurrent: "Bound to this chat ✓",
+    boundOther: (id) => `Bound to ${id}…`,
+    unbound: "No conversation bound",
+    sandboxTitle: "Sandbox Policy & Briefing Mode",
+    sbReadOnly: "Read-only",
+    sbWrite: "Workspace Write",
+    sbFull: "Full Access",
+    wfDirect: "Direct Dispatch",
+    wfDirectSub: "Plan and dispatch to Codex directly",
+    wfPlan: "Plan First",
+    wfPlanSub: "Show brief for approval first",
+    ephemeralLabel: "Ephemeral sessions (do not persist Codex history)",
+    resetBtn: "Reset Defaults",
+    quickTitle: "Quick Dispatch (Antigravity → Codex)",
+    quickPlaceholder: "Describe a backend fix, verification, or meta-analysis task for Codex…",
+    sendTaskBtn: "Send Task to Antigravity",
+    checkStatusBtn: "Health Check",
+    goalBoardTitle: "Persistent Goal & Milestone Board",
+    newGoalBtn: "+ New Goal",
+    goalTitlePlaceholder: "Goal title, e.g. Fix auth 500 error & pass pytest",
+    goalCwdPlaceholder: "Working directory (optional, defaults to workspace)",
+    goalMilestonesPlaceholder: "Milestones (one per line), e.g.\nReproduce 500 error & find root cause\nImplement fix and pass pytest\nVerify no regressions",
+    createGoalBtn: "Create & Set Active",
+    cancelBtn: "Cancel",
+    emptyGoal: "No persistent goals yet. Click \"+ New Goal\" or ask Antigravity to create one.",
+    goalMeta: (id, done, total, iter, max) => `${id} · ${done}/${total} done · iter ${iter}/${max}`,
+    msToggleTitle: "Click to toggle done status",
+    msVerifyPrefix: "Verify: ",
+    msNotesPrefix: "Notes: ",
+    continueGoalBtn: "Continue This Goal",
+    resumeGoalBtn: "Resume",
+    pauseGoalBtn: "Pause Auto",
+    deleteBtn: "Delete",
+    jobsTitle: "Background Codex Jobs (Resumable)",
+    jobsCount: (n) => `${n}`,
+    emptyJobs: "No background jobs yet (jobs launched via codex_start appear here).",
+    cbSent: "Callback sent ✓",
+    cbPending: "Will auto-callback",
+    resumeSessionBtn: "Resume Session",
+    checkProgressBtn: "Check Status",
+    historyTitle: "Recent Runs",
+    historyCount: (n) => `${n}`,
+    emptyHistory: "No recent runs yet.",
+    noPromptPreview: "(no prompt preview)",
+    copySessionBtn: "Copy Session",
+    toastRefreshed: "Refreshed Codex status, models & goals",
+    toastSaved: "Settings saved & active ✓",
+    toastReset: "Reset to defaults",
+    toastLangSwitched: "Switched to English ✓",
+    toastBound: "Bound to this conversation for auto-callbacks ✓",
+    toastNoConv: "Open inside a conversation side-pane to bind",
+    toastGoalCreated: "Created persistent goal ✓",
+    toastGoalDeleted: "Deleted goal",
+    toastGoalResumed: "Goal resumed (active)",
+    toastGoalPaused: "Goal paused (auto-progression stopped)",
+    toastMsUpdated: (id, st) => `Milestone ${id} marked ${st}`,
+    toastCopiedSid: (id) => `Copied Session ID: ${id}…`,
+    toastSent: "Sent to current Antigravity chat ✓",
+    toastNoSidecarMsg: "Cannot message chat outside side-pane",
+    toastNeedTask: "Please enter a task description first",
+    toastLoadErr: (m) => `Load failed: ${m}`,
+    toastSaveErr: (m) => `Save failed: ${m}`,
+    toastResetErr: (m) => `Reset failed: ${m}`,
+    toastActionErr: (m) => `Action failed: ${m}`,
+    toastSendErr: (m) => `Send failed: ${m}`,
+    msgContinueGoal: (id, title, prog) =>
+      `Call codex_goal(action="get", goal_id="${id}") to inspect goal "${title}" and its linked session, then advance and verify the next pending milestone under progression mode "${prog}".`,
+    msgResumeJob: (sid, jid) =>
+      `Use \`codex_resume(session_id="${sid}")\` to resume background job \`${jid}\`, inspect its current state, and finish the remaining work.`,
+    msgCheckJob: (jid) =>
+      `Call \`codex_status(job_id="${jid}")\` to check the latest progress of this background Codex job.`,
+    msgDispatchPlan: (prog, raw) =>
+      `First create a persistent goal via codex_goal and present a detailed Codex task brief for my approval, then dispatch under progression mode "${prog}":\n\n${raw}`,
+    msgDispatchDirect: (prog, raw) =>
+      `Create a persistent goal via codex_goal, then dispatch directly through Codex Bridge under progression mode "${prog}" and verify the results:\n\n${raw}`,
+    msgCheckStatus: "Call codex_info to check Codex Bridge status, active model, progression mode, and goal progress.",
+  },
 };
 
 const FALLBACK_EFFORTS = ["low", "medium", "high", "xhigh", "max", "ultra"];
@@ -18,6 +237,7 @@ const el = {
   statusPill: document.getElementById("status-pill"),
   codexMeta: document.getElementById("codex-meta"),
   toast: document.getElementById("toast"),
+  btnLang: document.getElementById("btn-lang"),
   tabs: document.querySelectorAll(".tab"),
   tabBadge: document.getElementById("tab-badge"),
   panelControl: document.getElementById("panel-control"),
@@ -54,6 +274,35 @@ const el = {
   historyCount: document.getElementById("history-count"),
   historyList: document.getElementById("history-list"),
 };
+
+function getLang() {
+  return state?.settings?.language === "en" ? "en" : "zh";
+}
+
+function t() {
+  return I18N[getLang()];
+}
+
+function applyStaticI18n() {
+  const dict = t();
+  document.documentElement.lang = getLang() === "en" ? "en" : "zh-CN";
+  el.btnLang.textContent = dict.langToggle;
+  el.btnLang.title = dict.langToggleTitle;
+  el.btnRefresh.title = dict.refreshTitle;
+
+  for (const node of document.querySelectorAll("[data-i18n]")) {
+    const key = node.dataset.i18n;
+    if (typeof dict[key] === "string") {
+      node.textContent = dict[key];
+    }
+  }
+  for (const node of document.querySelectorAll("[data-i18n-placeholder]")) {
+    const key = node.dataset.i18nPlaceholder;
+    if (typeof dict[key] === "string") {
+      node.placeholder = dict[key];
+    }
+  }
+}
 
 function apiFetch(url, options = {}) {
   if (window.sidecar && typeof window.sidecar.fetch === "function") {
@@ -114,15 +363,16 @@ function getSelectedModelObj() {
 }
 
 function renderHeader() {
+  const dict = t();
   const c = state.codex;
   if (c.found) {
-    el.statusPill.textContent = c.version || "已连接";
+    el.statusPill.textContent = c.version || dict.statusConnected;
     el.statusPill.className = "status-pill ok";
     el.codexMeta.textContent = `${c.source || "Codex"} · v${state.pluginVersion}`;
   } else {
-    el.statusPill.textContent = "未找到 Codex";
+    el.statusPill.textContent = dict.statusNotFound;
     el.statusPill.className = "status-pill err";
-    el.codexMeta.textContent = "请检查本机 Codex 安装或设置 CODEX_BIN";
+    el.codexMeta.textContent = dict.notFoundMeta;
   }
 
   const runningJobs = (state.jobs || []).filter((j) => j.status === "running").length;
@@ -133,14 +383,15 @@ function renderHeader() {
 }
 
 function renderModels() {
+  const dict = t();
   const { models, settings, tomlDefaults } = state;
   const tomlModel = tomlDefaults?.model || "auto";
-  el.modelDefaultHint.textContent = `Codex 默认: ${tomlModel}`;
+  el.modelDefaultHint.textContent = dict.modelDefaultHint(tomlModel);
 
   el.modelSelect.innerHTML = "";
   const defOpt = document.createElement("option");
   defOpt.value = "";
-  defOpt.textContent = `跟随 Codex 默认 (${tomlModel})`;
+  defOpt.textContent = dict.modelFollowDefault(tomlModel);
   el.modelSelect.appendChild(defOpt);
 
   for (const m of models) {
@@ -153,7 +404,7 @@ function renderModels() {
   if (settings.model && !models.some((m) => m.slug === settings.model)) {
     const customOpt = document.createElement("option");
     customOpt.value = settings.model;
-    customOpt.textContent = `${settings.model} (自定义)`;
+    customOpt.textContent = dict.modelCustom(settings.model);
     el.modelSelect.appendChild(customOpt);
   }
 
@@ -163,6 +414,7 @@ function renderModels() {
 }
 
 function renderEfforts() {
+  const dict = t();
   const { settings, tomlDefaults } = state;
   const activeModel = getSelectedModelObj();
   const supported =
@@ -172,11 +424,11 @@ function renderEfforts() {
 
   const defaultEffortLabel =
     tomlDefaults?.reasoningEffort || activeModel?.defaultEffort || "auto";
-  el.effortHint.textContent = `当前默认: ${defaultEffortLabel}`;
+  el.effortHint.textContent = dict.effortHint(defaultEffortLabel);
 
   el.effortGroup.innerHTML = "";
   const items = [
-    { effort: "", description: `跟随默认（${defaultEffortLabel}）` },
+    { effort: "", description: dict.effortFollowDesc(defaultEffortLabel) },
     ...supported,
   ];
 
@@ -190,7 +442,7 @@ function renderEfforts() {
       btn.classList.add("active");
       activeDesc = item.description || "";
     }
-    btn.textContent = EFFORT_LABELS[item.effort] || item.effort;
+    btn.textContent = dict.efforts[item.effort] || item.effort;
     btn.addEventListener("click", () => {
       updateSetting({ reasoningEffort: item.effort });
     });
@@ -200,6 +452,7 @@ function renderEfforts() {
 }
 
 function renderSegments() {
+  const dict = t();
   const { settings } = state;
   for (const btn of el.progressionGroup.querySelectorAll(".seg-btn")) {
     btn.classList.toggle(
@@ -223,16 +476,17 @@ function renderSegments() {
   if (settings.boundConversationId) {
     const isCurrent = curConv && settings.boundConversationId === curConv;
     el.bindBadge.textContent = isCurrent
-      ? "已绑定当前对话 ✓"
-      : `已绑定对话 ${settings.boundConversationId.slice(0, 8)}…`;
+      ? dict.boundCurrent
+      : dict.boundOther(settings.boundConversationId.slice(0, 8));
     el.bindBadge.className = "hint ok";
   } else {
-    el.bindBadge.textContent = "未绑定回调对话";
+    el.bindBadge.textContent = dict.unbound;
     el.bindBadge.className = "hint";
   }
 }
 
 function renderGoals() {
+  const dict = t();
   const store = state.goalsStore || { activeGoalId: null, goals: [] };
   const goals = store.goals || [];
   const activeGoal =
@@ -257,8 +511,7 @@ function renderGoals() {
   if (!activeGoal) {
     const empty = document.createElement("div");
     empty.className = "empty";
-    empty.textContent =
-      "暂无持久化目标。点右上角「+ 新建目标」或直接在对话中让反重力创建目标板～";
+    empty.textContent = dict.emptyGoal;
     el.activeGoalView.appendChild(empty);
     return;
   }
@@ -275,7 +528,13 @@ function renderGoals() {
   title.textContent = activeGoal.title;
   const meta = document.createElement("div");
   meta.className = "goal-meta";
-  meta.textContent = `${activeGoal.id} · 进度 ${doneCount}/${totalCount} · 自动轮次 ${activeGoal.iterationCount || 0}/${activeGoal.maxIterations || 12}`;
+  meta.textContent = dict.goalMeta(
+    activeGoal.id,
+    doneCount,
+    totalCount,
+    activeGoal.iterationCount || 0,
+    activeGoal.maxIterations || 12
+  );
   left.append(title, meta);
 
   const badge = document.createElement("span");
@@ -307,7 +566,7 @@ function renderGoals() {
     checkBtn.type = "button";
     checkBtn.className = `ms-check ${ms.status}`;
     checkBtn.textContent = msIcons[ms.status] || "";
-    checkBtn.title = "点击切换完成状态";
+    checkBtn.title = dict.msToggleTitle;
     checkBtn.addEventListener("click", async () => {
       try {
         const nextStatus = ms.status === "done" ? "pending" : "done";
@@ -320,25 +579,25 @@ function renderGoals() {
           }),
         });
         await fetchState(true);
-        showToast(`里程碑 ${ms.id} 已标记为 ${nextStatus}`);
+        showToast(t().toastMsUpdated(ms.id, nextStatus));
       } catch (err) {
-        showToast(`更新失败: ${err.message}`, true);
+        showToast(t().toastActionErr(err.message), true);
       }
     });
 
     const body = document.createElement("div");
     body.className = "ms-body";
-    const t = document.createElement("div");
-    t.className = `ms-title ${ms.status === "done" ? "done" : ""}`;
-    t.textContent = `${ms.id}. ${ms.title}`;
-    body.appendChild(t);
+    const titleEl = document.createElement("div");
+    titleEl.className = `ms-title ${ms.status === "done" ? "done" : ""}`;
+    titleEl.textContent = `${ms.id}. ${ms.title}`;
+    body.appendChild(titleEl);
 
     if (ms.verification || ms.notes) {
       const sub = document.createElement("div");
       sub.className = "ms-sub";
       sub.textContent = [
-        ms.verification ? `验证: ${ms.verification}` : "",
-        ms.notes ? `备注: ${ms.notes}` : "",
+        ms.verification ? `${dict.msVerifyPrefix}${ms.verification}` : "",
+        ms.notes ? `${dict.msNotesPrefix}${ms.notes}` : "",
       ]
         .filter(Boolean)
         .join(" · ");
@@ -355,10 +614,14 @@ function renderGoals() {
   const btnContinue = document.createElement("button");
   btnContinue.type = "button";
   btnContinue.className = "primary-btn";
-  btnContinue.textContent = "让反重力继续推进此目标";
+  btnContinue.textContent = dict.continueGoalBtn;
   btnContinue.addEventListener("click", async () => {
     await sendToConversation(
-      `请调用 codex_goal(action="get", goal_id="${activeGoal.id}") 读取目标「${activeGoal.title}」的当前进度与关联 Session，按照当前推进模式（${state.settings.progressionMode}）继续推进下一个未完成的里程碑并验收。`
+      t().msgContinueGoal(
+        activeGoal.id,
+        activeGoal.title,
+        state.settings.progressionMode
+      )
     );
   });
   actions.appendChild(btnContinue);
@@ -367,7 +630,7 @@ function renderGoals() {
   btnPause.type = "button";
   btnPause.className = "mini-btn";
   const isPaused = activeGoal.status === "paused";
-  btnPause.textContent = isPaused ? "恢复推进" : "暂停自动推进";
+  btnPause.textContent = isPaused ? dict.resumeGoalBtn : dict.pauseGoalBtn;
   btnPause.addEventListener("click", async () => {
     try {
       const nextStatus = isPaused ? "active" : "paused";
@@ -376,9 +639,9 @@ function renderGoals() {
         body: JSON.stringify({ goalId: activeGoal.id, status: nextStatus }),
       });
       await fetchState(true);
-      showToast(isPaused ? "目标已恢复为 active" : "目标已暂停，不再自动推进");
+      showToast(isPaused ? t().toastGoalResumed : t().toastGoalPaused);
     } catch (err) {
-      showToast(`操作失败: ${err.message}`, true);
+      showToast(t().toastActionErr(err.message), true);
     }
   });
   actions.appendChild(btnPause);
@@ -386,7 +649,7 @@ function renderGoals() {
   const btnDelete = document.createElement("button");
   btnDelete.type = "button";
   btnDelete.className = "mini-btn danger";
-  btnDelete.textContent = "删除";
+  btnDelete.textContent = dict.deleteBtn;
   btnDelete.addEventListener("click", async () => {
     try {
       await apiJson("/api/goals/delete", {
@@ -394,9 +657,9 @@ function renderGoals() {
         body: JSON.stringify({ goalId: activeGoal.id }),
       });
       await fetchState(true);
-      showToast("已删除目标");
+      showToast(t().toastGoalDeleted);
     } catch (err) {
-      showToast(`删除失败: ${err.message}`, true);
+      showToast(t().toastActionErr(err.message), true);
     }
   });
   actions.appendChild(btnDelete);
@@ -407,25 +670,30 @@ function renderGoals() {
 function formatTime(iso) {
   if (!iso) return "";
   try {
-    return new Date(iso).toLocaleTimeString("zh-CN", {
-      hour: "2-digit",
-      minute: "2-digit",
-      second: "2-digit",
-    });
+    return new Date(iso).toLocaleTimeString(
+      getLang() === "en" ? "en-US" : "zh-CN",
+      {
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit",
+        hour12: false,
+      }
+    );
   } catch {
     return iso;
   }
 }
 
 function renderJobs() {
+  const dict = t();
   const jobs = state.jobs || [];
-  el.jobsCount.textContent = `${jobs.length} 个`;
+  el.jobsCount.textContent = dict.jobsCount(jobs.length);
   el.jobsList.innerHTML = "";
 
   if (jobs.length === 0) {
     const empty = document.createElement("div");
     empty.className = "empty";
-    empty.textContent = "暂无后台任务记录（使用 codex_start 启动后会实时显示）。";
+    empty.textContent = dict.emptyJobs;
     el.jobsList.appendChild(empty);
     return;
   }
@@ -452,14 +720,14 @@ function renderJobs() {
 
     const prompt = document.createElement("div");
     prompt.className = "history-prompt";
-    prompt.textContent = job.promptPreview || "(无提示词预览)";
+    prompt.textContent = job.promptPreview || dict.noPromptPreview;
 
     const foot = document.createElement("div");
     foot.className = "history-foot";
     const cbNote = job.callbackSent
-      ? "已自动回调 ✓"
+      ? dict.cbSent
       : job.notifyOnComplete && job.status === "running"
-        ? "完工将自动回调"
+        ? dict.cbPending
         : job.model || "default";
     const metaText = document.createElement("span");
     metaText.textContent = cbNote;
@@ -472,11 +740,9 @@ function renderJobs() {
       const resumeBtn = document.createElement("button");
       resumeBtn.type = "button";
       resumeBtn.className = "copy-sid";
-      resumeBtn.textContent = "续跑 Session";
+      resumeBtn.textContent = dict.resumeSessionBtn;
       resumeBtn.addEventListener("click", async () => {
-        await sendToConversation(
-          `请使用 \`codex_resume(session_id="${job.sessionId}")\` 续接后台任务 \`${job.id}\` 的上下文，检查当前进度并继续完成剩余工作。`
-        );
+        await sendToConversation(t().msgResumeJob(job.sessionId, job.id));
       });
       footActions.appendChild(resumeBtn);
     }
@@ -485,11 +751,9 @@ function renderJobs() {
       const checkBtn = document.createElement("button");
       checkBtn.type = "button";
       checkBtn.className = "copy-sid";
-      checkBtn.textContent = "查进度";
+      checkBtn.textContent = dict.checkProgressBtn;
       checkBtn.addEventListener("click", async () => {
-        await sendToConversation(
-          `请调用 \`codex_status(job_id="${job.id}")\` 查看这个后台 Codex 任务的最新进度。`
-        );
+        await sendToConversation(t().msgCheckJob(job.id));
       });
       footActions.appendChild(checkBtn);
     }
@@ -501,14 +765,15 @@ function renderJobs() {
 }
 
 function renderHistory() {
+  const dict = t();
   const list = state.history || [];
-  el.historyCount.textContent = `${list.length} 条`;
+  el.historyCount.textContent = dict.historyCount(list.length);
   el.historyList.innerHTML = "";
 
   if (list.length === 0) {
     const empty = document.createElement("div");
     empty.className = "empty";
-    empty.textContent = "还没有执行记录，派 Codex 干一单后会显示在这里～";
+    empty.textContent = dict.emptyHistory;
     el.historyList.appendChild(empty);
     return;
   }
@@ -539,7 +804,7 @@ function renderHistory() {
 
     const prompt = document.createElement("div");
     prompt.className = "history-prompt";
-    prompt.textContent = item.promptPreview || "(无提示词预览)";
+    prompt.textContent = item.promptPreview || dict.noPromptPreview;
 
     const foot = document.createElement("div");
     foot.className = "history-foot";
@@ -554,12 +819,12 @@ function renderHistory() {
       const copyBtn = document.createElement("button");
       copyBtn.type = "button";
       copyBtn.className = "copy-sid";
-      copyBtn.textContent = "复制 Session";
+      copyBtn.textContent = dict.copySessionBtn;
       copyBtn.title = item.sessionId;
       copyBtn.addEventListener("click", async () => {
         try {
           await navigator.clipboard.writeText(item.sessionId);
-          showToast(`已复制 Session ID: ${item.sessionId.slice(0, 8)}…`);
+          showToast(t().toastCopiedSid(item.sessionId.slice(0, 8)));
         } catch {
           showToast(item.sessionId);
         }
@@ -573,6 +838,7 @@ function renderHistory() {
 }
 
 function renderAll() {
+  applyStaticI18n();
   renderHeader();
   renderModels();
   renderEfforts();
@@ -586,33 +852,35 @@ async function fetchState(silent = false) {
   try {
     const convId = getCurrentConvId();
     const qs = convId ? `?conversationId=${encodeURIComponent(convId)}` : "";
-    const res = await apiFetch(`/api/state${qs}`, { method: "GET" });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    state = await res.json();
+    state = await apiJson(`/api/state${qs}`, { method: "GET" });
     renderAll();
-    if (!silent) showToast("已刷新 Codex 状态、模型与目标板");
+    if (!silent) showToast(t().toastRefreshed);
   } catch (err) {
-    showToast(`加载失败: ${err.message}`, true);
+    showToast(t().toastLoadErr(err.message), true);
   }
 }
 
-async function updateSetting(patch) {
+async function updateSetting(patch, customToast = null) {
   try {
-    const res = await apiFetch("/api/settings", {
+    const data = await apiJson("/api/settings", {
       method: "POST",
       body: JSON.stringify(patch),
     });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const data = await res.json();
     state.settings = data.settings;
-    renderModels();
-    renderEfforts();
-    renderSegments();
-    showToast("配置已保存并实时生效 ✓");
+    renderAll();
+    showToast(customToast || t().toastSaved);
   } catch (err) {
-    showToast(`保存失败: ${err.message}`, true);
+    showToast(t().toastSaveErr(err.message), true);
   }
 }
+
+el.btnLang.addEventListener("click", () => {
+  const nextLang = getLang() === "en" ? "zh" : "en";
+  updateSetting(
+    { language: nextLang },
+    I18N[nextLang].toastLangSwitched
+  );
+});
 
 el.modelSelect.addEventListener("change", () => {
   updateSetting({ model: el.modelSelect.value });
@@ -632,7 +900,7 @@ el.maxIterInput.addEventListener("change", () => {
 el.btnBindConv.addEventListener("click", async () => {
   const convId = getCurrentConvId();
   if (!convId) {
-    showToast("当前不在对话侧边栏内，无法获取对话 ID", true);
+    showToast(t().toastNoConv, true);
     return;
   }
   try {
@@ -643,12 +911,12 @@ el.btnBindConv.addEventListener("click", async () => {
     if (data.ok) {
       state.settings = data.settings;
       renderSegments();
-      showToast("已绑定当前对话，后台任务完工将自动回调 ✓");
+      showToast(t().toastBound);
     } else {
-      showToast(data.error || "绑定失败", true);
+      showToast(data.error || t().toastActionErr("bind"), true);
     }
   } catch (err) {
-    showToast(`绑定失败: ${err.message}`, true);
+    showToast(t().toastActionErr(err.message), true);
   }
 });
 
@@ -672,14 +940,12 @@ el.btnRefresh.addEventListener("click", () => fetchState(false));
 
 el.btnReset.addEventListener("click", async () => {
   try {
-    const res = await apiFetch("/api/reset", { method: "POST", body: "{}" });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const data = await res.json();
+    const data = await apiJson("/api/reset", { method: "POST", body: "{}" });
     state.settings = data.settings;
     renderAll();
-    showToast("已恢复默认设置");
+    showToast(t().toastReset);
   } catch (err) {
-    showToast(`重置失败: ${err.message}`, true);
+    showToast(t().toastResetErr(err.message), true);
   }
 });
 
@@ -721,12 +987,12 @@ el.newGoalForm.addEventListener("submit", async (e) => {
       el.newGoalForm.classList.add("hidden");
       renderGoals();
       renderHeader();
-      showToast("已创建持久化目标 ✓");
+      showToast(t().toastGoalCreated);
     } else {
-      showToast(data.error || "创建失败", true);
+      showToast(data.error || t().toastActionErr("create"), true);
     }
   } catch (err) {
-    showToast(`创建失败: ${err.message}`, true);
+    showToast(t().toastActionErr(err.message), true);
   }
 });
 
@@ -741,44 +1007,42 @@ el.goalSelect.addEventListener("change", async () => {
     });
     await fetchState(true);
   } catch (err) {
-    showToast(`切换失败: ${err.message}`, true);
+    showToast(t().toastActionErr(err.message), true);
   }
 });
 
 async function sendToConversation(message) {
   if (!window.sidecar?.agent?.sendMessage) {
-    showToast("当前页面不在对话侧边栏中，无法直接发消息", true);
+    showToast(t().toastNoSidecarMsg, true);
     return;
   }
   try {
     await window.sidecar.agent.sendMessage(message);
-    showToast("已发送到当前反重力对话 ✓");
+    showToast(t().toastSent);
   } catch (err) {
-    showToast(`发送失败: ${err.message}`, true);
+    showToast(t().toastSendErr(err.message), true);
   }
 }
 
 el.btnSendTask.addEventListener("click", async () => {
   const raw = el.quickTask.value.trim();
   if (!raw) {
-    showToast("请先输入想让 Codex 执行的任务内容", true);
+    showToast(t().toastNeedTask, true);
     el.quickTask.focus();
     return;
   }
   const progMode = state?.settings?.progressionMode || "notify";
   const workflowMode = state?.settings?.workflowMode || "direct";
-  const hint =
+  const msg =
     workflowMode === "plan_first"
-      ? `请先为以下需求建好持久化目标板（codex_goal）并输出详细任务单给我确认，确认后按当前推进模式（${progMode}）派给 Codex 执行：`
-      : `请先为以下需求建好持久化目标板（codex_goal），然后按当前推进模式（${progMode}）直接调用 Codex Bridge 派给 Codex 执行并持续验证：`;
-  await sendToConversation(`${hint}\n\n${raw}`);
+      ? t().msgDispatchPlan(progMode, raw)
+      : t().msgDispatchDirect(progMode, raw);
+  await sendToConversation(msg);
   el.quickTask.value = "";
 });
 
 el.btnCheckStatus.addEventListener("click", async () => {
-  await sendToConversation(
-    "请调用 codex_info 检查当前 Codex Bridge 的模型、推进模式、目标进度与连接状态。"
-  );
+  await sendToConversation(t().msgCheckStatus);
 });
 
 fetchState(true);
