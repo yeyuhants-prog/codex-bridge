@@ -4,9 +4,11 @@ import {
   getCodexVersion,
   runCodex,
   formatCodexResult,
-  resolveResumeSandbox,
 } from "./codex-runner.js";
-import { JobManager, normalizeCallbackTarget } from "./job-manager.js";
+import { validateBooleans } from "./validation.js";
+import { workingDirectory, resolveResume } from "./run-policy.js";
+import { processIdentity } from "./process-identity.js";
+import { JobManager, normalizeCallbackTarget, readPersistedJobs, reconcilePersistedJobs } from "./job-manager.js";
 import {
   loadSettings,
   saveSettings,
@@ -22,7 +24,7 @@ import {
   updateGoalStatus,
   addMilestone,
   updateMilestone,
-  recordGoalExecution,
+  recordGoalExecution, reserveGoalDispatch, abandonGoalDispatch,
   deleteGoal,
   formatGoalSummary,
 } from "./goal-store.js";
@@ -44,6 +46,7 @@ const SUPPORTED_PROTOCOL_VERSIONS = [
 ];
 
 const jobManager = new JobManager();
+reconcilePersistedJobs();
 const activeRequests = new Map();
 
 function log(...args) {
@@ -99,14 +102,6 @@ function extractTrustedHostCallbackTarget(meta = {}, args = {}) {
     meta?.["antigravity/projectId"] ||
     "";
 
-  if (metaConv) {
-    return normalizeCallbackTarget({
-      conversationId: metaConv,
-      projectId: metaProj,
-      source: "mcp_meta",
-    });
-  }
-
   let envConv = process.env.ANTIGRAVITY_CONVERSATION_ID || "";
   const envProj = process.env.ANTIGRAVITY_PROJECT_ID || "";
   if (!envConv && process.env.ANTIGRAVITY_SOURCE_METADATA) {
@@ -118,23 +113,17 @@ function extractTrustedHostCallbackTarget(meta = {}, args = {}) {
     }
   }
 
-  if (envConv) {
-    return normalizeCallbackTarget({
-      conversationId: envConv,
-      projectId: envProj,
-      source: "host_env",
+  const targets = [[metaConv,metaProj,"mcp_meta"],[args.conversation_id,args.project_id,"agent_conversation_id"],[envConv,envProj,"host_env"]]
+    .filter(([id]) => id).map(([conversationId,projectId,source]) => {
+      const target = normalizeCallbackTarget({ conversationId,projectId,source });
+      if (!target) throw new Error("Invalid conversation_id.");
+      return target;
     });
+  if (new Set(targets.map(t => t.conversationId.toLowerCase())).size > 1 ||
+      new Set(targets.map(t => t.projectId.toLowerCase()).filter(Boolean)).size > 1) {
+    throw new Error("Conflicting conversation or project targets in request and host context.");
   }
-
-  if (typeof args?.conversation_id === "string" && args.conversation_id.trim()) {
-    return normalizeCallbackTarget({
-      conversationId: args.conversation_id.trim(),
-      projectId:
-        typeof args.project_id === "string" ? args.project_id.trim() : "",
-      source: "agent_conversation_id",
-    });
-  }
-
+  if (targets.length) return targets[0];
   return null;
 }
 
@@ -263,6 +252,7 @@ const TOOLS = [
             "Absolute working directory (required when resuming by session_id without resume_job_id or goal_id).",
         },
         sandbox: COMMON_RUN_PROPERTIES.sandbox,
+        add_dirs: COMMON_RUN_PROPERTIES.add_dirs,
         allow_sandbox_escalation: {
           type: "boolean",
           default: false,
@@ -296,6 +286,8 @@ const TOOLS = [
           type: "string",
           description: "Absolute path to the Git repository to review.",
         },
+        goal_id: COMMON_RUN_PROPERTIES.goal_id,
+        sandbox: COMMON_RUN_PROPERTIES.sandbox,
         uncommitted: {
           type: "boolean",
           description:
@@ -326,7 +318,7 @@ const TOOLS = [
           description: "Maximum seconds to wait before aborting (default 600).",
         },
       },
-      required: ["cwd"],
+      required: [],
     },
   },
   {
@@ -357,6 +349,7 @@ const TOOLS = [
           description:
             "Must be true to widen sandbox permissions relative to the original job.",
         },
+        transfer_callback: { type: "boolean", description: "Explicitly transfer the parent callback to this conversation." },
         notify_on_complete: {
           type: "boolean",
           description:
@@ -538,16 +531,16 @@ const TOOLS = [
       "Check Codex Bridge health: shows resolved codex.exe path & version, active UI panel preferences, active goal progress, and tracked background jobs.",
     inputSchema: {
       type: "object",
-      properties: {},
+      properties: { refresh: { type: "boolean", description: "Recheck the local CLI path and version." } },
     },
   },
 ];
 
-function mapCommonOptions(args) {
+function mapCommonOptions(args, resume = false) {
   const prefs = loadSettings();
-  const linkedGoal = args.goal_id ? getGoal(args.goal_id) : null;
+  const linkedGoal = args.goal_id ? getGoal(args.goal_id) : getGoal();
   return {
-    cwd: args.cwd || linkedGoal?.cwd || undefined,
+    cwd: resume ? args.cwd : workingDirectory(args.cwd, linkedGoal),
     sandbox: args.sandbox || prefs.sandbox || "workspace-write",
     model: args.model || prefs.model || undefined,
     reasoningEffort:
@@ -573,9 +566,20 @@ function mapCommonOptions(args) {
   };
 }
 
+function resumeOptions(args, target) {
+  return {
+    ...mapCommonOptions(args, true),
+    parentJobId: args.resume_job_id, sessionId: args.session_id,
+    prompt: args.prompt, sandbox: args.sandbox, model: args.model, reasoningEffort: args.reasoning_effort,
+    allowSandboxEscalation: args.allow_sandbox_escalation, transferCallback: args.transfer_callback,
+    callbackTarget: target, notifyOnComplete: args.notify_on_complete, skipGitRepoCheck: args.skip_git_repo_check,
+  };
+}
+
 function recordRunHistory(mode, opts, result) {
   appendHistory({
-    mode,
+    mode, conversationId: opts.callbackTarget?.conversationId || null, transferredFrom: opts.transferredFrom || null,
+    addDirs: opts.addDirs || [], skipGitRepoCheck: opts.skipGitRepoCheck,
     status: result.ok
       ? "completed"
       : result.cancelled
@@ -585,23 +589,43 @@ function recordRunHistory(mode, opts, result) {
           : "failed",
     model: opts.model || "(codex default)",
     reasoningEffort: opts.reasoningEffort || "(default)",
-    sandbox: opts.sandbox || "workspace-write",
+    sandbox: result.sandbox || opts.sandbox,
     goalId: opts.goalId || null,
     milestoneId: opts.milestoneId || null,
     cwd: result.cwd || opts.cwd || process.cwd(),
     sessionId: result.sessionId || null,
     durationMs: result.durationMs || 0,
     usage: result.usage || null,
+    executionKind: "sync",
+    prompt: opts.prompt,
     promptPreview: String(opts.prompt || "").replace(/\s+/g, " ").slice(0, 140),
   });
 }
 
+async function runWithGoal(opts, runtime) {
+  let reservation = reserveGoalDispatch(opts.goalId, opts.milestoneId);
+  try {
+    return await runCodex({
+      ...opts, ...runtime,
+      onSpawn(child) {
+        runtime.onSpawn?.(child);
+        if (reservation) {
+          recordGoalExecution(opts.goalId, { milestoneId: opts.milestoneId, reservationId: reservation });
+          reservation = null;
+        }
+      },
+    });
+  } finally { abandonGoalDispatch(opts.goalId, reservation); }
+}
+
 async function handleToolCall(name, args = {}, meta = {}, signal) {
+  validateBooleans(args);
   const progressToken = meta?.progressToken;
 
   if (name === "codex_info") {
-    const resolved = resolveCodexBinary();
-    const version = resolved ? getCodexVersion(resolved.path) : "not found";
+    if (args.refresh !== undefined && typeof args.refresh !== "boolean") throw new Error("refresh must be boolean.");
+    const resolved = resolveCodexBinary(args.refresh);
+    const version = resolved ? getCodexVersion(resolved.path, args.refresh) : "not found";
     const jobs = jobManager.listJobs();
     const prefs = loadSettings();
     const toml = readCodexTomlDefaults();
@@ -846,10 +870,9 @@ async function handleToolCall(name, args = {}, meta = {}, signal) {
     const opts = {
       mode: "run",
       prompt: args.prompt,
-      ...mapCommonOptions(args),
+      ...mapCommonOptions(args), callbackTarget: extractTrustedHostCallbackTarget(meta, args),
     };
-    const result = await runCodex({
-      ...opts,
+    const result = await runWithGoal(opts, {
       signal,
       onProgress: ({ eventCount, summary }) => {
         sendProgress(progressToken, eventCount, summary);
@@ -859,7 +882,7 @@ async function handleToolCall(name, args = {}, meta = {}, signal) {
       recordGoalExecution(opts.goalId, {
         milestoneId: opts.milestoneId,
         sessionId: result.sessionId,
-        incrementIteration: true,
+        incrementIteration: false,
       });
     }
     recordRunHistory("run", opts, result);
@@ -877,68 +900,9 @@ async function handleToolCall(name, args = {}, meta = {}, signal) {
       };
     }
 
-    const prefs = loadSettings();
-    let oldJob = null;
-    if (args.resume_job_id) {
-      oldJob = await jobManager.getStatus(args.resume_job_id, 0);
-      if (!oldJob) {
-        return {
-          content: [
-            { type: "text", text: `Error: Previous job not found: ${args.resume_job_id}` },
-          ],
-          isError: true,
-        };
-      }
-    }
-
-    const sid = (
-      (typeof args.session_id === "string" && args.session_id.trim()) ||
-      (oldJob?.sessionId || "").trim()
-    );
-    if (!sid || sid === "last") {
-      return {
-        content: [
-          {
-            type: "text",
-            text: "Error: An exact session_id (or a valid resume_job_id with a recorded session_id) is required; 'last' fallback is disabled.",
-          },
-        ],
-        isError: true,
-      };
-    }
-
-    // Inherit cwd, goalId, milestoneId, sandbox from oldJob when available
-    const linkedGoal = (args.goal_id || oldJob?.goalId)
-      ? getGoal(args.goal_id || oldJob?.goalId)
-      : null;
-    const cwd = args.cwd || oldJob?.cwd || linkedGoal?.cwd;
-    if (!cwd) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: "Error: 'cwd' is required when resuming without a prior resume_job_id or goal_id (refusing to default to the plugin server directory).",
-          },
-        ],
-        isError: true,
-      };
-    }
-
-    let effectiveSandbox;
-    try {
-      effectiveSandbox = resolveResumeSandbox({
-        requestedSandbox: args.sandbox,
-        originalSandbox: oldJob?.sandbox,
-        fallbackSandbox: prefs.sandbox || "workspace-write",
-        allowEscalation: Boolean(args.allow_sandbox_escalation),
-      });
-    } catch (err) {
-      return {
-        content: [{ type: "text", text: `Error: ${err.message}` }],
-        isError: true,
-      };
-    }
-
+    const opts = resolveResume(resumeOptions(args, extractTrustedHostCallbackTarget(meta, args)), readPersistedJobs());
+    const { sessionId: sid, cwd } = opts;
+    reconcilePersistedJobs(jobManager._localRunningIds);
     // Cross-process per-session mutual exclusion
     const syncLockId = `sync_${Date.now()}_${Math.random().toString(16).slice(2, 8)}`;
     const active = jobManager.findActiveJobForSession(sid);
@@ -970,38 +934,11 @@ async function handleToolCall(name, args = {}, meta = {}, signal) {
       };
     }
 
-    const opts = {
-      mode: "resume",
-      sessionId: sid,
-      prompt: args.prompt,
-      cwd,
-      sandbox: effectiveSandbox,
-      model: args.model || oldJob?.model || prefs.model || undefined,
-      reasoningEffort:
-        args.reasoning_effort ||
-        oldJob?.reasoningEffort ||
-        prefs.reasoningEffort ||
-        undefined,
-      goalId: args.goal_id || oldJob?.goalId || undefined,
-      milestoneId: args.milestone_id || oldJob?.milestoneId || undefined,
-      images: args.images,
-      config: args.config,
-      skipGitRepoCheck:
-        args.skip_git_repo_check !== undefined
-          ? Boolean(args.skip_git_repo_check)
-          : prefs.skipGitRepoCheck,
-      timeoutMs:
-        typeof args.timeout_seconds === "number" && args.timeout_seconds > 0
-          ? args.timeout_seconds * 1000
-          : 600_000,
-    };
-
     try {
-      const result = await runCodex({
-        ...opts,
+      const result = await runWithGoal(opts, {
         signal,
         onSpawn: (child) => {
-          if (child.pid) updateSessionLockPid(sid, syncLockId, child.pid);
+          if (child.pid && !updateSessionLockPid(sid, lockRes.ownerToken, child.pid, processIdentity(child.pid))) throw new Error("Lost session lock.");
         },
         onProgress: ({ eventCount, summary }) => {
           sendProgress(progressToken, eventCount, summary);
@@ -1011,7 +948,7 @@ async function handleToolCall(name, args = {}, meta = {}, signal) {
         recordGoalExecution(opts.goalId, {
           milestoneId: opts.milestoneId,
           sessionId: result.sessionId || sid,
-          incrementIteration: true,
+          incrementIteration: false,
         });
       }
       recordRunHistory("resume", opts, result);
@@ -1020,21 +957,15 @@ async function handleToolCall(name, args = {}, meta = {}, signal) {
         isError: !result.ok,
       };
     } finally {
-      releaseSessionLock(sid, syncLockId, { force: true });
+      releaseSessionLock(sid, lockRes.ownerToken);
     }
   }
 
   if (name === "codex_review") {
-    if (!args.cwd) {
-      return {
-        content: [{ type: "text", text: "Error: 'cwd' is required." }],
-        isError: true,
-      };
-    }
     const common = mapCommonOptions(args);
     const opts = {
       mode: "review",
-      cwd: args.cwd,
+      cwd: common.cwd, sandbox: common.sandbox, callbackTarget: extractTrustedHostCallbackTarget(meta, args),
       uncommitted: Boolean(args.uncommitted),
       base: args.base,
       commit: args.commit,
@@ -1067,23 +998,7 @@ async function handleToolCall(name, args = {}, meta = {}, signal) {
 
     // Structured resume by previous job_id
     if (args.resume_job_id) {
-      const { job, reused } = jobManager.resumeFromJob(args.resume_job_id, {
-        prompt: args.prompt,
-        sandbox: args.sandbox,
-        allowSandboxEscalation: Boolean(args.allow_sandbox_escalation),
-        model: args.model,
-        reasoningEffort: args.reasoning_effort,
-        goalId: args.goal_id,
-        milestoneId: args.milestone_id,
-        callbackTarget: trustedTarget,
-        notifyOnComplete: args.notify_on_complete,
-        timeoutMs:
-          typeof args.timeout_seconds === "number" && args.timeout_seconds > 0
-            ? args.timeout_seconds * 1000
-            : undefined,
-        config: args.config,
-        images: args.images,
-      });
+      const { job, reused } = jobManager.resumeFromJob(args.resume_job_id, resumeOptions(args, trustedTarget));
 
       const lines = reused
         ? [
@@ -1112,32 +1027,8 @@ async function handleToolCall(name, args = {}, meta = {}, signal) {
       };
     }
 
-    const mode = args.session_id ? "resume" : "run";
-    const common = mapCommonOptions(args);
-    if (mode === "resume") {
-      if (args.session_id.trim() === "last") {
-        return {
-          content: [
-            {
-              type: "text",
-              text: "Error: 'last' fallback is disabled; pass an exact session_id or resume_job_id.",
-            },
-          ],
-          isError: true,
-        };
-      }
-      if (!common.cwd) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: "Error: 'cwd' is required when resuming by session_id without resume_job_id.",
-            },
-          ],
-          isError: true,
-        };
-      }
-    }
+    const mode = args.session_id !== undefined ? "resume" : "run";
+    const common = mode === "resume" ? resolveResume(resumeOptions(args, trustedTarget), readPersistedJobs()) : mapCommonOptions(args);
 
     const { job, reused } = jobManager.startJob({
       mode,
@@ -1268,7 +1159,6 @@ async function handleRequest(msg) {
       const controller = activeRequests.get(reqId);
       if (controller) {
         controller.abort();
-        activeRequests.delete(reqId);
       }
     }
     return;
@@ -1371,12 +1261,16 @@ process.stdin.on("data", (chunk) => {
   }
 });
 
-function shutdown() {
+let closing = false;
+async function shutdown() {
+  if (closing) return;
+  closing = true;
   for (const controller of activeRequests.values()) {
     controller.abort();
   }
-  activeRequests.clear();
-  jobManager.cancelAll();
+  await jobManager.cancelAll();
+  const deadline = Date.now() + 6000;
+  while (activeRequests.size && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 25));
   process.exit(0);
 }
 

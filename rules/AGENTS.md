@@ -14,7 +14,7 @@ When `Role Division: orchestrator` is active (check `codex_info` if unsure; swit
 
 ## Closed-Loop Execution & Callback Rules
 
-1. **Always lock `conversation_id` on `codex_start`**: Whenever calling `codex_start`, ALWAYS pass `conversation_id` set to your current `Conversation ID` from `<user_information>` (plus `cwd`, and `goal_id` / `milestone_id` when tracking a multi-step goal). This locks the callback route so Codex's completion report automatically wakes **this exact conversation** without ever leaking to other conversations.
+1. **Always lock `conversation_id` on `codex_start`**: Whenever calling `codex_start`, ALWAYS pass `conversation_id` set to your current `Conversation ID` from `<user_information>` (plus `cwd`, and `goal_id` / `milestone_id` when tracking a multi-step goal). The bridge binds new jobs at dispatch and rejects conflicting host and request destinations.
 2. **Respect panel selections**: Omit `model`, `reasoning_effort`, and `sandbox` unless the user explicitly overrides them for that call.
 3. **Track multi-step goals with `codex_goal`**: Define ordered milestones & acceptance checks before dispatching multi-stage work.
 4. **Synthesize & steer on `[Codex Bridge Auto-Callback]`**:
@@ -22,4 +22,4 @@ When `Role Division: orchestrator` is active (check `codex_info` if unsure; swit
    - Judge whether execution stayed aligned with the user's goal:
      - In **`notify`** mode: synthesize a clear, readable stage report for the user and propose the next step.
      - In **`autonomous`** mode: if off-track or failing checks, call `codex_start(resume_job_id=..., conversation_id=..., prompt=...)` to correct course; if on-track and milestones remain, dispatch the next milestone automatically until complete or user input is needed.
-5. **Safe resume**: Always prefer `resume_job_id` (inherits exact `session_id`, `cwd`, `sandbox`, `goal_id`, `milestone_id`); never pass `"last"`.
+5. **Safe resume**: Use `resume_job_id` to preserve the parent callback, directory and permissions. A bare session ID must be a full UUID. Keep the parent callback unless the user explicitly asks to transfer it. MCP transfers use `transfer_callback: true`. The panel API returns HTTP 409 for a cross-conversation resume until the caller selects keep or transfer.

@@ -1,13 +1,15 @@
+import crypto from "node:crypto";
+import net from "node:net";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { pathToFileURL } from "node:url";
+import { withFileLock, writeJsonAtomic } from "../server/file-store.js";
+import { processIdentity } from "../server/process-identity.js";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
-const PLUGIN_ROOT =
-  process.env.PLUGIN_ROOT ||
-  path.join(os.homedir(), ".gemini", "config", "plugins", "codex-bridge");
+const PLUGIN_ROOT = fileURLToPath(new URL("../", import.meta.url));
 const MCP_SERVER = path.join(PLUGIN_ROOT, "server", "mcp-server.js");
 const SIDECAR_MAIN = path.join(PLUGIN_ROOT, "sidecars", "codex_panel", "main.mjs");
 const SIDECAR_LOADER = path.join(
@@ -102,10 +104,10 @@ class McpClient {
 }
 
 function createMockBinaries(tmpRoot) {
-  // 1) Mock Codex CLI (.cmd wrapper -> node script)
+  // 1) Mock Codex CLI (direct Node CLI entry)
   const mockCodexJs = path.join(tmpRoot, "mock-codex.mjs");
   const mockCodexLog = path.join(tmpRoot, "mock-codex-log.jsonl");
-  const mockCodexCmd = path.join(tmpRoot, "mock-codex.cmd");
+
 
   fs.writeFileSync(
     mockCodexJs,
@@ -115,6 +117,7 @@ import path from "node:path";
 
 const args = process.argv.slice(2);
 if (args.includes("--version")) {
+  if (process.env.MOCK_PROBE_LOG) fs.appendFileSync(process.env.MOCK_PROBE_LOG, "probe\\n");
   console.log("codex-cli 0.171.0-mock");
   process.exit(0);
 }
@@ -193,12 +196,6 @@ process.stdin.on("end", async () => {
 `,
     "utf8"
   );
-  fs.writeFileSync(
-    mockCodexCmd,
-    `@echo off\r\n"${process.execPath}" "${mockCodexJs}" %*\r\n`,
-    "utf8"
-  );
-
   // 2) Mock agentapi (executed directly by node.exe via `execFileSync(node, ["agentapi", ...])`)
   const mockAgentDir = path.join(tmpRoot, "mock_agent_cwd");
   fs.mkdirSync(mockAgentDir, { recursive: true });
@@ -222,6 +219,7 @@ const logFile = process.env.MOCK_AGENTAPI_LOG;
 const failFlag = process.env.MOCK_AGENTAPI_FAIL_FLAG;
 
 if (sub === "get-conversation-metadata") {
+  if (failFlag && fs.existsSync(failFlag + ".metadata")) { console.error("temporary metadata outage"); process.exit(1); }
   const convId = rest[0];
   const map = {
     "${CONV_A}": "${PROJ_A}",
@@ -246,7 +244,7 @@ if (sub === "send-message") {
     convId,
     projId,
     failed: shouldFail,
-    preview: message.slice(0, 120),
+    preview: message,
     at: new Date().toISOString(),
   }) + "\\n", "utf8");
   if (shouldFail) {
@@ -263,7 +261,7 @@ console.log("{}");
   );
 
   return {
-    mockCodexCmd,
+    mockCodexJs,
     mockCodexLog,
     mockAgentDir,
     mockAgentLog,
@@ -278,6 +276,14 @@ function readJsonl(filePath) {
     .split(/\r?\n/)
     .filter(Boolean)
     .map((l) => JSON.parse(l));
+}
+
+async function freePort() {
+  const reservation = net.createServer();
+  await new Promise((resolve,reject) => reservation.once("error",reject).listen(0, "127.0.0.1", resolve));
+  const port = reservation.address().port;
+  await new Promise(resolve => reservation.close(resolve));
+  return port;
 }
 
 async function startSidecar(env, port, token, cwd) {
@@ -299,10 +305,13 @@ async function startSidecar(env, port, token, cwd) {
       windowsHide: true,
     }
   );
+  let listening = false;
+  child.stdout.on("data", bytes => { if (bytes.toString().includes("listening on 127.0.0.1:" + port)) listening = true; });
   let stderr = "";
   child.stderr.on("data", (d) => (stderr += d.toString()));
   for (let i = 0; i < 30; i++) {
     try {
+      if (!listening) throw new Error("Waiting for test sidecar");
       const r = await fetch(`http://127.0.0.1:${port}/api/state`);
       if (r.ok) return child;
     } catch {}
@@ -311,6 +320,7 @@ async function startSidecar(env, port, token, cwd) {
     }
     await sleep(150);
   }
+  child.kill();
   throw new Error(`Sidecar failed to bind port ${port}: ${stderr}`);
 }
 
@@ -322,18 +332,22 @@ async function runTests() {
   fs.mkdirSync(projectDir, { recursive: true });
 
   const mocks = createMockBinaries(tmpRoot);
-  const sidecarPort = 47925 + Math.floor(Math.random() * 400);
-  const sidecarToken = "accept-tok-14";
+  const sidecarPort = await freePort();
+  const sidecarToken = crypto.randomUUID();
   const baseEnv = {
+    CODEX_HOME: path.join(tmpRoot, "codex-home"), ANTIGRAVITY_CONVERSATION_ID: "", ANTIGRAVITY_PROJECT_ID: "",
+    ANTIGRAVITY_SOURCE_METADATA: "", CODEX_PANEL_DISABLE_WATCHER: "0",
     CODEX_BRIDGE_DATA_DIR: dataDir,
-    CODEX_BIN: mocks.mockCodexCmd,
+    CODEX_BIN: mocks.mockCodexJs,
     MOCK_CODEX_LOG: mocks.mockCodexLog,
     ANTIGRAVITY_AGENTAPI_EXE: process.execPath,
     MOCK_AGENTAPI_LOG: mocks.mockAgentLog,
     MOCK_AGENTAPI_FAIL_FLAG: mocks.mockAgentFlag,
   };
 
+  fs.mkdirSync(baseEnv.CODEX_HOME);
   let sidecar = null;
+  let mcpA2, mcpShared, mcpStop, snapshotSidecar, secondWatcher, orphanChild;
   let mcpA = null;
   let mcpB = null;
 
@@ -363,6 +377,11 @@ async function runTests() {
       MOCK_HOLD_MS: "800",
     });
     await mcpA.init();
+    for (const name of ["codex_run","codex_start","codex_review"]) {
+      const missing = await mcpA.callTool(name,{prompt:"check cwd"});
+      assert.equal(missing.isError,true);
+      assert.match(missing.content[0].text,/cwd/);
+    }
 
     const startRes1 = await mcpA.callTool("codex_start", {
       prompt: "Task from conversation A",
@@ -372,6 +391,7 @@ async function runTests() {
     const job1Match = /Job ID: (codex_[a-f0-9]+)/.exec(startRes1.content[0].text);
     assert.ok(job1Match, "Should return job_id for Test 1");
     const job1Id = job1Match[1];
+    assert.equal((await sidecarPost("/api/jobs/retry-callback", { jobId: job1Id })).status, 409);
 
     // While job1 is running, Conv B refreshes /api/state multiple times
     const settingsBefore = fs.existsSync(path.join(dataDir, "settings.json"))
@@ -406,7 +426,7 @@ async function runTests() {
     // =========================================================================
     console.log("=== TEST 2: Failed callback stays failed & retries strictly to Conv A ===");
     fs.writeFileSync(mocks.mockAgentFlag, "fail", "utf8");
-    const mcpA2 = new McpClient({
+    mcpA2 = new McpClient({
       ...baseEnv,
       ANTIGRAVITY_CONVERSATION_ID: CONV_A,
       ANTIGRAVITY_PROJECT_ID: PROJ_A,
@@ -503,8 +523,8 @@ async function runTests() {
     for (const entry of codexLogs) {
       assert.equal(path.resolve(entry.cwd), path.resolve(projectDir), "Child cwd MUST match original projectDir");
       assert.equal(entry.sandbox, "read-only", "Resume MUST pass -s read-only before resume");
-      assert.ok(entry.args.indexOf("-s") < entry.resumeIdx, "-s MUST precede resume");
-      assert.ok(entry.args.indexOf("-C") < entry.resumeIdx, "-C MUST precede resume");
+      assert.ok(entry.args.indexOf("-s") >= 0 && entry.args.indexOf("-s") < entry.resumeIdx, "-s MUST precede resume");
+      assert.ok(entry.args.indexOf("-C") >= 0 && entry.args.indexOf("-C") < entry.resumeIdx, "-C MUST precede resume");
     }
     assert.equal(
       fs.existsSync(path.join(projectDir, "mock_written.txt")),
@@ -519,19 +539,18 @@ async function runTests() {
     console.log("=== TEST 4: Detached alive PID across restart & cross-process per-session mutex ===");
     const longSid = "44444444-4444-4444-8444-444444444444";
     // Spawn a real long-running detached OS process (node sleep) to simulate an orphaned live Codex process
-    const orphanChild = spawn(
+    orphanChild = spawn(
       process.execPath,
       ["-e", "setTimeout(() => {}, 30000)"],
-      { stdio: "ignore", windowsHide: true }
+      { stdio: "ignore", windowsHide: true, detached: process.platform !== "win32" }
     );
     const orphanPid = orphanChild.pid;
     assert.ok(orphanPid, "Orphan PID must exist");
 
     // Persist a running job record owned by a dead parent PID (999999) with our live orphanPid
     const jobsPath = path.join(dataDir, "jobs.json");
-    const existingJobs = JSON.parse(fs.readFileSync(jobsPath, "utf8"));
     const detachedJobId = "codex_deadbeef";
-    existingJobs.unshift({
+    const detachedRecord = {
       id: detachedJobId,
       parentJobId: null,
       mode: "run",
@@ -545,7 +564,7 @@ async function runTests() {
       promptPreview: "Long running job across MCP restart",
       startedAt: new Date().toISOString(),
       finishedAt: null,
-      pid: orphanPid,
+      pid: orphanPid, processIdentity: processIdentity(orphanPid),
       ownerPid: 999999,
       sessionId: longSid,
       eventCount: 5,
@@ -559,8 +578,11 @@ async function runTests() {
       callbackAt: null,
       callbackError: null,
       resultSummary: null,
+    };
+    withFileLock(jobsPath, () => {
+      const rows = JSON.parse(fs.readFileSync(jobsPath, "utf8"));
+      writeJsonAtomic(jobsPath, [detachedRecord, ...rows]);
     });
-    fs.writeFileSync(jobsPath, JSON.stringify(existingJobs, null, 2), "utf8");
 
     // Start a fresh MCP server after simulated restart
     mcpB = new McpClient({
@@ -607,7 +629,7 @@ async function runTests() {
     assert.equal(r1.data.ok, true);
     assert.equal(r2.data.ok, true);
     assert.notEqual(r1.data.reused, r2.data.reused, "Exactly one click spawns and the other reuses");
-    await sleep(400);
+    for (let i = 0; i < 50 && readJsonl(mocks.mockCodexLog).length === countBefore; i++) await sleep(100);
     const countAfterStop = readJsonl(mocks.mockCodexLog).length;
     assert.equal(countAfterStop, countBefore + 1, "Exactly ONE new Codex process spawned after stopping old PID");
     console.log("  PASS: running_detached preserved alive PID, mutex blocked all duplicate spawns, and stop->resume spawned exactly 1 process.");
@@ -616,7 +638,7 @@ async function runTests() {
     // ACCEPTANCE TEST 6: Shared global MCP process (no host env) locks conversation_id & verifies via agentapi
     // =========================================================================
     console.log("=== TEST 6: Shared MCP process (no host env) closed-loop via conversation_id ===");
-    const mcpShared = new McpClient({
+    mcpShared = new McpClient({
       ...baseEnv,
       ANTIGRAVITY_CONVERSATION_ID: "",
       ANTIGRAVITY_PROJECT_ID: "",
@@ -665,12 +687,145 @@ async function runTests() {
     for (let i = 0; i < 30; i++) {
       const st = await (await fetch(`http://127.0.0.1:${sidecarPort}/api/state`)).json();
       job6b = st.jobs.find((j) => j.id === job6bId);
-      if (job6b && job6b.status === "completed" && job6b.callbackStatus !== "pending") break;
+      if (job6b && job6b.status === "completed" && job6b.callbackStatus === "unrouted") break;
       await sleep(150);
     }
     assert.equal(job6b.callbackStatus, "unrouted", "Bogus conversation_id must be marked unrouted");
     assert.equal(job6b.callbackSent, false);
-    mcpShared.close();
+    const getState = async () => (await fetch(`http://127.0.0.1:${sidecarPort}/api/state`)).json();
+    async function waitForJob(id, predicate) {
+      for (let i = 0; i < 80; i++) {
+        const j = (await getState()).jobs.find(row => row.id === id);
+        if (j && predicate(j)) return j;
+        await sleep(100);
+      }
+      assert.fail("Timed out waiting for job " + id);
+    }
+    const parent = (await getState()).jobs.find(j => j.id === job1Id);
+    const request = { resume_job_id: job1Id, prompt: "continue" };
+    for (const name of ["codex_start","codex_resume"]) {
+      for (const [field,value] of Object.entries({ session_id: longSid, cwd: tmpRoot, goal_id: "different",
+        milestone_id: "absent", allow_sandbox_escalation: "false", add_dirs: [tmpRoot] })) {
+        const bad = await mcpShared.callTool(name, { ...request, [field]: value });
+        assert.equal(bad.isError, true, name + " " + field);
+      }
+    }
+    const conflict = await mcpA.callTool("codex_start", { ...request, conversation_id: CONV_B });
+    assert.match(conflict.content[0].text, /conflicting conversation/i);
+    for (const name of ["codex_resume","codex_start"]) {
+      const unknown = await mcpShared.callTool(name, {session_id:crypto.randomUUID(),cwd:projectDir,prompt:"policy",sandbox:"workspace-write"});
+      assert.equal(unknown.isError,true);
+      assert.match(unknown.content[0].text,/widen/i);
+    }
+    const before409 = (await getState()).jobs.length;
+    const cross = await sidecarPost("/api/jobs/resume", { jobId: job1Id, conversationId: CONV_B });
+    assert.equal(cross.status, 409);
+    assert.equal(cross.data.code, "CROSS_CONVERSATION_RESUME");
+    assert.equal(cross.data.sourceConversationId, CONV_A);
+    assert.equal(cross.data.targetConversationId, CONV_B);
+    assert.equal((await getState()).jobs.length, before409);
+    assert.equal((await sidecarPost("/api/jobs/resume", { jobId: job1Id, allowSandboxEscalation: "false" })).status, 400);
+    assert.equal((await sidecarPost("/api/jobs/retry-callback", { jobId: job1Id })).status, 409);
+    assert.equal((await sidecarPost("/api/jobs/stop", { jobId: "absent" })).status, 404);
+    const unrelated = "Unrelated-active-goal-for-callback-isolation";
+    const createdGoal = (await sidecarPost("/api/goals", { title: unrelated, cwd: projectDir, milestones: ["first","second"] })).data.goal;
+    secondWatcher = await startSidecar(baseEnv, await freePort(), crypto.randomUUID(), mocks.mockAgentDir);
+    for (const transfer of [false, true]) {
+      const choice = transfer ? { transferCallback: true } : { keepOriginalCallback: true };
+      const resumed = await sidecarPost("/api/jobs/resume", { jobId: job1Id, conversationId: CONV_B, ...choice });
+      assert.equal(resumed.status, 200, JSON.stringify(resumed.data));
+      const child = await waitForJob(resumed.data.job.id, j => j.callbackStatus === "sent");
+      assert.equal(child.conversationId, transfer ? CONV_B : CONV_A);
+      assert.equal(child.transferredFrom, transfer ? CONV_A : null);
+      assert.equal(child.sessionId, parent.sessionId);
+      const deliveries = readJsonl(mocks.mockAgentLog).filter(row => row.preview.includes(child.id));
+      assert.equal(deliveries.length, 1);
+      const [delivered] = deliveries;
+      assert.equal(delivered.convId, child.conversationId);
+      assert.ok(!delivered.preview.includes(unrelated));
+    }
+    for (const transfer of [false,true]) {
+      const result = await mcpShared.callTool("codex_start", { ...request, session_id: parent.sessionId.toUpperCase(),
+        cwd: path.join(parent.cwd,"."), conversation_id: CONV_B, transfer_callback: transfer, notify_on_complete: false });
+      assert.notEqual(result.isError, true, result.content[0].text);
+      const id = /Job ID: (codex_[a-f0-9]+)/.exec(result.content[0].text)[1];
+      const child = await waitForJob(id, j => j.status === "completed");
+      assert.equal(child.conversationId, transfer ? CONV_B : CONV_A);
+      assert.equal(child.transferredFrom, transfer ? CONV_A : null);
+      assert.equal(child.callbackStatus, "skipped");
+    }
+    const falseFlags = await mcpShared.callTool("codex_start", { ...request, transfer_callback: "false" });
+    assert.equal(falseFlags.isError, true);
+    const linked = await mcpShared.callTool("codex_start", { prompt: "linked job", cwd: projectDir,
+      goal_id: createdGoal.id, milestone_id: "m1", add_dirs: [tmpRoot], skip_git_repo_check: false, notify_on_complete: false });
+    const linkedId = /Job ID: (codex_[a-f0-9]+)/.exec(linked.content[0].text)[1];
+    await waitForJob(linkedId, j => j.status === "completed");
+    const next = await sidecarPost("/api/jobs/resume", { jobId: linkedId, goalId: createdGoal.id, milestoneId: "m2" });
+    assert.equal(next.status, 200, JSON.stringify(next.data));
+    const second = await waitForJob(next.data.job.id, j => j.status === "completed");
+    assert.equal(second.milestoneId, "m2");
+    assert.equal(second.skipGitRepoCheck, false);
+    assert.deepEqual(second.addDirs, [tmpRoot]);
+    assert.equal(second.notifyOnComplete, false);
+    const argv = readJsonl(mocks.mockCodexLog).at(-1).args;
+    assert.ok(argv.includes("--add-dir") && !argv.includes("--skip-git-repo-check"));
+    const historyRow = (await getState()).history.find(row => row.jobId === second.id);
+    assert.equal(historyRow.cwd, second.cwd);
+    for (const field of ["conversationId","durationMs","usage","transferredFrom","model","reasoningEffort"]) {
+      assert.ok(Object.hasOwn(second, field) && Object.hasOwn(historyRow, field), field);
+    }
+
+    mcpStop = new McpClient({ ...baseEnv, MOCK_HOLD_MS:"20000", MOCK_SESSION_ID:crypto.randomUUID() });
+    await mcpStop.init();
+    const stopStart = await mcpStop.callTool("codex_start", {prompt:"stop lifecycle fixture",cwd:projectDir,conversation_id:CONV_A});
+    const stopId = /Job ID: (codex_[a-f0-9]+)/.exec(stopStart.content[0].text)[1];
+    await waitForJob(stopId,j => j.status === "running" && j.pid);
+    const stopped = await sidecarPost("/api/jobs/stop", {jobId:stopId});
+    assert.equal(stopped.status,200, JSON.stringify(stopped.data));
+    for(let i=0;i<50;i++) {
+      if ((await getState()).history.some(r=>r.jobId===stopId)) break;
+      await sleep(100);
+    }
+    const stoppedState = await getState();
+    assert.equal(stoppedState.jobs.find(j=>j.id===stopId).status,"cancelled");
+    assert.equal(stoppedState.history.find(j=>j.jobId===stopId).status,"cancelled");
+    fs.writeFileSync(mocks.mockAgentFlag + ".metadata", "unavailable");
+    const temporary = await mcpShared.callTool("codex_start", { prompt:"metadata outage", cwd:projectDir,
+      conversation_id:CONV_A, goal_id:createdGoal.id });
+    const failedId = /Job ID: (codex_[a-f0-9]+)/.exec(temporary.content[0].text)[1];
+    await waitForJob(failedId, j => j.callbackStatus === "failed");
+    fs.unlinkSync(mocks.mockAgentFlag + ".metadata");
+    assert.equal((await sidecarPost("/api/goals/delete", {goalId:createdGoal.id})).status,200);
+    assert.equal((await sidecarPost("/api/jobs/retry-callback", {jobId:failedId})).status,200);
+    const afterDelete = readJsonl(mocks.mockAgentLog).find(row => row.preview.includes(failedId));
+    assert.match(afterDelete.preview, /已删除|has been deleted/);
+
+    // Use a separate data root and disable the maintenance worker. Even a legacy job
+    // requiring reconciliation must remain byte-for-byte untouched by GET.
+    const snapshotDir = path.join(tmpRoot, "snapshot");
+    fs.mkdirSync(path.join(snapshotDir,"locks"), { recursive: true });
+    fs.writeFileSync(path.join(snapshotDir,"jobs.json"), JSON.stringify([{id:"legacy", status:"running", ownerPid:0}]));
+    fs.writeFileSync(path.join(snapshotDir,"settings.json"), "{bad}");
+    fs.writeFileSync(path.join(snapshotDir,"locks","test.lock"), "untouched");
+    const tree = () => ["jobs.json","settings.json","locks/test.lock"].map(f => [
+      fs.readFileSync(path.join(snapshotDir,f),"utf8"),fs.statSync(path.join(snapshotDir,f)).mtimeMs]);
+    const original = tree();
+    const snapshotPort = await freePort();
+    snapshotSidecar = await startSidecar({ ...baseEnv, CODEX_BRIDGE_DATA_DIR:snapshotDir, MOCK_PROBE_LOG:path.join(tmpRoot,"probes"), CODEX_PANEL_DISABLE_WATCHER:"1" },
+      snapshotPort, crypto.randomUUID(), mocks.mockAgentDir);
+    const snapshot = await (await fetch(`http://127.0.0.1:${snapshotPort}/api/state`)).json();
+    assert.equal(snapshot.settings.sandbox, "read-only");
+    assert.equal(snapshot.jobs[0].status, "running");
+    assert.equal(fs.readFileSync(path.join(tmpRoot,"probes"),"utf8").trim().split("\n").length,1);
+    await fetch(`http://127.0.0.1:${snapshotPort}/api/state?refresh=1`);
+    assert.equal(fs.readFileSync(path.join(tmpRoot,"probes"),"utf8").trim().split("\n").length,2);
+    assert.deepEqual(tree(), original);
+    assert.deepEqual(fs.readdirSync(snapshotDir).sort(), ["jobs.json","locks","settings.json"]);
+    assert.deepEqual(fs.readdirSync(path.join(snapshotDir,"locks")), ["test.lock"]);
+    fs.writeFileSync(path.join(snapshotDir,"goals.json"), "bad-json");
+    assert.equal((await fetch(`http://127.0.0.1:${snapshotPort}/api/state`)).status,500);
+    assert.deepEqual(fs.readdirSync(snapshotDir).sort(),["goals.json","jobs.json","locks","settings.json"]);
+    console.log("  PASS: M2 routing, conflict checks, inherited options, retry rules, history and read-only snapshot.");
     console.log("  PASS: Shared MCP closed-loop delivered to Conv A (auto-resolved projectId) and safely quarantined invalid conversation_id.");
 
     // =========================================================================
@@ -681,6 +836,8 @@ async function runTests() {
       const realWorkDir = path.join(tmpRoot, "real_readonly_dir");
       fs.mkdirSync(realWorkDir, { recursive: true });
       const origCodexBin = process.env.CODEX_BIN;
+      const origHome = process.env.CODEX_HOME;
+      process.env.CODEX_HOME = baseEnv.CODEX_HOME;
       delete process.env.CODEX_BIN;
       const runner = await import(
         pathToFileURL(path.join(PLUGIN_ROOT, "server", "codex-runner.js")).href
@@ -703,6 +860,12 @@ async function runTests() {
           prompt:
             "Use a shell command to try creating a file named forbidden_write.txt containing TEST in the current working directory. Report whether it failed or succeeded.",
         });
+        assert.equal(resumed.ok, true, "Real resumed turn must complete successfully");
+        assert.equal(resumed.sessionId.toLowerCase(), first.sessionId.toLowerCase());
+        assert.ok(resumed.commands.some(c => c.command.includes("forbidden_write.txt") &&
+          typeof c.exitCode === "number" && c.exitCode !== 0 &&
+          /denied|not permitted|read.only|unauthorized|拒绝|只读/i.test(c.outputPreview || "")),
+          "A write attempt and actual OS permission denial must both be observed");
         console.log("  Real resume CLI args:", resumed.cliArgs.join(" "));
         console.log("  Real resume response:", (resumed.lastMessage || "").slice(0, 220));
         assert.equal(
@@ -710,14 +873,29 @@ async function runTests() {
           false,
           "REAL Codex CLI read-only resumed session MUST NOT be able to write forbidden_write.txt!"
         );
+        const control = await runner.runCodex({
+          mode: "run", cwd: realWorkDir, sandbox: "workspace-write",
+          prompt: "Use a shell command to create writable_control.txt containing TEST in the current working directory."
+        });
+        assert.equal(control.ok, true);
+        assert.ok(control.commands.some(c => c.exitCode === 0 && c.command.includes("writable_control.txt")));
+        assert.equal(fs.readFileSync(path.join(realWorkDir, "writable_control.txt"), "utf8").trim(), "TEST");
         console.log("  PASS: Real local codex.exe denied file write inside resumed read-only session!");
       } finally {
         if (origCodexBin) process.env.CODEX_BIN = origCodexBin;
+        if (origHome === undefined) delete process.env.CODEX_HOME;
+        else process.env.CODEX_HOME = origHome;
       }
     }
 
     console.log("\nALL v1.4.0 ACCEPTANCE TESTS PASSED!");
   } finally {
+    snapshotSidecar?.kill();
+    secondWatcher?.kill();
+    if (orphanChild?.exitCode === null && !orphanChild.signalCode) orphanChild.kill();
+    mcpShared?.close();
+    mcpStop?.close();
+    mcpA2?.close();
     if (mcpA) mcpA.close();
     if (mcpB) mcpB.close();
     if (sidecar) {

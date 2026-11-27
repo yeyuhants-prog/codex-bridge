@@ -27,8 +27,8 @@
     </header>
 
     <nav class="tabs" role="tablist">
-      <button type="button" class="tab active" data-tab="control" data-i18n="tabControl">控制台</button>
-      <button type="button" class="tab" data-tab="goals">
+      <button type="button" class="tab active" role="tab" aria-selected="true" aria-controls="panel-control" data-tab="control" data-i18n="tabControl">控制台</button>
+      <button type="button" class="tab" role="tab" tabindex="-1" aria-selected="false" aria-controls="panel-goals" data-tab="goals">
         <span data-i18n="tabGoals">目标与任务</span>
         <span id="tab-badge" class="tab-badge hidden">0</span>
       </button>
@@ -43,7 +43,7 @@
         <div class="card-head">
           <span class="card-title" data-i18n="roleTitle">分工模式（主脑 vs 打工人）</span>
         </div>
-        <div id="role-group" class="segment-row two-col" role="radiogroup" aria-label="Role Division">
+        <div id="role-group" class="segment-row two-col" role="group" data-i18n-aria="roleTitle">
           <button type="button" class="seg-btn" data-role="orchestrator">
             <span class="seg-label" data-i18n="roleOrch">主脑派活模式</span>
             <span class="seg-sub" data-i18n="roleOrchSub">反重力管文本规划与基础插件，重活全交 Codex</span>
@@ -71,7 +71,7 @@
           <span class="card-title" data-i18n="effortTitle">思考深度（Reasoning Effort）</span>
           <span id="effort-hint" class="hint"></span>
         </div>
-        <div id="effort-group" class="pill-grid" role="radiogroup" aria-label="Reasoning Effort"></div>
+        <div id="effort-group" class="pill-grid" role="group" data-i18n-aria="effortTitle"></div>
         <p id="effort-desc" class="helper"></p>
       </section>
 
@@ -81,7 +81,7 @@
           <span class="card-title" data-i18n="progressionTitle">目标推进模式（Progression）</span>
           <span id="bind-badge" class="hint"></span>
         </div>
-        <div id="progression-group" class="segment-row" role="radiogroup" aria-label="Progression Mode">
+        <div id="progression-group" class="segment-row" role="group" data-i18n-aria="progressionTitle">
           <button type="button" class="seg-btn" data-progression="manual">
             <span class="seg-label" data-i18n="progManual">手动推进</span>
             <span class="seg-sub" data-i18n="progManualSub">干完不回调，等你指示</span>
@@ -108,7 +108,7 @@
         <div class="card-head">
           <span class="card-title" data-i18n="sandboxTitle">执行权限（Sandbox）与派活方式</span>
         </div>
-        <div id="sandbox-group" class="segment-row" role="radiogroup" aria-label="Sandbox">
+        <div id="sandbox-group" class="segment-row" role="group" data-i18n-aria="sbGroup">
           <button type="button" class="seg-btn" data-sandbox="read-only">
             <span class="seg-label" data-i18n="sbReadOnly">只读分析</span>
             <span class="seg-sub">read-only</span>
@@ -122,7 +122,7 @@
             <span class="seg-sub">full-access</span>
           </button>
         </div>
-        <div id="workflow-group" class="segment-row two-col mt-8" role="radiogroup" aria-label="Workflow">
+        <div id="workflow-group" class="segment-row two-col mt-8" role="group" data-i18n-aria="wfGroup">
           <button type="button" class="seg-btn" data-workflow="direct">
             <span class="seg-label" data-i18n="wfDirect">直接派活执行</span>
             <span class="seg-sub" data-i18n="wfDirectSub">拆解后立即交给 Codex</span>
@@ -157,7 +157,7 @@
     <!-- TAB 2: GOALS & JOBS -->
     <main id="panel-goals" class="content hidden">
       <!-- Persistent Goal Board -->
-      <section class="card">
+      <section class="card goal-board-card">
         <div class="card-head">
           <span class="card-title" data-i18n="goalBoardTitle">持久化目标板（Goal & Milestones）</span>
           <button id="btn-toggle-new-goal" type="button" class="mini-btn" data-i18n="newGoalBtn">+ 新建目标</button>
@@ -182,29 +182,47 @@
         </div>
       </section>
 
-      <!-- Live & Persisted Background Jobs -->
-      <section class="card">
-        <div class="card-head">
-          <span class="card-title" data-i18n="jobsTitle">后台 Codex 任务（断点可续接）</span>
-          <span id="jobs-count" class="hint">0</span>
+      <section class="task-board" aria-labelledby="task-heading">
+        <h2 id="task-heading" data-i18n="scopeTitle">任务视图</h2>
+        <div id="task-scope" class="scope-switch" role="group" aria-labelledby="task-heading">
+          <button type="button" data-scope="current"><span data-i18n="currentChat">当前对话</span><b>0</b></button>
+          <button type="button" data-scope="all"><span data-i18n="allChats">全部对话</span><b>0</b></button>
         </div>
-        <div id="jobs-list" class="history-list">
-          <div class="empty" data-i18n="emptyJobs">暂无后台任务记录。</div>
-        </div>
-      </section>
-
-      <!-- Recent History -->
-      <section class="card">
-        <div class="card-head">
-          <span class="card-title" data-i18n="historyTitle">最近执行记录</span>
-          <span id="history-count" class="hint">0</span>
-        </div>
-        <div id="history-list" class="history-list">
-          <div class="empty" data-i18n="emptyHistory">还没有执行记录～</div>
-        </div>
+        <button id="view-all" type="button" class="text-action" hidden></button>
+        <section class="task-section" aria-labelledby="active-heading">
+          <header class="section-head"><h3 id="active-heading" data-i18n="activeTitle">运行中任务</h3><span id="jobs-count" class="count">0</span></header>
+          <div id="jobs-list" class="task-list"></div>
+        </section>
+        <section class="task-section" aria-labelledby="history-heading">
+          <header class="section-head"><h3 id="history-heading" data-i18n="historyTitle">历史任务与执行记录</h3><span id="history-count" class="count">0</span></header>
+          <div id="history-filter" class="filters" role="group" data-i18n-aria="filterTitle">
+            <button type="button" data-filter="all" data-i18n="all">全部</button>
+            <button type="button" data-filter="success" data-i18n="success">成功</button>
+            <button type="button" data-filter="failure" data-i18n="failure">失败</button>
+          </div>
+          <div id="history-list" class="task-list"></div>
+          <div class="paging"><button id="history-more" type="button" hidden></button><button id="history-less" type="button" data-i18n="less" hidden>收起</button></div>
+        </section>
       </section>
     </main>
   </div>
+  <dialog id="route-modal" aria-labelledby="route-title" aria-describedby="route-hint">
+    <form method="dialog">
+      <h2 id="route-title" data-i18n="routeTitle">续跑结果发给谁？</h2>
+      <p id="route-hint" data-i18n="routeHint">此任务来自其他对话。选择续跑完成时接收回调的对话。</p>
+      <dl class="route-details">
+        <dt data-i18n="jobId">任务 ID</dt><dd id="route-job"></dd>
+        <dt data-i18n="workdir">工作目录</dt><dd id="route-cwd"></dd>
+        <dt data-i18n="origin">来源对话</dt><dd id="route-source"></dd>
+        <dt data-i18n="destination">当前面板对话</dt><dd id="route-target"></dd>
+      </dl>
+      <div class="route-actions">
+        <button value="keep" class="primary-btn" data-i18n="keep" autofocus>保留回调原对话（默认）</button>
+        <button value="transfer" class="secondary-btn" data-i18n="transfer">转绑回调到当前对话</button>
+        <button value="cancel" class="link-btn" data-i18n="cancelBtn">取消</button>
+      </div>
+    </form>
+  </dialog>
   <script src="/app.js"></script>
 </body>
 </html>

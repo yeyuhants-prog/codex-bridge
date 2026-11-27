@@ -1,11 +1,11 @@
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+import { readOnlySnapshot } from "../../server/file-store.js";
+import { problem, validateBooleans } from "../../server/validation.js";
 import { existsSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { SidecarApp, Response } from "sidecar_sdk";
-import {
-  resolveCodexBinary,
-  getCodexVersion,
-} from "../../server/codex-runner.js";
 import {
   loadSettings,
   saveSettings,
@@ -15,7 +15,7 @@ import {
   readCodexModelsCatalog,
 } from "../../server/settings-store.js";
 import {
-  listGoals,
+  listGoals, iterationLimit,
   getGoal,
   createGoal,
   setActiveGoal,
@@ -28,7 +28,7 @@ import {
   JobManager,
   normalizeCallbackTarget,
   reconcilePersistedJobs,
-  updateJobCallbackState,
+  claimCallback, beginCallbackSend, finishCallback, readPersistedJobs, callbackTerminal,
 } from "../../server/job-manager.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -39,6 +39,28 @@ const ID_RE = /^[0-9a-f-]{8,}$/i;
 const app = new SidecarApp();
 const jobManager = new JobManager();
 
+const runFile = promisify(execFile);
+async function agentApi(args, projectId) {
+  const host = process.env.ANTIGRAVITY_AGENTAPI_EXE;
+  const { stdout } = await runFile(host || "agentapi", host ? ["agentapi", ...args] : args, {
+    timeout: 8000, killSignal: "SIGKILL", windowsHide: true, maxBuffer: 1024 * 1024,
+    env: projectId ? { ...process.env, ANTIGRAVITY_PROJECT_ID: projectId } : process.env
+  });
+  return stdout.trim() ? JSON.parse(stdout) : {};
+}
+
+let probePromise;
+function runtimeProbe(refresh) {
+  if (refresh || !probePromise) {
+    probePromise = runFile(process.execPath, [join(__dirname, "runtime-probe.mjs")], {
+      timeout: 9000, windowsHide: true
+    }).then(({ stdout }) => JSON.parse(stdout)).catch(err => ({
+      found: false, path: null, source: null, version: null, error: err.message
+    }));
+  }
+  return probePromise;
+}
+
 function readText(file) {
   return readFileSync(join(__dirname, file), "utf-8");
 }
@@ -47,14 +69,14 @@ function readText(file) {
  * Validate a conversationId against Antigravity's agentapi metadata endpoint
  * and return its authoritative { conversationId, projectId } or { valid: false }.
  */
-function verifyConversationTarget(conversationId, fallbackProjectId = "") {
+async function verifyConversationTarget(conversationId, fallbackProjectId = "") {
   if (!conversationId || !ID_RE.test(conversationId)) {
     return { valid: false, reason: "Invalid conversationId format." };
   }
   try {
-    const data = app.getConversationMetadata(conversationId);
+    const data = await agentApi(["get-conversation-metadata", conversationId]);
     if (data && data.error) {
-      return { valid: false, reason: String(data.error) };
+      return { valid: false, temporary: !/not found|expired|does not exist/i.test(String(data.error)), reason: String(data.error) };
     }
     const metaEvent =
       data?.response?.conversationMetadata ||
@@ -65,16 +87,18 @@ function verifyConversationTarget(conversationId, fallbackProjectId = "") {
     if (!meta) {
       return {
         valid: false,
-        reason: "Conversation metadata not found or expired.",
+        temporary: true, reason: "Conversation metadata temporarily unavailable.",
       };
     }
-    const projectId =
-      meta.projectId || meta.project_id || fallbackProjectId || "";
+    const projectId = meta.projectId || meta.project_id || "";
+    if (fallbackProjectId && projectId !== fallbackProjectId) {
+      return { valid: false, temporary: !projectId, reason: "Locked project and conversation metadata differ." };
+    }
     return { valid: true, conversationId, projectId };
   } catch (err) {
     return {
       valid: false,
-      reason: err?.message || "Failed to verify conversation metadata.",
+      temporary: true, reason: err?.message || "Failed to verify conversation metadata.",
     };
   }
 }
@@ -86,12 +110,13 @@ function buildCallbackMessage(job, settings, goal) {
   const hasExactSession = Boolean(
     job.sessionId && String(job.sessionId).trim() && job.sessionId !== "last"
   );
+  const limit = goal ? iterationLimit(goal, settings) : settings.maxAutoIterations;
+  const used = goal ? (goal.iterationCount || 0) - (goal.iterationBaseline || 0) : 0;
   const isAutonomousEligible =
     mode === "autonomous" &&
     goal &&
     goal.status === "active" &&
-    (goal.iterationCount || 0) <
-      (goal.maxIterations || settings.maxAutoIterations || 12);
+    used < limit;
 
   const lines = [
     isEn
@@ -113,7 +138,7 @@ function buildCallbackMessage(job, settings, goal) {
   if (goal) {
     const done = goal.milestones.filter((m) => m.status === "done").length;
     lines.push(
-      `- **Goal**: ${goal.title} (\`${goal.id}\`, ${done}/${goal.milestones.length} done, iter ${goal.iterationCount || 0}/${goal.maxIterations || settings.maxAutoIterations})`
+      `- **Goal**: ${goal.title} (\`${goal.id}\`, ${done}/${goal.milestones.length} done, iter ${used}/${limit})`
     );
     if (job.milestoneId) {
       const ms = goal.milestones.find((m) => m.id === job.milestoneId);
@@ -125,6 +150,7 @@ function buildCallbackMessage(job, settings, goal) {
     }
   }
 
+  if (job.goalId && !goal) lines.push(isEn ? "Linked goal has been deleted." : "此任务绑定的目标已删除。");
   if (summary.fileChanges?.length) {
     const files = summary.fileChanges
       .slice(0, 12)
@@ -174,13 +200,12 @@ function buildCallbackMessage(job, settings, goal) {
   } else if (
     mode === "autonomous" &&
     goal &&
-    (goal.iterationCount || 0) >=
-      (goal.maxIterations || settings.maxAutoIterations || 12)
+    used >= limit
   ) {
     lines.push(
       isEn
-        ? `**Progression Notice**: Reached max automatic iterations (${goal.iterationCount}/${goal.maxIterations || settings.maxAutoIterations}). Auto-paused; report current progress and ask whether to continue.`
-        : `**推进提示**：已达到目标最大自动轮次上限（${goal.iterationCount}/${goal.maxIterations || settings.maxAutoIterations}），已自动暂停。请汇报当前进展与验收结果，询问用户是否继续。`
+        ? `**Progression Notice**: Reached max automatic iterations (${used}/${limit}). Auto-paused; report current progress and ask whether to continue.`
+        : `**推进提示**：已达到目标最大自动轮次上限（${used}/${limit}），已自动暂停。请汇报当前进展与验收结果，询问用户是否继续。`
     );
   } else {
     lines.push(
@@ -197,10 +222,13 @@ function buildCallbackMessage(job, settings, goal) {
  * Deliver a callback strictly to job.callbackTarget (never falls back to any global/current conversation).
  * Marks `sent` ONLY AFTER confirmed delivery. Failures stay visibly marked `failed` for manual retry.
  */
-function deliverCallbackForJob(job, settings) {
+async function deliverCallbackForJob(id, settings, retry = false) {
+  const job = claimCallback(id, retry);
+  if (!job.callbackClaim) return { ok: false, status: job.callbackStatus, error: job.callbackError };
+  const finish = patch => finishCallback(id, job.callbackClaim, patch);
   const target = normalizeCallbackTarget(job.callbackTarget);
   if (!target) {
-    const updated = updateJobCallbackState(job.id, {
+    const updated = finish({
       callbackStatus: "unrouted",
       callbackSent: false,
       callbackError:
@@ -210,38 +238,28 @@ function deliverCallbackForJob(job, settings) {
   }
 
   // Verify the locked conversation is still valid before sending
-  const verified = verifyConversationTarget(
+  const verified = await verifyConversationTarget(
     target.conversationId,
     target.projectId
   );
   if (!verified.valid) {
-    const updated = updateJobCallbackState(job.id, {
-      callbackStatus: "unrouted",
+    const updated = finish({
+      callbackStatus: verified.temporary ? "failed" : "unrouted",
       callbackSent: false,
       callbackError: `Locked source conversation unavailable (${verified.reason}); result kept in panel.`,
     });
-    return { ok: false, status: "unrouted", error: verified.reason, job: updated };
+    return { ok: false, status: updated.callbackStatus, error: verified.reason, job: updated };
   }
 
-  // Mark `sending` (NOT `sent`) before invoking agentapi
-  updateJobCallbackState(job.id, {
-    callbackStatus: "sending",
-    callbackSent: false,
-    callbackError: null,
-    incrementAttempts: true,
-  });
-
-  const goal = job.goalId ? getGoal(job.goalId) : getGoal();
-  const message = buildCallbackMessage(job, settings, goal);
-
   try {
-    const sendRes = app.sendMessage(verified.conversationId, message, {
-      projectId: verified.projectId || undefined,
-    });
+    const goal = job.goalId ? getGoal(job.goalId) : null;
+    const message = buildCallbackMessage(job, settings, goal);
+    beginCallbackSend(id, job.callbackClaim);
+    const sendRes = await agentApi(["send-message", verified.conversationId, message], verified.projectId);
     if (sendRes && sendRes.error) {
       throw new Error(String(sendRes.error));
     }
-    const updated = updateJobCallbackState(job.id, {
+    const updated = finish({
       callbackStatus: "sent",
       callbackSent: true,
       callbackAt: new Date().toISOString(),
@@ -253,7 +271,7 @@ function deliverCallbackForJob(job, settings) {
     return { ok: true, status: "sent", job: updated };
   } catch (err) {
     const errMsg = err?.message || String(err);
-    const updated = updateJobCallbackState(job.id, {
+    const updated = finish({
       callbackStatus: "failed",
       callbackSent: false,
       callbackError: errMsg,
@@ -279,15 +297,13 @@ async function checkAndDispatchCallbacks() {
       (j) =>
         j &&
         j.notifyOnComplete &&
-        j.callbackStatus === "pending" &&
+        (j.callbackStatus === "pending" || (j.callbackStatus === "sending" && !(Date.parse(j.callbackLeaseUntil) > Date.now()))) &&
         !j.callbackSent &&
-        (j.status === "completed" ||
-          j.status === "failed" ||
-          j.status === "timed_out")
+        callbackTerminal.has(j.status)
     );
-
     for (const job of pending) {
-      deliverCallbackForJob(job, settings);
+      try { await deliverCallbackForJob(job.id, settings); }
+      catch (err) { if (err.status !== 409) console.error("[codex-panel] callback:", err.message); }
     }
   } finally {
     watcherBusy = false;
@@ -298,36 +314,45 @@ async function checkAndDispatchCallbacks() {
  * PURE READ-ONLY state snapshot.
  * Never mutates settings.json or any global conversation binding!
  */
-function buildState(query = {}) {
+async function buildState(query = {}) {
   const convFromQuery =
     typeof query.conversationId === "string" ? query.conversationId.trim() : "";
   const convId = convFromQuery || app.config.conversationId || "";
 
-  const resolved = resolveCodexBinary();
-  const version = resolved ? getCodexVersion(resolved.path) : null;
-  const models = readCodexModelsCatalog();
-  const tomlDefaults = readCodexTomlDefaults();
-  const settings = loadSettings();
-  const goalsStore = listGoals();
-  const jobs = reconcilePersistedJobs(jobManager._localRunningIds);
-  const history = loadHistory();
+  const codex = await runtimeProbe(query.refresh === "1");
+  return readOnlySnapshot(() => {
+    const models = readCodexModelsCatalog();
+    const tomlDefaults = readCodexTomlDefaults();
+    const settings = loadSettings();
+    const goalsStore = listGoals();
+    const jobs = readPersistedJobs().map(publicJob);
+    const history = loadHistory().map(row => {
+      const job = row.jobId && jobs.find(j => j.id === row.jobId);
+      return { cwd: job?.cwd || null, conversationId: job?.conversationId || null, transferredFrom: job?.transferredFrom || null,
+        durationMs: null, usage: null, model: "", reasoningEffort: "", ...row };
+    });
+    return { pluginVersion: "1.5.0", codex, tomlDefaults, models, settings,
+      goalsStore, jobs, history, conversationId: convId || null };
+  });
+}
 
-  return {
-    pluginVersion: "1.5.0",
-    codex: {
-      found: Boolean(resolved),
-      path: resolved?.path || null,
-      source: resolved?.source || null,
-      version,
-    },
-    tomlDefaults,
-    models,
-    settings,
-    goalsStore,
-    jobs,
-    history,
-    conversationId: convId || null,
-  };
+function publicJob({ lockToken, callbackClaim, processIdentity, ...job }) {
+  return { ...job, conversationId: job.callbackTarget?.conversationId || job.conversationId || null,
+    transferredFrom: job.transferredFrom || null, durationMs: job.durationMs ?? job.resultSummary?.durationMs ?? null,
+    usage: job.usage ?? job.resultSummary?.usage ?? null, model: job.model || "", reasoningEffort: job.reasoningEffort || "" };
+}
+
+function api(route, handler, method) {
+  app.api(route, async data => {
+    try {
+      validateBooleans(data);
+      return await handler(data);
+    } catch (err) {
+      const status = err.status || 500;
+      return new Response(JSON.stringify({ ok: false, error: err.message, ...err.details }),
+        { status, contentType: "application/json" });
+    }
+  }, method);
 }
 
 app.page("/", () =>
@@ -336,7 +361,7 @@ app.page("/", () =>
   })
 );
 
-app.api(
+api(
   "/styles.css",
   () =>
     new Response(readText("styles.css"), {
@@ -345,16 +370,36 @@ app.api(
   "GET"
 );
 
-app.api(
+function readClassicAppBundle() {
+  const stripExport = (src) => src.replace(/^export\s+/gm, "");
+  const stripLocalImport = (src) =>
+    src.replace(/^import\s+[\s\S]*?from\s+["']\.\/[^"']+["'];?\r?\n/gm, "");
+  return [
+    "(() => {",
+    '"use strict";',
+    stripExport(readText("i18n.mjs")),
+    stripExport(readText("view-model.mjs")),
+    stripLocalImport(readText("app.js")),
+    "})();",
+  ].join("\n");
+}
+
+api(
   "/app.js",
   () =>
-    new Response(readText("app.js"), {
+    new Response(readClassicAppBundle(), {
       contentType: "application/javascript; charset=utf-8",
     }),
   "GET"
 );
 
-app.api(
+for (const file of ["i18n.mjs", "view-model.mjs"]) {
+  api("/" + file, () => new Response(readText(file), {
+    contentType: "application/javascript; charset=utf-8",
+  }), "GET");
+}
+
+api(
   "/logo.png",
   () => {
     if (!existsSync(LOGO_PATH)) {
@@ -369,9 +414,9 @@ app.api(
 );
 
 // Pure read-only state endpoint
-app.api("/api/state", (data) => buildState(data), "GET");
+api("/api/state", (data) => buildState(data), "GET");
 
-app.api(
+api(
   "/api/settings",
   (data) => {
     const settings = saveSettings({
@@ -391,7 +436,7 @@ app.api(
   "POST"
 );
 
-app.api(
+api(
   "/api/reset",
   () => {
     const settings = resetSettings();
@@ -401,61 +446,38 @@ app.api(
 );
 
 // Structured background resume by old job_id (inherits exact sessionId, cwd, sandbox, goal, milestone)
-app.api(
+api(
   "/api/jobs/resume",
-  (data) => {
-    const oldJobId = typeof data.jobId === "string" ? data.jobId.trim() : "";
-    if (!oldJobId) {
-      return new Response(
-        JSON.stringify({ ok: false, error: "jobId is required." }),
-        { status: 400, contentType: "application/json" }
-      );
+  async data => {
+    if (typeof data.jobId !== "string" || !data.jobId.trim()) throw problem(400, "jobId is required.");
+    const old = readPersistedJobs().find(j => j.id === data.jobId);
+    if (!old) throw problem(404, "Job not found: " + data.jobId);
+    const source = old.callbackTarget?.conversationId;
+    const target = data.conversationId || app.config.conversationId;
+    if (data.keepOriginalCallback && data.transferCallback) throw problem(400, "Conflicting callback choices.");
+    if (source && target && source !== target && !data.keepOriginalCallback && !data.transferCallback) {
+      throw problem(409, "Cross-conversation resume requires a callback choice.", {
+        code: "CROSS_CONVERSATION_RESUME", sourceConversationId: source, targetConversationId: target, jobId: old.id });
     }
-
-    // Lock trusted callback target from host conversation if provided & verified;
-    // otherwise resumeFromJob inherits oldJob.callbackTarget if valid.
-    let callbackTarget = null;
-    const reqConv =
-      (typeof data.conversationId === "string" && data.conversationId.trim()) ||
-      app.config.conversationId ||
-      "";
-    if (reqConv && ID_RE.test(reqConv)) {
-      const verified = verifyConversationTarget(reqConv);
-      if (verified.valid) {
-        callbackTarget = {
-          conversationId: verified.conversationId,
-          projectId: verified.projectId,
-          source: "sidecar_host",
-        };
-      }
+    let callbackTarget;
+    if (data.transferCallback) {
+      const verified = await verifyConversationTarget(target);
+      if (!verified.valid) throw problem(verified.temporary ? 500 : 400, verified.reason);
+      callbackTarget = { conversationId: target, projectId: verified.projectId, source: "sidecar_host" };
     }
-
-    try {
-      const { job, reused, reason } = jobManager.resumeFromJob(oldJobId, {
-        prompt: data.prompt,
-        sandbox: data.sandbox,
-        allowSandboxEscalation: Boolean(data.allowSandboxEscalation),
-        callbackTarget,
-      });
-      return {
-        ok: true,
-        reused,
-        reason: reason || null,
-        job: jobManager._serializeJob(job),
-        jobs: reconcilePersistedJobs(jobManager._localRunningIds),
-      };
-    } catch (err) {
-      return new Response(
-        JSON.stringify({ ok: false, error: err?.message || String(err) }),
-        { status: 400, contentType: "application/json" }
-      );
-    }
-  },
-  "POST"
+    const { job, reused, reason } = jobManager.resumeFromJob(old.id, {
+      prompt: data.prompt, sandbox: data.sandbox, cwd: data.cwd,
+      sessionId: data.sessionId ?? data.session_id, goalId: data.goalId ?? data.goal_id,
+      milestoneId: data.milestoneId ?? data.milestone_id, addDirs: data.addDirs ?? data.add_dirs,
+      notifyOnComplete: data.notifyOnComplete ?? data.notify_on_complete, skipGitRepoCheck: data.skipGitRepoCheck ?? data.skip_git_repo_check,
+      ephemeral: data.ephemeral, allowSandboxEscalation: data.allowSandboxEscalation ?? data.allow_sandbox_escalation,
+      transferCallback: data.transferCallback, callbackTarget });
+    return { ok: true, reused, reason, job: publicJob(jobManager._serializeJob(job)), jobs: readPersistedJobs().map(publicJob) };
+  }, "POST"
 );
 
 // Stop a running or detached-running job by PID and release its session lock
-app.api(
+api(
   "/api/jobs/stop",
   async (data) => {
     const jobId = typeof data.jobId === "string" ? data.jobId.trim() : "";
@@ -466,47 +488,29 @@ app.api(
       );
     }
     const res = await jobManager.stopJob(jobId);
+    if (!res.found) throw problem(404, "Job not found.");
+    if (!res.cancelled && !res.alreadyFinished) throw problem(409, res.error);
     return {
-      ok: Boolean(res.cancelled || res.alreadyFinished),
+      ok: true,
       ...res,
-      jobs: reconcilePersistedJobs(jobManager._localRunningIds),
+      jobs: readPersistedJobs().map(publicJob),
     };
   },
   "POST"
 );
 
 // Retry a failed callback strictly to the job's locked callbackTarget (never to another conversation)
-app.api(
+api(
   "/api/jobs/retry-callback",
-  (data) => {
-    const jobId = typeof data.jobId === "string" ? data.jobId.trim() : "";
-    if (!jobId) {
-      return new Response(
-        JSON.stringify({ ok: false, error: "jobId is required." }),
-        { status: 400, contentType: "application/json" }
-      );
-    }
-    const jobs = reconcilePersistedJobs(jobManager._localRunningIds);
-    const job = jobs.find((j) => j.id === jobId);
-    if (!job) {
-      return new Response(
-        JSON.stringify({ ok: false, error: `Job not found: ${jobId}` }),
-        { status: 404, contentType: "application/json" }
-      );
-    }
-    if (job.callbackStatus === "sent") {
-      return { ok: true, status: "sent", alreadySent: true, job, jobs };
-    }
-    const res = deliverCallbackForJob(job, loadSettings());
-    return {
-      ...res,
-      jobs: reconcilePersistedJobs(jobManager._localRunningIds),
-    };
-  },
-  "POST"
+  async data => {
+    if (!data.jobId) throw problem(400, "jobId is required.");
+    const res = await deliverCallbackForJob(data.jobId, loadSettings(), true);
+    if (!res.ok) throw problem(res.status === "unrouted" ? 409 : 500, res.error || "Callback unavailable.");
+    return { ...res, job: publicJob(res.job), jobs: readPersistedJobs().map(publicJob) };
+  }, "POST"
 );
 
-app.api(
+api(
   "/api/goals",
   (data) => {
     const goal = createGoal({
@@ -522,7 +526,7 @@ app.api(
   "POST"
 );
 
-app.api(
+api(
   "/api/goals/status",
   (data) => {
     if (data.activateOnly) {
@@ -538,7 +542,7 @@ app.api(
   "POST"
 );
 
-app.api(
+api(
   "/api/goals/milestone",
   (data) => {
     if (data.add) {
@@ -559,10 +563,12 @@ app.api(
   "POST"
 );
 
-app.api(
+api(
   "/api/goals/delete",
   (data) => {
+    if (!data.goalId) throw problem(400, "goalId is required.");
     const deleted = deleteGoal(data.goalId);
+    if (!deleted) throw problem(404, "Goal not found.");
     return { ok: deleted, goalsStore: listGoals() };
   },
   "POST"
@@ -575,7 +581,7 @@ const watcherMs = Math.max(
 );
 if (process.env.CODEX_PANEL_DISABLE_WATCHER !== "1") {
   setInterval(() => {
-    void checkAndDispatchCallbacks();
+    void checkAndDispatchCallbacks().catch(err => console.error("[codex-panel] maintenance:", err.message));
   }, watcherMs).unref();
 }
 

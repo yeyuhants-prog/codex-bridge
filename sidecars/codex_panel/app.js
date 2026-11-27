@@ -1,267 +1,29 @@
-const I18N = {
-  zh: {
-    langToggle: "EN",
-    langToggleTitle: "Switch to English",
-    refreshTitle: "刷新状态、模型与目标",
-    statusChecking: "检测中…",
-    statusConnected: "已连接",
-    statusNotFound: "未找到 Codex",
-    loadingMeta: "正在读取本机 Codex 环境与模型列表",
-    notFoundMeta: "请检查本机 Codex 安装或设置 CODEX_BIN",
-    tabControl: "控制台",
-    tabGoals: "目标与任务",
-    roleTitle: "分工模式（主脑 vs 打工人）",
-    roleOrch: "主脑派活模式",
-    roleOrchSub: "反重力管文本规划与基础插件，重活全交 Codex",
-    roleFlex: "按需自由协作",
-    roleFlexSub: "仅在指定或需要时调用 Codex",
-    modelTitle: "Codex 干活模型",
-    modelDefaultHint: (m) => `Codex 默认: ${m}`,
-    modelFollowDefault: (m) => `跟随 Codex 默认 (${m})`,
-    modelCustom: (m) => `${m} (自定义)`,
-    effortTitle: "思考深度（Reasoning Effort）",
-    effortHint: (e) => `当前默认: ${e}`,
-    effortFollowDesc: (e) => `跟随默认（${e}）`,
-    efforts: {
-      "": "跟随默认",
-      low: "低 (low)",
-      medium: "中 (medium)",
-      high: "高 (high)",
-      xhigh: "超高 (xhigh)",
-      max: "极高 (max)",
-      ultra: "极限 (ultra)",
-    },
-    progressionTitle: "目标推进模式（Progression）",
-    progManual: "手动推进",
-    progManualSub: "干完不回调，等你指示",
-    progNotify: "完工自动验收",
-    progNotifySub: "后台跑完自动唤醒汇报",
-    progAuto: "持续自动推进",
-    progAutoSub: "自动验收→返工/下一步",
-    maxIterLabel: "自动推进轮次上限",
-    perJobRoutingBadge: "按任务锁定原对话 ✓",
-    sandboxTitle: "执行权限（Sandbox）与派活方式",
-    sbReadOnly: "只读分析",
-    sbWrite: "工作区可写",
-    sbFull: "完全权限",
-    wfDirect: "直接派活执行",
-    wfDirectSub: "拆解后立即交给 Codex",
-    wfPlan: "先出任务单确认",
-    wfPlanSub: "你点头后再启动 Codex",
-    ephemeralLabel: "临时会话模式（不写入 Codex 历史会话）",
-    resetBtn: "恢复默认",
-    quickTitle: "快捷派活给反重力 → Codex",
-    quickPlaceholder: "描述你想让 Codex 持续排查、验证或修改的后端/Meta分析任务…",
-    sendTaskBtn: "发送任务给反重力",
-    checkStatusBtn: "对话自检",
-    goalBoardTitle: "持久化目标板（Goal & Milestones）",
-    newGoalBtn: "+ 新建目标",
-    goalTitlePlaceholder: "目标标题，例如：排查后端鉴权 500 报错并补全单测",
-    goalCwdPlaceholder: "项目目录（可选，留空自动使用当前工作区）",
-    goalMilestonesPlaceholder: "子里程碑（每行一条），例如：\n复现 500 错误并定位根因\n修复代码并跑通 pytest\n验证接口回归无副作用",
-    createGoalBtn: "创建并设为当前目标",
-    cancelBtn: "取消",
-    emptyGoal: "暂无持久化目标。点右上角「+ 新建目标」或直接在对话中让反重力创建目标板～",
-    goalMeta: (id, done, total, iter, max) => `${id} · 进度 ${done}/${total} · 自动轮次 ${iter}/${max}`,
-    msToggleTitle: "点击切换完成状态",
-    msVerifyPrefix: "验证: ",
-    msNotesPrefix: "备注: ",
-    continueGoalBtn: "让反重力继续推进此目标",
-    resumeGoalBtn: "恢复推进",
-    pauseGoalBtn: "暂停自动推进",
-    deleteBtn: "删除",
-    jobsTitle: "后台 Codex 任务（断点可续接）",
-    jobsCount: (n) => `${n} 个`,
-    emptyJobs: "暂无后台任务记录（使用 codex_start 启动后会实时显示）。",
-    cbSent: "已回调原对话 ✓",
-    cbFailed: "回调失败",
-    cbPending: "完工将回调原对话",
-    cbUnrouted: "仅面板查看（无绑定来源）",
-    cbSkipped: "未启用回调",
-    retryCbBtn: "重试回调",
-    resumeJobBtn: "结构化续跑",
-    stopJobBtn: "停止原进程",
-    noSessionHint: "无 Session ID（需人工处理）",
-    detachedBanner: (pid) => `原进程仍在运行 (PID ${pid || "?"})，请等待结束或先停止后再续跑`,
-    checkProgressBtn: "查进度",
-    toastResumedNew: (id) => `已启动续跑任务 ${id}（保留原目录与权限）✓`,
-    toastResumedReused: (id, st) => `该 Session 已有活跃任务 ${id} (${st})，未重复启动`,
-    toastStopped: (id) => `已停止任务 ${id} 并释放 Session 锁 ✓`,
-    toastRetryOk: (id) => `已成功补发回调到原对话 (${id}) ✓`,
-    toastRetryFail: (m) => `重试回调失败: ${m}`,
-    historyTitle: "最近执行记录",
-    historyCount: (n) => `${n} 条`,
-    emptyHistory: "还没有执行记录，派 Codex 干一单后会显示在这里～",
-    noPromptPreview: "(无提示词预览)",
-    copySessionBtn: "复制 Session",
-    toastRefreshed: "已刷新 Codex 状态、模型与目标板",
-    toastSaved: "配置已保存并实时生效 ✓",
-    toastReset: "已恢复默认设置",
-    toastLangSwitched: "已切换为中文界面 ✓",
-    toastBound: "已绑定当前对话，后台任务完工将自动回调 ✓",
-    toastNoConv: "当前不在对话侧边栏内，无法获取对话 ID",
-    toastGoalCreated: "已创建持久化目标 ✓",
-    toastGoalDeleted: "已删除目标",
-    toastGoalResumed: "目标已恢复为 active",
-    toastGoalPaused: "目标已暂停，不再自动推进",
-    toastMsUpdated: (id, st) => `里程碑 ${id} 已标记为 ${st}`,
-    toastCopiedSid: (id) => `已复制 Session ID: ${id}…`,
-    toastSent: "已发送到当前反重力对话 ✓",
-    toastNoSidecarMsg: "当前页面不在对话侧边栏中，无法直接发消息",
-    toastNeedTask: "请先输入想让 Codex 执行的任务内容",
-    toastLoadErr: (m) => `加载失败: ${m}`,
-    toastSaveErr: (m) => `保存失败: ${m}`,
-    toastResetErr: (m) => `重置失败: ${m}`,
-    toastActionErr: (m) => `操作失败: ${m}`,
-    toastSendErr: (m) => `发送失败: ${m}`,
-    msgContinueGoal: (id, title, prog) =>
-      `请调用 codex_goal(action="get", goal_id="${id}") 读取目标「${title}」的当前进度与关联 Session，按照当前推进模式（${prog}）继续推进下一个未完成的里程碑并验收。`,
-    msgResumeJob: (sid, jid) =>
-      `请使用 \`codex_resume(session_id="${sid}")\` 续接后台任务 \`${jid}\` 的上下文，检查当前进度并继续完成剩余工作。`,
-    msgCheckJob: (jid) =>
-      `请调用 \`codex_status(job_id="${jid}")\` 查看这个后台 Codex 任务的最新进度。`,
-    msgDispatchPlan: (prog, raw) =>
-      `请先为以下需求建好持久化目标板（codex_goal）并输出详细任务单给我确认，确认后按当前推进模式（${prog}）派给 Codex 执行：\n\n${raw}`,
-    msgDispatchDirect: (prog, raw) =>
-      `请先为以下需求建好持久化目标板（codex_goal），然后按当前推进模式（${prog}）直接调用 Codex Bridge 派给 Codex 执行并持续验证：\n\n${raw}`,
-    msgCheckStatus: "请调用 codex_info 检查当前 Codex Bridge 的模型、推进模式、目标进度与连接状态。",
-  },
-  en: {
-    langToggle: "中文",
-    langToggleTitle: "切换为中文",
-    refreshTitle: "Refresh status, models & goals",
-    statusChecking: "Checking…",
-    statusConnected: "Connected",
-    statusNotFound: "Codex Not Found",
-    loadingMeta: "Loading local Codex runtime & model catalog",
-    notFoundMeta: "Check local Codex installation or set CODEX_BIN",
-    tabControl: "Controls",
-    tabGoals: "Goals & Jobs",
-    roleTitle: "Role Division (Mastermind vs Worker)",
-    roleOrch: "Mastermind Mode",
-    roleOrchSub: "Gemini plans, synthesizes & uses basic tools; heavy work to Codex",
-    roleFlex: "Flexible Mode",
-    roleFlexSub: "Invoke Codex on demand",
-    modelTitle: "Codex Model",
-    modelDefaultHint: (m) => `Codex default: ${m}`,
-    modelFollowDefault: (m) => `Follow Codex default (${m})`,
-    modelCustom: (m) => `${m} (custom)`,
-    effortTitle: "Reasoning Effort",
-    effortHint: (e) => `Default: ${e}`,
-    effortFollowDesc: (e) => `Follow default (${e})`,
-    efforts: {
-      "": "Default",
-      low: "Low",
-      medium: "Medium",
-      high: "High",
-      xhigh: "Extra High",
-      max: "Max",
-      ultra: "Ultra",
-    },
-    progressionTitle: "Goal Progression Mode",
-    progManual: "Manual",
-    progManualSub: "No auto-callback; wait for prompt",
-    progNotify: "Notify & Verify",
-    progNotifySub: "Wake Antigravity when job finishes",
-    progAuto: "Autonomous",
-    progAutoSub: "Verify → fix or advance milestones",
-    maxIterLabel: "Max auto-iterations",
-    perJobRoutingBadge: "Per-job locked routing ✓",
-    sandboxTitle: "Sandbox Policy & Briefing Mode",
-    sbReadOnly: "Read-only",
-    sbWrite: "Workspace Write",
-    sbFull: "Full Access",
-    wfDirect: "Direct Dispatch",
-    wfDirectSub: "Plan and dispatch to Codex directly",
-    wfPlan: "Plan First",
-    wfPlanSub: "Show brief for approval first",
-    ephemeralLabel: "Ephemeral sessions (do not persist Codex history)",
-    resetBtn: "Reset Defaults",
-    quickTitle: "Quick Dispatch (Antigravity → Codex)",
-    quickPlaceholder: "Describe a backend fix, verification, or meta-analysis task for Codex…",
-    sendTaskBtn: "Send Task to Antigravity",
-    checkStatusBtn: "Health Check",
-    goalBoardTitle: "Persistent Goal & Milestone Board",
-    newGoalBtn: "+ New Goal",
-    goalTitlePlaceholder: "Goal title, e.g. Fix auth 500 error & pass pytest",
-    goalCwdPlaceholder: "Working directory (optional, defaults to workspace)",
-    goalMilestonesPlaceholder: "Milestones (one per line), e.g.\nReproduce 500 error & find root cause\nImplement fix and pass pytest\nVerify no regressions",
-    createGoalBtn: "Create & Set Active",
-    cancelBtn: "Cancel",
-    emptyGoal: "No persistent goals yet. Click \"+ New Goal\" or ask Antigravity to create one.",
-    goalMeta: (id, done, total, iter, max) => `${id} · ${done}/${total} done · iter ${iter}/${max}`,
-    msToggleTitle: "Click to toggle done status",
-    msVerifyPrefix: "Verify: ",
-    msNotesPrefix: "Notes: ",
-    continueGoalBtn: "Continue This Goal",
-    resumeGoalBtn: "Resume",
-    pauseGoalBtn: "Pause Auto",
-    deleteBtn: "Delete",
-    jobsTitle: "Background Codex Jobs (Resumable)",
-    jobsCount: (n) => `${n}`,
-    emptyJobs: "No background jobs yet (jobs launched via codex_start appear here).",
-    cbSent: "Delivered to source chat ✓",
-    cbFailed: "Callback failed",
-    cbPending: "Will callback source chat",
-    cbUnrouted: "Panel-only (no bound source)",
-    cbSkipped: "Callback off",
-    retryCbBtn: "Retry Callback",
-    resumeJobBtn: "Resume Job",
-    stopJobBtn: "Stop Process",
-    noSessionHint: "No Session ID (manual)",
-    detachedBanner: (pid) => `Original process still running (PID ${pid || "?"}). Wait or stop before resuming.`,
-    checkProgressBtn: "Check Status",
-    toastResumedNew: (id) => `Started resumed job ${id} (preserved cwd & sandbox) ✓`,
-    toastResumedReused: (id, st) => `Session already active in ${id} (${st}); reused instead of spawning a duplicate`,
-    toastStopped: (id) => `Stopped job ${id} & released session lock ✓`,
-    toastRetryOk: (id) => `Callback retried & delivered to source chat (${id}) ✓`,
-    toastRetryFail: (m) => `Retry callback failed: ${m}`,
-    historyTitle: "Recent Runs",
-    historyCount: (n) => `${n}`,
-    emptyHistory: "No recent runs yet.",
-    noPromptPreview: "(no prompt preview)",
-    copySessionBtn: "Copy Session",
-    toastRefreshed: "Refreshed Codex status, models & goals",
-    toastSaved: "Settings saved & active ✓",
-    toastReset: "Reset to defaults",
-    toastLangSwitched: "Switched to English ✓",
-    toastBound: "Bound to this conversation for auto-callbacks ✓",
-    toastNoConv: "Open inside a conversation side-pane to bind",
-    toastGoalCreated: "Created persistent goal ✓",
-    toastGoalDeleted: "Deleted goal",
-    toastGoalResumed: "Goal resumed (active)",
-    toastGoalPaused: "Goal paused (auto-progression stopped)",
-    toastMsUpdated: (id, st) => `Milestone ${id} marked ${st}`,
-    toastCopiedSid: (id) => `Copied Session ID: ${id}…`,
-    toastSent: "Sent to current Antigravity chat ✓",
-    toastNoSidecarMsg: "Cannot message chat outside side-pane",
-    toastNeedTask: "Please enter a task description first",
-    toastLoadErr: (m) => `Load failed: ${m}`,
-    toastSaveErr: (m) => `Save failed: ${m}`,
-    toastResetErr: (m) => `Reset failed: ${m}`,
-    toastActionErr: (m) => `Action failed: ${m}`,
-    toastSendErr: (m) => `Send failed: ${m}`,
-    msgContinueGoal: (id, title, prog) =>
-      `Call codex_goal(action="get", goal_id="${id}") to inspect goal "${title}" and its linked session, then advance and verify the next pending milestone under progression mode "${prog}".`,
-    msgResumeJob: (sid, jid) =>
-      `Use \`codex_resume(session_id="${sid}")\` to resume background job \`${jid}\`, inspect its current state, and finish the remaining work.`,
-    msgCheckJob: (jid) =>
-      `Call \`codex_status(job_id="${jid}")\` to check the latest progress of this background Codex job.`,
-    msgDispatchPlan: (prog, raw) =>
-      `First create a persistent goal via codex_goal and present a detailed Codex task brief for my approval, then dispatch under progression mode "${prog}":\n\n${raw}`,
-    msgDispatchDirect: (prog, raw) =>
-      `Create a persistent goal via codex_goal, then dispatch directly through Codex Bridge under progression mode "${prog}" and verify the results:\n\n${raw}`,
-    msgCheckStatus: "Call codex_info to check Codex Bridge status, active model, progression mode, and goal progress.",
-  },
-};
+import { I18N } from "./i18n.mjs";
+import { taskRows, taskView, conversationOf, isActive, shortId, responseData } from "./view-model.mjs";
 
 const FALLBACK_EFFORTS = ["low", "medium", "high", "xhigh", "max", "ultra"];
 
 let state = null;
 let toastTimer = null;
-let activeTab = "control";
+let scope = "current";
+let historyFilter = "all";
+const pageSize = 8;
+let historyLimit = pageSize;
+const collapsed = new Set();
+const expanded = new Set();
+const busy = new Set();
+let stateReqSeq = 0;
+let settingsVersion = 0;
+let pendingSettings = 0;
+let settingsQueue = Promise.resolve();
 
 const el = {
+  scope: document.getElementById("task-scope"),
+  all: document.getElementById("view-all"),
+  filter: document.getElementById("history-filter"),
+  more: document.getElementById("history-more"),
+  less: document.getElementById("history-less"),
+  dialog: document.getElementById("route-modal"),
   statusPill: document.getElementById("status-pill"),
   codexMeta: document.getElementById("codex-meta"),
   toast: document.getElementById("toast"),
@@ -324,6 +86,9 @@ function applyStaticI18n() {
       node.textContent = dict[key];
     }
   }
+  for (const node of document.querySelectorAll("[data-i18n-aria]")) {
+    node.setAttribute("aria-label", dict[node.dataset.i18nAria]);
+  }
   for (const node of document.querySelectorAll("[data-i18n-placeholder]")) {
     const key = node.dataset.i18nPlaceholder;
     if (typeof dict[key] === "string") {
@@ -343,18 +108,11 @@ function apiFetch(url, options = {}) {
 }
 
 async function apiJson(url, options = {}) {
-  const res = await apiFetch(url, options);
-  const text = await res.text();
-  let data = null;
-  try {
-    data = text ? JSON.parse(text) : {};
-  } catch {
-    throw new Error(`HTTP ${res.status}: ${text.slice(0, 120) || "invalid response"}`);
-  }
-  if (!res.ok) {
-    throw new Error(data?.error || `HTTP ${res.status}`);
-  }
-  return data;
+  return responseData(await apiFetch(url, options));
+}
+
+function post(url, data) {
+  return apiJson(url, { method: "POST", body: JSON.stringify(data) });
 }
 
 function getCurrentConvId() {
@@ -372,9 +130,10 @@ function showToast(message, isError = false) {
 }
 
 function switchTab(tab) {
-  activeTab = tab;
   for (const btn of el.tabs) {
     btn.classList.toggle("active", btn.dataset.tab === tab);
+    btn.setAttribute("aria-selected", String(btn.dataset.tab === tab));
+    btn.tabIndex = btn.dataset.tab === tab ? 0 : -1;
   }
   el.panelControl.classList.toggle("hidden", tab !== "control");
   el.panelGoals.classList.toggle("hidden", tab !== "goals");
@@ -382,6 +141,13 @@ function switchTab(tab) {
 
 for (const btn of el.tabs) {
   btn.addEventListener("click", () => switchTab(btn.dataset.tab));
+  btn.addEventListener("keydown", event => {
+    if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+    event.preventDefault();
+    const next = event.key === "Home" ? el.tabs[0] : event.key === "End" ? el.tabs[1] : [...el.tabs].find(tab => tab !== btn);
+    switchTab(next.dataset.tab);
+    next.focus();
+  });
 }
 
 function getSelectedModelObj() {
@@ -403,13 +169,13 @@ function renderHeader() {
     el.codexMeta.textContent = dict.notFoundMeta;
   }
 
-  const runningJobs = (state.jobs || []).filter(
-    (j) => j.status === "running" || j.status === "running_detached"
-  ).length;
-  const activeGoals = (state.goalsStore?.goals || []).filter((g) => g.status === "active").length;
-  const badgeNum = runningJobs || activeGoals;
-  el.tabBadge.textContent = String(badgeNum);
-  el.tabBadge.classList.toggle("hidden", badgeNum === 0);
+  const active = (state.jobs || []).filter(isActive);
+  const current = getCurrentConvId();
+  el.tabBadge.textContent = String(active.length);
+  el.tabBadge.title = dict.activeCount + " · " + active.length;
+  el.tabBadge.setAttribute("aria-label", el.tabBadge.title);
+  el.tabBadge.classList.toggle("hidden", !active.length);
+  el.tabBadge.classList.toggle("local", Boolean(current && active.some(job => conversationOf(job) === current)));
 }
 
 function renderModels() {
@@ -418,7 +184,7 @@ function renderModels() {
   const tomlModel = tomlDefaults?.model || "auto";
   el.modelDefaultHint.textContent = dict.modelDefaultHint(tomlModel);
 
-  el.modelSelect.innerHTML = "";
+  el.modelSelect.replaceChildren();
   const defOpt = document.createElement("option");
   defOpt.value = "";
   defOpt.textContent = dict.modelFollowDefault(tomlModel);
@@ -456,7 +222,7 @@ function renderEfforts() {
     tomlDefaults?.reasoningEffort || activeModel?.defaultEffort || "auto";
   el.effortHint.textContent = dict.effortHint(defaultEffortLabel);
 
-  el.effortGroup.innerHTML = "";
+  el.effortGroup.replaceChildren();
   const items = [
     { effort: "", description: dict.effortFollowDesc(defaultEffortLabel) },
     ...supported,
@@ -505,6 +271,9 @@ function renderSegments() {
   el.toggleEphemeral.checked = Boolean(settings.ephemeral);
   el.maxIterInput.value = String(settings.maxAutoIterations || 12);
 
+  for (const btn of el.panelControl.querySelectorAll(".seg-btn, .pill-btn")) {
+    btn.setAttribute("aria-pressed", String(btn.classList.contains("active")));
+  }
   el.bindBadge.textContent = dict.perJobRoutingBadge;
   el.bindBadge.className = "hint ok";
 }
@@ -518,12 +287,12 @@ function renderGoals() {
 
   if (goals.length > 1) {
     el.goalSelectorRow.classList.remove("hidden");
-    el.goalSelect.innerHTML = "";
+    el.goalSelect.replaceChildren();
     for (const g of goals) {
       const opt = document.createElement("option");
       opt.value = g.id;
       const done = g.milestones.filter((m) => m.status === "done").length;
-      opt.textContent = `[${g.status}] ${g.title} (${done}/${g.milestones.length})`;
+      opt.textContent = `[${dict.taskStatuses[g.status] || g.status}] ${g.title} (${done}/${g.milestones.length})`;
       el.goalSelect.appendChild(opt);
     }
     if (activeGoal) el.goalSelect.value = activeGoal.id;
@@ -531,7 +300,7 @@ function renderGoals() {
     el.goalSelectorRow.classList.add("hidden");
   }
 
-  el.activeGoalView.innerHTML = "";
+  el.activeGoalView.replaceChildren();
   if (!activeGoal) {
     const empty = document.createElement("div");
     empty.className = "empty";
@@ -563,7 +332,7 @@ function renderGoals() {
 
   const badge = document.createElement("span");
   badge.className = `badge ${activeGoal.status}`;
-  badge.textContent = activeGoal.status;
+  badge.textContent = dict.taskStatuses[activeGoal.status] || activeGoal.status;
   header.append(left, badge);
 
   const track = document.createElement("div");
@@ -586,28 +355,12 @@ function renderGoals() {
     const row = document.createElement("div");
     row.className = "milestone-item";
 
-    const checkBtn = document.createElement("button");
-    checkBtn.type = "button";
-    checkBtn.className = `ms-check ${ms.status}`;
-    checkBtn.textContent = msIcons[ms.status] || "";
-    checkBtn.title = dict.msToggleTitle;
-    checkBtn.addEventListener("click", async () => {
-      try {
-        const nextStatus = ms.status === "done" ? "pending" : "done";
-        await apiJson("/api/goals/milestone", {
-          method: "POST",
-          body: JSON.stringify({
-            goalId: activeGoal.id,
-            milestoneId: ms.id,
-            status: nextStatus,
-          }),
-        });
-        await fetchState(true);
-        showToast(t().toastMsUpdated(ms.id, nextStatus));
-      } catch (err) {
-        showToast(t().toastActionErr(err.message), true);
-      }
-    });
+    const statusIcon = document.createElement("span");
+    statusIcon.className = `ms-check ${ms.status}`;
+    statusIcon.textContent = msIcons[ms.status] || "";
+    const statusLabel = dict.taskStatuses[ms.status] || ms.status;
+    statusIcon.title = `${ms.title} · ${statusLabel}`;
+    statusIcon.setAttribute("aria-label", statusLabel);
 
     const body = document.createElement("div");
     body.className = "ms-body";
@@ -628,7 +381,7 @@ function renderGoals() {
       body.appendChild(sub);
     }
 
-    row.append(checkBtn, body);
+    row.append(statusIcon, body);
     msList.appendChild(row);
   }
 
@@ -691,314 +444,340 @@ function renderGoals() {
   el.activeGoalView.append(header, track, msList, actions);
 }
 
+function node(tag, className, text) {
+  const element = document.createElement(tag);
+  if (className) element.className = className;
+  if (text != null) element.textContent = text;
+  return element;
+}
+
+function button(label, className, click) {
+  const btn = node("button", className, label);
+  btn.type = "button";
+  btn.addEventListener("click", click);
+  return btn;
+}
+
 function formatTime(iso) {
-  if (!iso) return "";
+  const date = new Date(iso);
+  if (!iso || Number.isNaN(date.valueOf())) return "";
+  return date.toLocaleString(getLang(), { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+}
+
+function chooseRouting(job, conflict) {
+  if (el.dialog.open) return Promise.resolve("cancel");
+  document.getElementById("route-job").textContent = conflict.jobId;
+  document.getElementById("route-cwd").textContent = job.cwd || "—";
+  document.getElementById("route-source").textContent = conflict.sourceConversationId;
+  document.getElementById("route-target").textContent = conflict.targetConversationId;
+  el.dialog.returnValue = "cancel";
+  el.dialog.showModal();
+  return new Promise(resolve => el.dialog.addEventListener("close", () => resolve(el.dialog.returnValue), { once: true }));
+}
+el.dialog.addEventListener("click", event => {
+  if (event.target === el.dialog) el.dialog.close("cancel");
+});
+
+async function resumeJob(job) {
+  const url = "/api/jobs/resume";
+  const request = { jobId: job.id, conversationId: getCurrentConvId() };
+  let result;
+  let choice;
   try {
-    return new Date(iso).toLocaleTimeString(
-      getLang() === "en" ? "en-US" : "zh-CN",
-      {
-        hour: "2-digit",
-        minute: "2-digit",
-        second: "2-digit",
-        hour12: false,
+    result = await post(url, request);
+  } catch (error) {
+    const conflict = error.data;
+    if (error.status !== 409 || conflict?.code !== "CROSS_CONVERSATION_RESUME") throw error;
+    if (!conflict.sourceConversationId || !conflict.targetConversationId || conflict.jobId !== job.id ||
+        (request.conversationId && conflict.targetConversationId !== request.conversationId)) {
+      throw new Error(t().contextChanged);
+    }
+    choice = await chooseRouting(job, conflict);
+    if (choice !== "keep" && choice !== "transfer") return;
+    if (getCurrentConvId() !== request.conversationId) throw new Error(t().contextChanged);
+    result = await post(url, { ...request, conversationId: conflict.targetConversationId,
+      [choice === "keep" ? "keepOriginalCallback" : "transferCallback"]: true });
+  }
+  await fetchState(true);
+  if (result.reused) showToast(t().toastResumedReused(result.job.id, t().taskStatuses[result.job.status] || result.job.status));
+  else showToast(choice === "keep" ? t().kept : choice === "transfer" ? t().moved : t().toastResumedNew(result.job.id));
+}
+
+function jobAction(job, name, label, action, disabled = false) {
+  const key = JSON.stringify([job.key, name]);
+  const btn = button(label, "task-action", async () => {
+    if (busy.has(key)) return;
+    const restoreFocus = document.activeElement === btn;
+    busy.add(key);
+    btn.disabled = true;
+    try {
+      await action();
+    } catch (err) {
+      showToast(t().toastActionErr(err.message), true);
+    } finally {
+      busy.delete(key);
+      // Polling may have replaced the button while the action was in flight.
+      for (const current of document.querySelectorAll(".task-action")) {
+        if (current.dataset.key !== key) continue;
+        current.disabled = current.dataset.unavailable === "true";
+        if (restoreFocus && document.activeElement === document.body) current.focus({ preventScroll: true });
       }
-    );
-  } catch {
-    return iso;
+    }
+  });
+  btn.dataset.key = key;
+  btn.dataset.unavailable = String(disabled);
+  btn.disabled = disabled || busy.has(key);
+  return btn;
+}
+
+function renderPrompt(card, row) {
+  const prompt = node("p", "task-prompt", row.prompt || row.promptPreview || t().noPromptPreview);
+  const toggle = button("", "prompt-toggle", () => {
+    if (expanded.has(row.key)) expanded.delete(row.key);
+    else expanded.add(row.key);
+    update();
+  });
+  toggle.dataset.key = JSON.stringify([row.key, "prompt"]);
+  function update() {
+    const open = expanded.has(row.key);
+    prompt.classList.toggle("expanded", open);
+    toggle.setAttribute("aria-expanded", String(open));
+    toggle.textContent = open ? t().fold : t().expand;
+    toggle.hidden = !open && prompt.scrollHeight <= prompt.clientHeight + 1;
+  }
+  card.append(prompt, toggle);
+  toggle.hidden = true;
+  prompt.classList.toggle("expanded", expanded.has(row.key));
+  promptObserver.observe(prompt);
+  update();
+}
+
+const promptObserver = new ResizeObserver(entries => {
+  for (const { target } of entries) {
+    if (!target.isConnected) continue;
+    const toggle = target.nextElementSibling;
+    toggle.hidden = !target.classList.contains("expanded") && target.scrollHeight <= target.clientHeight + 1;
+  }
+});
+
+function taskCard(row) {
+  const d = t();
+  const live = isActive(row);
+  const card = node("article", live ? "task-card live" : "task-card");
+  const top = node("div", "task-top");
+  const badge = node("span", "badge " + row.status, d.taskStatuses[row.status]);
+  if (live) badge.prepend(node("i", "pulse-dot"));
+  top.append(badge);
+  if (row.kind !== "job") top.append(node("span", "kind", d[row.kind]));
+  if (row.id || row.jobId) {
+    const id = node("span", "job-id", row.id || row.jobId);
+    id.title = id.textContent;
+    top.append(id);
+  }
+  const time = node("time", "time", formatTime(row.finishedAt || row.at || row.startedAt));
+  top.append(time);
+  card.append(top);
+  renderPrompt(card, row);
+
+  const meta = node("div", "task-meta");
+  const add = (label, cls = "", title = "") => {
+    const tag = node("span", "chip " + cls, label);
+    tag.title = title || label;
+    meta.append(tag);
+  };
+  add(row.conversationId ? shortId(row.conversationId) : d.unbound, "chat", row.conversationId);
+  if (row.transferredFrom) add(d.transferred.replace("{id}", shortId(row.transferredFrom)), "transfer", row.transferredFrom);
+  if (row.sandbox) add(row.sandbox, "sandbox " + row.sandbox);
+  if (row.model) add(d.model + " · " + row.model);
+  if (row.reasoningEffort) add(d.effort + " · " + (d.efforts[row.reasoningEffort] || row.reasoningEffort));
+  if (row.durationMs != null) add(d.duration + " · " + (row.durationMs / 1000).toLocaleString(getLang(), { maximumFractionDigits: 1 }) + " s");
+  if (row.usage) {
+    const tokens = n => typeof n === "number" ? n.toLocaleString(getLang()) : "—";
+    add("Tokens · " + d.tokensIn + " " + tokens(row.usage.input_tokens) + " / " + d.tokensOut + " " + tokens(row.usage.output_tokens), "tokens");
+  }
+  if (row.eventCount != null || live) add(d.events + " · " + (row.eventCount || 0), live ? "event-count" : "");
+  if (row.parentJobId) add("← " + row.parentJobId);
+  if (row.goalId) add([row.goalId, row.milestoneId].filter(Boolean).join(" / "));
+  card.append(meta);
+  if (row.cwd) {
+    const cwd = node("div", "task-cwd", row.cwd);
+    cwd.title = d.workdir + " · " + row.cwd;
+    card.append(cwd);
+  }
+  if (row.status === "running_detached") card.append(node("div", "task-note", d.detachedBanner(row.pid)));
+  if (!live && row.error) card.append(node("div", "task-note", row.error));
+  if (row.kind === "job") {
+    const cb = row.callbackStatus || (row.callbackSent ? "sent" : "skipped");
+    const labels = { sent: d.cbSent, failed: d.cbFailed, unrouted: d.cbUnrouted, pending: d.cbPending, sending: d.cbSending, skipped: d.cbSkipped };
+    card.append(node("div", "callback " + cb, [labels[cb] || cb, row.callbackError].filter(Boolean).join(" · ")));
+  }
+  const actions = node("div", "task-actions");
+  if (live) {
+    actions.append(jobAction(row, "check", d.checkProgressBtn, () => sendToConversation(t().msgCheckJob(row.id))),
+      jobAction(row, "stop", d.stopJobBtn, async () => {
+        const result = await post("/api/jobs/stop", { jobId: row.id });
+        await fetchState(true);
+        showToast(result.alreadyFinished ? t().alreadyFinished : t().toastStopped(row.id));
+      }, row.status === "stopping"));
+  } else {
+    if (row.sessionId && row.sessionId !== "last") {
+      if (row.kind === "job") actions.append(jobAction(row, "resume", d.resumeJobBtn, () => resumeJob(row)));
+      actions.append(jobAction(row, "copy", d.copySessionBtn, async () => {
+        try {
+          await navigator.clipboard.writeText(row.sessionId);
+          showToast(t().toastCopiedSid(row.sessionId.slice(0, 8)));
+        } catch { showToast(row.sessionId); }
+      }));
+    }
+    if (row.kind === "job" && row.notifyOnComplete !== false && ["failed", "unrouted"].includes(row.callbackStatus)) {
+      actions.append(jobAction(row, "retry", d.retryCbBtn, async () => {
+        await post("/api/jobs/retry-callback", { jobId: row.id });
+        await fetchState(true);
+        showToast(t().toastRetryOk(row.id));
+      }));
+    }
+  }
+  if (actions.childElementCount) card.append(actions);
+  return card;
+}
+
+function renderGroups(list, groups, grouped, limit, emptyText) {
+  list.replaceChildren();
+  if (!groups.length) list.append(node("p", "empty", emptyText));
+  let available = 0;
+  for (const group of groups) {
+    const key = JSON.stringify([list.id, group.id]);
+    const closed = grouped && collapsed.has(key);
+    const section = node("div", "task-group");
+    if (grouped) {
+      const local = group.id && group.id === getCurrentConvId();
+      const heading = button("", "group-head", () => {
+        if (closed) collapsed.delete(key);
+        else collapsed.add(key);
+        renderTasks();
+      });
+      heading.dataset.key = key;
+      heading.setAttribute("aria-expanded", String(!closed));
+      const label = local ? t().currentChat : group.id ? t().otherChat : t().unbound;
+      heading.append(node("span", local ? "group-label current" : "group-label", label));
+      if (group.id) heading.append(node("span", "group-id", shortId(group.id)));
+      if (group.directory && group.id && !local) heading.append(node("span", "directory", group.directory));
+      heading.append(node("span", "group-count", group.rows.length), node("span", "chevron", closed ? "▸" : "▾"));
+      heading.title = group.id;
+      section.append(heading);
+    }
+    if (!closed) {
+      const slice = group.rows.slice(0, Math.max(0, limit - available));
+      available += group.rows.length;
+      for (const row of slice) section.append(taskCard(row));
+      if (!slice.length) continue;
+    }
+    list.append(section);
+  }
+  return available;
+}
+
+function renderTasks() {
+  const focusedKey = document.activeElement?.dataset.key;
+  promptObserver.disconnect();
+  if (!state) return;
+  const current = getCurrentConvId();
+  const grouped = !current || scope === "all";
+  const v = taskView(taskRows(state.jobs, state.history), current, scope, historyFilter);
+  for (const btn of el.scope.querySelectorAll("button")) {
+    const local = btn.dataset.scope === "current";
+    btn.querySelector("b").textContent = local ? v.currentCount : v.total;
+    btn.disabled = local && !current;
+    btn.setAttribute("aria-pressed", String(local !== grouped));
+  }
+  el.all.hidden = grouped || v.currentCount > 0 || v.total === 0;
+  el.all.textContent = t().viewAll + " (" + v.total + ")";
+  for (const btn of el.filter.querySelectorAll("button")) {
+    btn.setAttribute("aria-pressed", String(btn.dataset.filter === historyFilter));
+  }
+  el.jobsCount.textContent = v.active.reduce((n, g) => n + g.rows.length, 0);
+  el.historyCount.textContent = v.historyCount;
+  renderGroups(el.jobsList, v.active, grouped, Infinity, t().noActive);
+  const available = renderGroups(el.historyList, v.history, grouped, historyLimit, t().noHistory);
+  el.more.textContent = t().more + " (+" + Math.min(pageSize, Math.max(0, available - historyLimit)) + ")";
+  el.more.hidden = available <= historyLimit;
+  el.less.hidden = historyLimit <= pageSize || available <= pageSize;
+  if (focusedKey && document.activeElement === document.body) {
+    Array.from(el.panelGoals.querySelectorAll("[data-key]")).find(b => b.dataset.key === focusedKey)?.focus({ preventScroll: true });
   }
 }
 
-function renderJobs() {
-  const dict = t();
-  const jobs = state.jobs || [];
-  el.jobsCount.textContent = dict.jobsCount(jobs.length);
-  el.jobsList.innerHTML = "";
-
-  if (jobs.length === 0) {
-    const empty = document.createElement("div");
-    empty.className = "empty";
-    empty.textContent = dict.emptyJobs;
-    el.jobsList.appendChild(empty);
-    return;
-  }
-
-  for (const job of jobs.slice(0, 10)) {
-    const row = document.createElement("div");
-    row.className = "history-item";
-
-    const top = document.createElement("div");
-    top.className = "history-top";
-    const left = document.createElement("span");
-    const badge = document.createElement("span");
-    badge.className = `badge ${job.status}`;
-    badge.textContent = job.status;
-    left.appendChild(badge);
-    left.appendChild(
-      document.createTextNode(
-        ` ${job.id}${job.parentJobId ? ` ← ${job.parentJobId}` : ""}${job.goalId ? ` · ${job.goalId}` : ""}`
-      )
-    );
-    const right = document.createElement("span");
-    right.textContent = `${job.sandbox || "workspace-write"} · ${job.eventCount || 0} ev · ${formatTime(job.startedAt)}`;
-    top.append(left, right);
-
-    const prompt = document.createElement("div");
-    prompt.className = "history-prompt";
-    prompt.textContent = job.promptPreview || dict.noPromptPreview;
-
-    const subline = document.createElement("div");
-    subline.className = "job-subline";
-    subline.textContent = [
-      job.cwd || "",
-      job.sessionId ? `sid:${job.sessionId.slice(0, 8)}…` : dict.noSessionHint,
-    ]
-      .filter(Boolean)
-      .join(" · ");
-
-    row.append(top, prompt, subline);
-
-    if (job.status === "running_detached") {
-      const alert = document.createElement("div");
-      alert.className = "job-alert";
-      alert.textContent = dict.detachedBanner(job.pid);
-      row.appendChild(alert);
-    }
-
-    if (job.callbackStatus === "failed" && job.callbackError) {
-      const errBanner = document.createElement("div");
-      errBanner.className = "job-alert error";
-      errBanner.textContent = `${dict.cbFailed}: ${job.callbackError}`;
-      row.appendChild(errBanner);
-    }
-
-    const foot = document.createElement("div");
-    foot.className = "history-foot";
-
-    const cbTag = document.createElement("span");
-    const cbStatus = job.callbackStatus || (job.callbackSent ? "sent" : "skipped");
-    cbTag.className = `cb-tag ${cbStatus}`;
-    if (cbStatus === "sent") {
-      cbTag.textContent = dict.cbSent;
-    } else if (cbStatus === "failed") {
-      cbTag.textContent = dict.cbFailed;
-    } else if (cbStatus === "unrouted") {
-      cbTag.textContent = dict.cbUnrouted;
-      if (job.callbackError) cbTag.title = job.callbackError;
-    } else if (cbStatus === "pending") {
-      cbTag.textContent = dict.cbPending;
-    } else {
-      cbTag.textContent = dict.cbSkipped;
-    }
-    foot.appendChild(cbTag);
-
-    const footActions = document.createElement("div");
-    footActions.className = "foot-actions";
-
-    if (cbStatus === "failed" && job.callbackTarget?.conversationId) {
-      const retryBtn = document.createElement("button");
-      retryBtn.type = "button";
-      retryBtn.className = "copy-sid";
-      retryBtn.textContent = dict.retryCbBtn;
-      retryBtn.addEventListener("click", async () => {
-        try {
-          const data = await apiJson("/api/jobs/retry-callback", {
-            method: "POST",
-            body: JSON.stringify({ jobId: job.id }),
-          });
-          if (data.jobs) state.jobs = data.jobs;
-          renderJobs();
-          if (data.ok) {
-            showToast(t().toastRetryOk(job.id));
-          } else {
-            showToast(t().toastRetryFail(data.error || data.status), true);
-          }
-        } catch (err) {
-          showToast(t().toastRetryFail(err.message), true);
-        }
-      });
-      footActions.appendChild(retryBtn);
-    }
-
-    const isActiveJob =
-      job.status === "running" || job.status === "running_detached";
-
-    if (isActiveJob) {
-      const stopBtn = document.createElement("button");
-      stopBtn.type = "button";
-      stopBtn.className = "copy-sid";
-      stopBtn.textContent = dict.stopJobBtn;
-      stopBtn.addEventListener("click", async () => {
-        try {
-          const data = await apiJson("/api/jobs/stop", {
-            method: "POST",
-            body: JSON.stringify({ jobId: job.id }),
-          });
-          if (data.jobs) state.jobs = data.jobs;
-          renderAll();
-          if (data.ok) {
-            showToast(t().toastStopped(job.id));
-          } else {
-            showToast(t().toastActionErr(data.error || "stop failed"), true);
-          }
-        } catch (err) {
-          showToast(t().toastActionErr(err.message), true);
-        }
-      });
-      footActions.appendChild(stopBtn);
-
-      if (job.status === "running") {
-        const checkBtn = document.createElement("button");
-        checkBtn.type = "button";
-        checkBtn.className = "copy-sid";
-        checkBtn.textContent = dict.checkProgressBtn;
-        checkBtn.addEventListener("click", async () => {
-          await sendToConversation(t().msgCheckJob(job.id));
-        });
-        footActions.appendChild(checkBtn);
-      }
-    } else if (job.sessionId && job.sessionId !== "last") {
-      // Structured resume by old job_id directly via Sidecar backend (preserves cwd, sandbox, goal, milestone)
-      const resumeBtn = document.createElement("button");
-      resumeBtn.type = "button";
-      resumeBtn.className = "copy-sid";
-      resumeBtn.textContent = dict.resumeJobBtn;
-      resumeBtn.addEventListener("click", async () => {
-        try {
-          const data = await apiJson("/api/jobs/resume", {
-            method: "POST",
-            body: JSON.stringify({
-              jobId: job.id,
-              conversationId: getCurrentConvId(),
-            }),
-          });
-          if (data.jobs) state.jobs = data.jobs;
-          renderAll();
-          if (data.reused) {
-            showToast(t().toastResumedReused(data.job.id, data.job.status));
-          } else {
-            showToast(t().toastResumedNew(data.job.id));
-          }
-        } catch (err) {
-          showToast(t().toastActionErr(err.message), true);
-        }
-      });
-      footActions.appendChild(resumeBtn);
-    }
-
-    foot.appendChild(footActions);
-    row.appendChild(foot);
-    el.jobsList.appendChild(row);
-  }
+function setScope(value) {
+  scope = value;
+  historyLimit = pageSize;
+  renderTasks();
 }
+for (const btn of el.scope.querySelectorAll("button")) btn.addEventListener("click", () => setScope(btn.dataset.scope));
+el.all.addEventListener("click", () => setScope("all"));
+for (const btn of el.filter.querySelectorAll("button")) btn.addEventListener("click", () => {
+  historyFilter = btn.dataset.filter;
+  historyLimit = pageSize;
+  renderTasks();
+});
+el.more.addEventListener("click", () => { historyLimit += pageSize; renderTasks(); });
+el.less.addEventListener("click", () => { historyLimit = pageSize; renderTasks(); });
 
-function renderHistory() {
-  const dict = t();
-  const list = state.history || [];
-  el.historyCount.textContent = dict.historyCount(list.length);
-  el.historyList.innerHTML = "";
-
-  if (list.length === 0) {
-    const empty = document.createElement("div");
-    empty.className = "empty";
-    empty.textContent = dict.emptyHistory;
-    el.historyList.appendChild(empty);
-    return;
-  }
-
-  for (const item of list.slice(0, 8)) {
-    const row = document.createElement("div");
-    row.className = "history-item";
-
-    const top = document.createElement("div");
-    top.className = "history-top";
-
-    const left = document.createElement("span");
-    const badge = document.createElement("span");
-    badge.className = `badge ${item.status || "completed"}`;
-    badge.textContent = item.status || "completed";
-    left.appendChild(badge);
-    left.appendChild(
-      document.createTextNode(
-        ` ${item.model || "default"} · ${item.reasoningEffort || "default"}`
-      )
-    );
-
-    const right = document.createElement("span");
-    const sec = item.durationMs ? `${(item.durationMs / 1000).toFixed(1)}s` : "";
-    right.textContent = [sec, formatTime(item.at)].filter(Boolean).join(" · ");
-
-    top.append(left, right);
-
-    const prompt = document.createElement("div");
-    prompt.className = "history-prompt";
-    prompt.textContent = item.promptPreview || dict.noPromptPreview;
-
-    const foot = document.createElement("div");
-    foot.className = "history-foot";
-    const metaText = document.createElement("span");
-    const tokens = item.usage
-      ? `in=${item.usage.input_tokens ?? 0} / out=${item.usage.output_tokens ?? 0}`
-      : item.mode || "run";
-    metaText.textContent = tokens;
-    foot.appendChild(metaText);
-
-    if (item.sessionId) {
-      const copyBtn = document.createElement("button");
-      copyBtn.type = "button";
-      copyBtn.className = "copy-sid";
-      copyBtn.textContent = dict.copySessionBtn;
-      copyBtn.title = item.sessionId;
-      copyBtn.addEventListener("click", async () => {
-        try {
-          await navigator.clipboard.writeText(item.sessionId);
-          showToast(t().toastCopiedSid(item.sessionId.slice(0, 8)));
-        } catch {
-          showToast(item.sessionId);
-        }
-      });
-      foot.appendChild(copyBtn);
-    }
-
-    row.append(top, prompt, foot);
-    el.historyList.appendChild(row);
-  }
-}
-
+let lastSettings, lastGoals, lastTasks;
 function renderAll() {
-  applyStaticI18n();
+  const lang = getLang();
+  const settingsKey = JSON.stringify([state.settings, state.models, state.tomlDefaults]);
+  if (lastSettings !== settingsKey) {
+    applyStaticI18n();
+    renderModels();
+    renderEfforts();
+    renderSegments();
+    lastSettings = settingsKey;
+  }
   renderHeader();
-  renderModels();
-  renderEfforts();
-  renderSegments();
-  renderGoals();
-  renderJobs();
-  renderHistory();
+  const goalKey = JSON.stringify([state.goalsStore, lang]);
+  if (goalKey !== lastGoals) { renderGoals(); lastGoals = goalKey; }
+  const taskKey = JSON.stringify([state.jobs, state.history, getCurrentConvId(), lang]);
+  if (taskKey !== lastTasks) { renderTasks(); lastTasks = taskKey; }
 }
 
 async function fetchState(silent = false) {
+  const seq = ++stateReqSeq;
+  const version = settingsVersion;
   try {
-    const convId = getCurrentConvId();
-    const qs = convId ? `?conversationId=${encodeURIComponent(convId)}` : "";
-    state = await apiJson(`/api/state${qs}`, { method: "GET" });
+    const query = new URLSearchParams();
+    if (getCurrentConvId()) query.set("conversationId", getCurrentConvId());
+    if (!silent) query.set("refresh", "1");
+    const snapshot = await apiJson("/api/state?" + query);
+    if (seq !== stateReqSeq) return;
+    if (state && (pendingSettings || version !== settingsVersion)) snapshot.settings = state.settings;
+    state = snapshot;
     renderAll();
     if (!silent) showToast(t().toastRefreshed);
   } catch (err) {
-    showToast(t().toastLoadErr(err.message), true);
+    if (seq === stateReqSeq) showToast(t().toastLoadErr(err.message), true);
   }
 }
 
-async function updateSetting(patch, customToast = null) {
-  try {
-    const data = await apiJson("/api/settings", {
-      method: "POST",
-      body: JSON.stringify(patch),
-    });
-    state.settings = data.settings;
-    renderAll();
-    showToast(customToast || t().toastSaved);
-  } catch (err) {
-    showToast(t().toastSaveErr(err.message), true);
-  }
+function updateSetting(patch, customToast = null) {
+  if (!state) return;
+  pendingSettings++;
+  settingsVersion++;
+  settingsQueue = settingsQueue.then(async () => {
+    try {
+      const data = await post(patch ? "/api/settings" : "/api/reset", patch || {});
+      state.settings = data.settings;
+      renderAll();
+      showToast(customToast || (patch ? t().toastSaved : t().toastReset));
+    } catch (err) {
+      renderSegments();
+      renderModels();
+      showToast(patch ? t().toastSaveErr(err.message) : t().toastResetErr(err.message), true);
+    } finally {
+      pendingSettings--;
+      settingsVersion++;
+    }
+  });
+  return settingsQueue;
 }
 
 el.btnLang.addEventListener("click", () => {
@@ -1048,16 +827,7 @@ el.toggleEphemeral.addEventListener("change", () => {
 
 el.btnRefresh.addEventListener("click", () => fetchState(false));
 
-el.btnReset.addEventListener("click", async () => {
-  try {
-    const data = await apiJson("/api/reset", { method: "POST", body: "{}" });
-    state.settings = data.settings;
-    renderAll();
-    showToast(t().toastReset);
-  } catch (err) {
-    showToast(t().toastResetErr(err.message), true);
-  }
-});
+el.btnReset.addEventListener("click", () => updateSetting(null));
 
 el.btnToggleNewGoal.addEventListener("click", () => {
   el.newGoalForm.classList.toggle("hidden");
@@ -1122,20 +892,24 @@ el.goalSelect.addEventListener("change", async () => {
 });
 
 async function sendToConversation(message) {
-  if (!window.sidecar?.agent?.sendMessage) {
+  if (!getCurrentConvId() || !window.sidecar?.agent?.sendMessage) {
     showToast(t().toastNoSidecarMsg, true);
-    return;
+    return false;
   }
   try {
-    await window.sidecar.agent.sendMessage(message);
+    const result = await window.sidecar.agent.sendMessage(message);
+    if (result === false || result?.ok === false || result?.error) throw new Error(result?.error?.message || result?.error || result?.message || t().sendRejected);
     showToast(t().toastSent);
+    return true;
   } catch (err) {
     showToast(t().toastSendErr(err.message), true);
+    return false;
   }
 }
 
 el.btnSendTask.addEventListener("click", async () => {
-  const raw = el.quickTask.value.trim();
+  const draft = el.quickTask.value;
+  const raw = draft.trim();
   if (!raw) {
     showToast(t().toastNeedTask, true);
     el.quickTask.focus();
@@ -1147,8 +921,12 @@ el.btnSendTask.addEventListener("click", async () => {
     workflowMode === "plan_first"
       ? t().msgDispatchPlan(progMode, raw)
       : t().msgDispatchDirect(progMode, raw);
-  await sendToConversation(msg);
-  el.quickTask.value = "";
+  el.btnSendTask.disabled = true;
+  try {
+    if (await sendToConversation(msg) && el.quickTask.value === draft) el.quickTask.value = "";
+  } finally {
+    el.btnSendTask.disabled = false;
+  }
 });
 
 el.btnCheckStatus.addEventListener("click", async () => {

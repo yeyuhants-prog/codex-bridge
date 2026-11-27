@@ -54,3 +54,7 @@ work as a complementary pair controlled from `[Codex Bridge](sidecar://codex-bri
        corrective instructions via `codex_start(resume_job_id="<job_id>", conversation_id="<conv_id>", prompt="...")`;
        if verified and pending milestones remain, immediately dispatch the next
        milestone until the goal is achieved or a human decision is needed.
+
+### Resume and callback ownership
+
+A new job records its destination at dispatch. Structured resumes inherit the parent's callback even when requested from another chat. Supply a full UUID for a bare session resume. Request `transfer_callback: true` only for an explicitly requested handoff. The Sidecar returns HTTP 409 across chats until the caller sends `keepOriginalCallback: true` or `transferCallback: true`. A transfer records `transferredFrom` on the new job.

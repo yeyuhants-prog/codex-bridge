@@ -1,12 +1,14 @@
+import { readJson, withFileLock } from "./file-store.js";
+import { processIdentity, matchesProcess } from "./process-identity.js";
+import { validateBooleans, problem } from "./validation.js";
+import { resolveResume, directoryList, workingDirectory } from "./run-policy.js";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import {
   runCodex,
   formatCodexResult,
-  killProcessTree,
   killPidTree,
-  resolveResumeSandbox,
 } from "./codex-runner.js";
 import {
   getJobsPath,
@@ -14,9 +16,9 @@ import {
   loadSettings,
   appendHistory,
 } from "./settings-store.js";
-import { recordGoalExecution } from "./goal-store.js";
+import { abandonGoalDispatch, reserveGoalDispatch, recordGoalExecution } from "./goal-store.js";
 import {
-  isPidAlive,
+  isPidAlive, normalizeSessionId,
   inspectSessionLock,
   acquireSessionLock,
   updateSessionLockPid,
@@ -39,127 +41,107 @@ export function normalizeCallbackTarget(target) {
   return { conversationId, projectId, source };
 }
 
+export const activeStates = new Set(["running", "stopping", "running_detached"]);
+export const callbackTerminal = new Set(["completed", "failed", "timed_out", "interrupted", "cancelled"]);
+
 export function readPersistedJobs() {
-  const filePath = getJobsPath();
-  try {
-    if (!fs.existsSync(filePath)) return [];
-    const arr = JSON.parse(fs.readFileSync(filePath, "utf8"));
-    return Array.isArray(arr) ? arr : [];
-  } catch {
-    return [];
-  }
+  return readJson(getJobsPath(), [], rows => Array.isArray(rows) && rows.every(row => typeof row?.id === "string"));
 }
 
-export function writePersistedJobs(list) {
-  try {
-    writeJsonAtomic(getJobsPath(), list.slice(0, MAX_STORED_JOBS));
-  } catch {
-    // Non-fatal
-  }
+function writePersistedJobs(list) {
+  let archived = 0;
+  const retained = list.filter(j => activeStates.has(j.status) ||
+    (j.notifyOnComplete && !j.callbackSent && (!j.callbackStatus || ["pending", "sending", "failed", "unrouted"].includes(j.callbackStatus))) ||
+    ++archived <= MAX_STORED_JOBS);
+  writeJsonAtomic(getJobsPath(), retained);
 }
 
-/**
- * Reconcile detached / foreign-owner jobs on disk against live OS PIDs.
- * - If a job from another/restarted Node process still has a live Codex PID:
- *   mark `running_detached` and keep its session lock intact.
- * - If its Codex PID is dead: mark `interrupted` and release any stale lock.
- */
-export function reconcilePersistedJobs(localRunningIds = new Set()) {
-  const list = readPersistedJobs();
-  let changed = false;
+function mutateJob(id, change) {
+  return withFileLock(getJobsPath(), () => {
+    const list = readPersistedJobs();
+    const job = list.find(j => j.id === id);
+    if (!job) throw problem(404, "Job not found: " + id);
+    change(job);
+    writePersistedJobs(list);
+    return job;
+  });
+}
 
-  for (const rec of list) {
-    if (!rec || !rec.id) continue;
-    if (localRunningIds.has(rec.id)) continue;
-
-    // Normalize legacy jobs missing callbackStatus
-    if (!rec.callbackStatus) {
-      if (rec.callbackSent) {
-        rec.callbackStatus = "sent";
-      } else if (!rec.notifyOnComplete) {
-        rec.callbackStatus = "skipped";
-      } else if (!normalizeCallbackTarget(rec.callbackTarget)) {
-        rec.callbackStatus = "unrouted";
-      } else {
-        rec.callbackStatus = "pending";
-      }
-      changed = true;
+export function claimCallback(id, retry = false) {
+  return mutateJob(id, job => {
+    const expired = job.callbackStatus === "sending" && !(Date.parse(job.callbackLeaseUntil) > Date.now());
+    const eligible = retry ? ["failed","unrouted"].includes(job.callbackStatus) : job.callbackStatus === "pending" || expired;
+    if (!callbackTerminal.has(job.status) || job.notifyOnComplete === false || !eligible || job.callbackSent) {
+      throw problem(409, "Callback is not eligible for " + (retry ? "retry" : "delivery"));
     }
+    if (expired && job.callbackDeliveryStartedAt) {
+      // The host has no idempotency key. Require an explicit retry when receipt is uncertain.
+      Object.assign(job, { callbackStatus: "failed", callbackClaim: null, callbackLeaseUntil: null,
+        callbackError: "Delivery acknowledgement unknown. Check the destination before retrying." });
+      return;
+    }
+    job.callbackDeliveryStartedAt = null;
+    job.callbackStatus = "sending";
+    job.callbackClaim = crypto.randomUUID();
+    job.callbackLeaseUntil = new Date(Date.now() + 120000).toISOString();
+    job.callbackAttempts = (job.callbackAttempts || 0) + 1;
+  });
+}
 
-    if (rec.status === "running" || rec.status === "running_detached") {
-      // Check if owned by another still-alive Node owner process (e.g. Sidecar reading MCP's job)
-      const ownerAlive =
-        rec.ownerPid &&
-        rec.ownerPid !== process.pid &&
-        isPidAlive(rec.ownerPid);
-      const childAlive = rec.pid ? isPidAlive(rec.pid) : false;
+export function beginCallbackSend(id, token) {
+  return mutateJob(id, job => {
+    if (!token || job.callbackClaim !== token || Date.parse(job.callbackLeaseUntil) <= Date.now()) {
+      throw problem(409, "Callback lease expired.");
+    }
+    job.callbackDeliveryStartedAt = new Date().toISOString();
+  });
+}
 
-      if (ownerAlive && rec.status === "running") {
-        // Active in sibling Node process (e.g. MCP owns it while Sidecar reads it)
-        continue;
+export function finishCallback(id, token, patch) {
+  return mutateJob(id, job => {
+    if (!token || job.callbackClaim !== token) throw problem(409, "Callback lease no longer owned");
+    Object.assign(job, patch, { callbackClaim: null, callbackLeaseUntil: null });
+  });
+}
+
+export function reconcilePersistedJobs(localRunningIds = new Set()) {
+  return withFileLock(getJobsPath(), () => {
+    const list = readPersistedJobs();
+    let changed = false;
+    for (const rec of list) {
+      if (localRunningIds.has(rec.id)) continue;
+      if (!rec.callbackStatus) {
+        rec.callbackStatus = rec.callbackSent ? "sent" : !rec.notifyOnComplete ? "skipped" :
+          normalizeCallbackTarget(rec.callbackTarget) ? "pending" : "unrouted";
+        changed = true;
       }
-
+      if (!activeStates.has(rec.status)) continue;
+      const ownerAlive = isPidAlive(rec.ownerPid);
+      let childAlive = isPidAlive(rec.pid);
+      if (childAlive && !ownerAlive && rec.processIdentity) {
+        const current = processIdentity(rec.pid);
+        if (current && !matchesProcess(rec.processIdentity, current)) childAlive = false;
+      }
+      const justStarted = Date.now() - Date.parse(rec.startedAt) < 30000;
+      if (ownerAlive && rec.status !== "running_detached" && (childAlive || justStarted)) continue;
       if (childAlive) {
-        if (rec.status !== "running_detached") {
-          rec.status = "running_detached";
-          rec.detachedNote = `Original Codex process is still running (PID ${rec.pid}). Wait for it to finish or stop it explicitly before resuming.`;
-          changed = true;
-        }
-        // Keep session lock alive while the detached child process is still running
-        if (rec.sessionId) {
-          const insp = inspectSessionLock(rec.sessionId);
-          if (!insp.locked) {
-            acquireSessionLock(rec.sessionId, {
-              jobId: rec.id,
-              pid: rec.pid,
-              ownerPid: rec.ownerPid || process.pid,
-              cwd: rec.cwd,
-            });
-          }
+        if (rec.status === "running") { rec.status = "running_detached"; changed = true; }
+        if (rec.sessionId && !inspectSessionLock(rec.sessionId).locked) {
+          const lease = acquireSessionLock(rec.sessionId, { jobId: rec.id, pid: rec.pid,
+            ownerPid: rec.ownerPid, processIdentity: rec.processIdentity, cwd: rec.cwd });
+          if (lease.acquired) { rec.lockToken = lease.ownerToken; changed = true; }
         }
       } else {
-        rec.status = "interrupted";
-        rec.finishedAt = rec.finishedAt || new Date().toISOString();
-        rec.error =
-          rec.error ||
-          "Codex process ended while detached or before completion. Resume via the linked job/session if needed.";
-        if (rec.sessionId) {
-          releaseSessionLock(rec.sessionId, rec.id);
-        }
+        rec.status = rec.status === "stopping" ? "cancelled" : "interrupted";
+        rec.finishedAt ||= new Date().toISOString();
+        rec.error ||= "Process ended before the owner recorded completion.";
+        if (rec.sessionId && rec.lockToken) releaseSessionLock(rec.sessionId, rec.lockToken);
         changed = true;
       }
     }
-  }
-
-  if (changed) {
-    writePersistedJobs(list);
-  }
-  return list;
-}
-
-export function updateJobCallbackState(jobId, patch = {}) {
-  const list = readPersistedJobs();
-  const target = list.find((j) => j.id === jobId);
-  if (!target) return null;
-
-  if (patch.callbackStatus !== undefined) {
-    target.callbackStatus = patch.callbackStatus;
-  }
-  if (patch.callbackSent !== undefined) {
-    target.callbackSent = Boolean(patch.callbackSent);
-  }
-  if (patch.callbackAt !== undefined) {
-    target.callbackAt = patch.callbackAt;
-  }
-  if (patch.callbackError !== undefined) {
-    target.callbackError = patch.callbackError;
-  }
-  if (patch.incrementAttempts) {
-    target.callbackAttempts = (target.callbackAttempts || 0) + 1;
-  }
-
-  writePersistedJobs(list);
-  return target;
+    if (changed) writePersistedJobs(list);
+    return list;
+  });
 }
 
 export class JobManager {
@@ -170,7 +152,7 @@ export class JobManager {
   }
 
   _syncFromDisk() {
-    const list = reconcilePersistedJobs(this._localRunningIds);
+    const list = readPersistedJobs();
     const seen = new Set();
     for (const rec of list) {
       if (!rec || !rec.id) continue;
@@ -206,6 +188,11 @@ export class JobManager {
     return {
       id: job.id,
       parentJobId: job.parentJobId || null,
+      addDirs: job.addDirs || [], skipGitRepoCheck: job.skipGitRepoCheck ?? true,
+      processIdentity: job.processIdentity || null, lockToken: job.lockToken || null,
+      conversationId: job.callbackTarget?.conversationId || null, transferredFrom: job.transferredFrom || null,
+      durationMs: job.result?.durationMs ?? job.resultSummary?.durationMs ?? null,
+      usage: job.result?.usage ?? job.resultSummary?.usage ?? null,
       mode: job.mode,
       status: job.status,
       cwd: job.cwd,
@@ -214,6 +201,7 @@ export class JobManager {
       sandbox: job.sandbox || "workspace-write",
       goalId: job.goalId || null,
       milestoneId: job.milestoneId || null,
+      prompt: job.prompt,
       promptPreview: job.promptPreview,
       startedAt: job.startedAt,
       finishedAt: job.finishedAt,
@@ -248,36 +236,27 @@ export class JobManager {
   }
 
   _persistJob(job) {
-    const list = readPersistedJobs();
-    const idx = list.findIndex((j) => j.id === job.id);
-    const serialized = this._serializeJob(job);
-    if (idx !== -1) {
-      // Preserve callback status updates written concurrently by Sidecar
-      const onDisk = list[idx];
-      if (
-        onDisk.callbackStatus &&
-        onDisk.callbackStatus !== "pending" &&
-        serialized.callbackStatus === "pending"
-      ) {
-        serialized.callbackStatus = onDisk.callbackStatus;
-        serialized.callbackSent = Boolean(onDisk.callbackSent);
-        serialized.callbackAt = onDisk.callbackAt || null;
-        serialized.callbackError = onDisk.callbackError || null;
-        serialized.callbackAttempts = onDisk.callbackAttempts || 0;
-        job.callbackStatus = serialized.callbackStatus;
-        job.callbackSent = serialized.callbackSent;
-        job.callbackAt = serialized.callbackAt;
-        job.callbackError = serialized.callbackError;
-        job.callbackAttempts = serialized.callbackAttempts;
-      }
-      list[idx] = serialized;
-    } else {
-      list.unshift(serialized);
-    }
-    list.sort((a, b) =>
-      String(b.startedAt || "").localeCompare(String(a.startedAt || ""))
-    );
-    writePersistedJobs(list);
+    return withFileLock(getJobsPath(), () => {
+      const list = readPersistedJobs();
+      const idx = list.findIndex(j => j.id === job.id);
+      const serialized = this._serializeJob(job);
+      if (idx >= 0) {
+        const onDisk = list[idx];
+        if (["stopping", "cancelled"].includes(onDisk.status)) {
+          job.status = serialized.status = onDisk.status === "stopping" && activeStates.has(job.status) ? "stopping" : "cancelled";
+          serialized.notifyOnComplete = false;
+          serialized.callbackStatus = "skipped";
+        } else if (serialized.callbackStatus !== "skipped") {
+          for (const field of ["callbackStatus", "callbackSent", "callbackAt", "callbackError",
+            "callbackAttempts", "callbackClaim", "callbackLeaseUntil", "callbackDeliveryStartedAt"]) {
+            if (onDisk[field] !== undefined) serialized[field] = onDisk[field];
+          }
+        }
+        list[idx] = serialized;
+      } else list.unshift(serialized);
+      list.sort((a,b) => String(b.startedAt).localeCompare(String(a.startedAt)));
+      writePersistedJobs(list);
+    });
   }
 
   findActiveJobForSession(sessionId) {
@@ -285,8 +264,7 @@ export class JobManager {
     this._syncFromDisk();
     for (const job of this.jobs.values()) {
       if (
-        job.sessionId === sessionId &&
-        (job.status === "running" || job.status === "running_detached")
+        job.sessionId?.toLowerCase() === sessionId && activeStates.has(job.status)
       ) {
         return job;
       }
@@ -306,10 +284,15 @@ export class JobManager {
 
   startJob(options) {
     this._syncFromDisk();
+    validateBooleans(options);
+    if (typeof options.prompt !== "string" || !options.prompt.trim()) throw problem(400, "A prompt is required.");
+    options.cwd = workingDirectory(options.cwd);
+    options.addDirs = directoryList(options.addDirs || [], options.cwd);
+    reconcilePersistedJobs(this._localRunningIds);
     const settings = loadSettings();
     const mode = options.mode || (options.sessionId ? "resume" : "run");
     const exactSid =
-      typeof options.sessionId === "string" ? options.sessionId.trim() : "";
+      options.sessionId ? normalizeSessionId(options.sessionId) : "";
 
     if (mode === "resume" && (!exactSid || exactSid === "last")) {
       throw new Error(
@@ -321,12 +304,16 @@ export class JobManager {
     if (exactSid) {
       const existing = this.findActiveJobForSession(exactSid);
       if (existing) {
+        if (options.transferCallback && existing.callbackTarget?.conversationId !== options.callbackTarget?.conversationId) {
+          throw problem(409, "An active job already owns this session and its callback destination.");
+        }
         return { job: existing, reused: true };
       }
     }
 
     const jobId = `codex_${crypto.randomBytes(4).toString("hex")}`;
     let lockedSessionId = null;
+    let lockToken = null;
 
     if (exactSid) {
       const acq = acquireSessionLock(exactSid, {
@@ -343,9 +330,11 @@ export class JobManager {
             pid: acq.existing?.pid || null,
             cwd: acq.existing?.cwd || options.cwd || "",
           };
+        if (options.transferCallback) throw problem(409, "Session is already active; destination cannot be transferred.");
         return { job: existing, reused: true };
       }
       lockedSessionId = exactSid;
+      lockToken = acq.ownerToken;
     }
 
     const abortController = new AbortController();
@@ -364,6 +353,8 @@ export class JobManager {
     const job = {
       id: jobId,
       parentJobId: options.parentJobId || null,
+      lockToken, transferredFrom: options.transferredFrom || null, addDirs: options.addDirs,
+      skipGitRepoCheck: options.skipGitRepoCheck ?? settings.skipGitRepoCheck,
       mode,
       status: "running",
       cwd: options.cwd ? path.resolve(options.cwd) : process.cwd(),
@@ -372,6 +363,7 @@ export class JobManager {
       sandbox: options.sandbox || "workspace-write",
       goalId: options.goalId || null,
       milestoneId: options.milestoneId || null,
+      prompt: options.prompt,
       promptPreview: (options.prompt || "").replace(/\s+/g, " ").slice(0, 160),
       startedAt: new Date().toISOString(),
       finishedAt: null,
@@ -401,37 +393,51 @@ export class JobManager {
 
     this.jobs.set(jobId, job);
     this._localRunningIds.add(jobId);
-    this._persistJob(job);
-
-    if (job.goalId) {
-      recordGoalExecution(job.goalId, {
-        milestoneId: job.milestoneId,
-        sessionId: job.sessionId,
-        jobId: job.id,
-        incrementIteration: true,
-      });
+    let reservation;
+    try {
+      reservation = reserveGoalDispatch(job.goalId, job.milestoneId);
+      this._persistJob(job);
+    } catch (err) {
+      this._localRunningIds.delete(jobId);
+      this.jobs.delete(jobId);
+      try {
+        withFileLock(getJobsPath(), () => {
+          const list = readPersistedJobs();
+          if (list.some(j => j.id === jobId)) writePersistedJobs(list.filter(j => j.id !== jobId));
+        });
+      } finally {
+        try { abandonGoalDispatch(job.goalId, reservation); }
+        finally { if (lockedSessionId) releaseSessionLock(lockedSessionId, lockToken); }
+      }
+      throw err;
     }
 
     let lastPersistAt = 0;
 
-    const promise = runCodex({
+    const promise = Promise.resolve().then(() => runCodex({
       ...options,
       mode,
       cwd: job.cwd,
-      sandbox: job.sandbox,
+      sandbox: job.sandbox, skipGitRepoCheck: job.skipGitRepoCheck,
       sessionId: exactSid || undefined,
       timeoutMs: options.timeoutMs ?? 1_800_000,
       signal: abortController.signal,
       onSpawn: (child) => {
         job.child = child;
         job.pid = child.pid || null;
+        job.processIdentity = processIdentity(job.pid);
         if (lockedSessionId && job.pid) {
-          updateSessionLockPid(lockedSessionId, job.id, job.pid);
+          if (!updateSessionLockPid(lockedSessionId, lockToken, job.pid, job.processIdentity)) throw new Error("Lost session lock");
         }
         this._persistJob(job);
+        if (reservation) {
+          recordGoalExecution(job.goalId, { reservationId: reservation, milestoneId: job.milestoneId, sessionId: job.sessionId, jobId });
+          reservation = null;
+        }
       },
       onProgress: ({ eventCount, summary, sessionId }) => {
         job.eventCount = eventCount;
+        if (sessionId) sessionId = normalizeSessionId(sessionId);
         const gotNewSession = sessionId && sessionId !== job.sessionId;
         if (sessionId) job.sessionId = sessionId;
         if (gotNewSession && !lockedSessionId) {
@@ -439,11 +445,11 @@ export class JobManager {
             jobId: job.id,
             pid: job.pid,
             ownerPid: process.pid,
-            cwd: job.cwd,
+            cwd: job.cwd, processIdentity: job.processIdentity,
           });
-          if (acq.acquired) {
-            lockedSessionId = sessionId;
-          }
+          if (!acq.acquired) throw new Error("Session already locked");
+          lockedSessionId = sessionId;
+          job.lockToken = lockToken = acq.ownerToken;
         }
         job.recentEvents.push({
           at: new Date().toISOString(),
@@ -466,11 +472,12 @@ export class JobManager {
           this._persistJob(job);
         }
       },
-    })
+    }))
       .then((result) => {
         job.result = result;
-        job.sessionId = result.sessionId || job.sessionId;
-        job.status = result.ok
+        job.sessionId = result.sessionId?.toLowerCase() || job.sessionId;
+        job.status = (job.status === "stopping" || abortController.signal.aborted ||
+          readPersistedJobs().some(j => j.id === job.id && ["stopping","cancelled"].includes(j.status))) ? "cancelled" : result.ok
           ? "completed"
           : result.cancelled
             ? "cancelled"
@@ -480,6 +487,7 @@ export class JobManager {
         job.finishedAt = new Date().toISOString();
         if (job.status === "cancelled") {
           job.callbackStatus = "skipped";
+          job.result = { ...result, ok: false, cancelled: true };
         }
         if (job.goalId && job.sessionId) {
           recordGoalExecution(job.goalId, {
@@ -490,7 +498,8 @@ export class JobManager {
           });
         }
         appendHistory({
-          mode: job.mode,
+          mode: job.mode, jobId: job.id, conversationId: callbackTarget?.conversationId || null,
+          transferredFrom: job.transferredFrom, addDirs: job.addDirs, skipGitRepoCheck: job.skipGitRepoCheck,
           status: job.status,
           model: job.model || "(codex default)",
           reasoningEffort: job.reasoningEffort || "(default)",
@@ -501,6 +510,7 @@ export class JobManager {
           sessionId: job.sessionId || null,
           durationMs: result.durationMs || 0,
           usage: result.usage || null,
+          prompt: job.prompt,
           promptPreview: job.promptPreview,
         });
       })
@@ -515,14 +525,18 @@ export class JobManager {
       .finally(() => {
         job.child = null;
         this._localRunningIds.delete(jobId);
-        if (lockedSessionId) {
-          releaseSessionLock(lockedSessionId, job.id, { force: true });
+        try {
+          this._persistJob(job);
+        } finally {
+          try { abandonGoalDispatch(job.goalId, reservation); }
+          finally {
+            try { if (lockedSessionId) releaseSessionLock(lockedSessionId, lockToken); }
+            finally { for (const wake of job.waiters.splice(0)) wake(); }
+          }
         }
-        this._persistJob(job);
-        const waiters = job.waiters.splice(0, job.waiters.length);
-        for (const fn of waiters) fn();
       });
 
+    promise.catch(err => console.error("[codex-bridge] Job finalization failed:", err.message));
     job.promise = promise;
     return { job, reused: false };
   }
@@ -535,61 +549,7 @@ export class JobManager {
    * - Enforces cross-process per-session mutual exclusion (reuses active job if already running).
    */
   resumeFromJob(oldJobId, overrides = {}) {
-    this._syncFromDisk();
-    const oldJob = this.jobs.get(oldJobId);
-    if (!oldJob) {
-      throw new Error(`Previous job not found: ${oldJobId}`);
-    }
-    const sid = typeof oldJob.sessionId === "string" ? oldJob.sessionId.trim() : "";
-    if (!sid || sid === "last") {
-      throw new Error(
-        `Job ${oldJobId} has no verified session_id; manual handling is required.`
-      );
-    }
-    if (!oldJob.cwd || !fs.existsSync(oldJob.cwd)) {
-      throw new Error(
-        `Original working directory for job ${oldJobId} is missing or invalid: ${oldJob.cwd || "(empty)"}`
-      );
-    }
-
-    // If the old job itself or any job for the same session is still alive, return it without spawning.
-    const active = this.findActiveJobForSession(sid);
-    if (active) {
-      return { job: active, reused: true, reason: active.status };
-    }
-
-    const effectiveSandbox = resolveResumeSandbox({
-      requestedSandbox: overrides.sandbox,
-      originalSandbox: oldJob.sandbox,
-      allowEscalation: Boolean(overrides.allowSandboxEscalation),
-    });
-
-    const callbackTarget =
-      normalizeCallbackTarget(overrides.callbackTarget) ||
-      normalizeCallbackTarget(oldJob.callbackTarget);
-
-    const prompt =
-      (typeof overrides.prompt === "string" && overrides.prompt.trim()) ||
-      `Continue from the interrupted/previous state of job ${oldJob.id} in ${oldJob.cwd}. Inspect what has already been completed, avoid redoing finished work, finish the remaining steps, and verify the results.`;
-
-    return this.startJob({
-      mode: "resume",
-      parentJobId: oldJob.id,
-      sessionId: sid,
-      prompt,
-      cwd: oldJob.cwd,
-      sandbox: effectiveSandbox,
-      model: overrides.model || oldJob.model || undefined,
-      reasoningEffort:
-        overrides.reasoningEffort || oldJob.reasoningEffort || undefined,
-      goalId: overrides.goalId || oldJob.goalId || undefined,
-      milestoneId: overrides.milestoneId || oldJob.milestoneId || undefined,
-      callbackTarget,
-      notifyOnComplete: overrides.notifyOnComplete,
-      timeoutMs: overrides.timeoutMs,
-      config: overrides.config,
-      images: overrides.images,
-    });
+    return this.startJob(resolveResume({ ...overrides, parentJobId: oldJobId }, readPersistedJobs()));
   }
 
   async getStatus(jobId, waitSeconds = 0) {
@@ -622,77 +582,39 @@ export class JobManager {
     const job = this.jobs.get(jobId);
     if (!job) return { found: false };
 
-    if (job.status !== "running" && job.status !== "running_detached") {
-      return { found: true, alreadyFinished: true, status: job.status };
+    if (!activeStates.has(job.status)) return { found: true, alreadyFinished: true, status: job.status };
+    const local = this._localRunningIds.has(jobId);
+    if (!local && job.pid && isPidAlive(job.pid) && !matchesProcess(job.processIdentity, processIdentity(job.pid))) {
+      return { found: true, cancelled: false, error: "Cannot confirm process identity for this job." };
     }
-
+    if (!local && !job.pid) return { found: true, cancelled: false, error: "Job has not recorded a PID yet." };
+    mutateJob(jobId, rec => {
+      if (!activeStates.has(rec.status)) throw problem(409, "Job already finished.");
+      Object.assign(rec, { status: "stopping", notifyOnComplete: false, callbackStatus: "skipped" });
+    });
+    job.status = "stopping";
     job.notifyOnComplete = false;
     job.callbackStatus = "skipped";
-
-    if (this._localRunningIds.has(jobId) && job.abortController) {
+    if (local) {
       job.abortController.abort();
-      if (job.child) {
-        killProcessTree(job.child);
+      let timer;
+      try {
+        const stopped = await Promise.race([job.promise.then(() => true),
+          new Promise(resolve => { timer = setTimeout(() => resolve(false), 8000); })]);
+        if (!stopped) return { found: true, cancelled: false, error: "Process termination has not been confirmed." };
+      } finally { clearTimeout(timer); }
+    } else {
+      if (isPidAlive(job.pid) && !killPidTree(job.pid, job.processIdentity)) {
+        return { found: true, cancelled: false, error: "Unable to confirm process tree termination." };
       }
-      this._persistJob(job);
-      return { found: true, cancelled: true, pid: job.pid };
-    }
-
-    // Detached or foreign-owner process: explicitly kill by PID and wait briefly for exit
-    if (job.pid && isPidAlive(job.pid)) {
-      killPidTree(job.pid);
-      for (let i = 0; i < 15; i += 1) {
-        if (!isPidAlive(job.pid)) break;
-        await new Promise((r) => setTimeout(r, 150));
-      }
-    }
-
-    const stillAlive = job.pid ? isPidAlive(job.pid) : false;
-    if (stillAlive) {
-      return {
-        found: true,
-        cancelled: false,
-        error: `Failed to stop process PID ${job.pid}; still alive.`,
-      };
-    }
-
-    job.status = "cancelled";
-    job.finishedAt = new Date().toISOString();
-    job.error = "Stopped explicitly by user.";
-    if (job.sessionId) {
-      releaseSessionLock(job.sessionId, job.id, { force: true });
-    }
-    this._persistJob(job);
-    return { found: true, cancelled: true, pid: job.pid };
-  }
-
-  cancelJob(jobId) {
-    this._syncFromDisk();
-    const job = this.jobs.get(jobId);
-    if (!job) return { found: false };
-    if (job.status !== "running" && job.status !== "running_detached") {
-      return { found: true, alreadyFinished: true, status: job.status };
-    }
-    job.notifyOnComplete = false;
-    job.callbackStatus = "skipped";
-    if (job.abortController) {
-      job.abortController.abort();
-    }
-    if (job.child) {
-      killProcessTree(job.child);
-    } else if (job.pid && isPidAlive(job.pid)) {
-      killPidTree(job.pid);
-    }
-    if (!this._localRunningIds.has(jobId)) {
+      for (let i = 0; i < 30 && isPidAlive(job.pid); i++) await new Promise(resolve => setTimeout(resolve, 100));
+      if (isPidAlive(job.pid)) return { found: true, cancelled: false, error: "Process still running." };
       job.status = "cancelled";
       job.finishedAt = new Date().toISOString();
-      job.error = "Cancelled by caller.";
-      if (job.sessionId) {
-        releaseSessionLock(job.sessionId, job.id, { force: true });
-      }
+      this._persistJob(job);
+      if (job.sessionId) releaseSessionLock(job.sessionId, job.lockToken);
     }
-    this._persistJob(job);
-    return { found: true, cancelled: true };
+    return { found: true, cancelled: true, pid: job.pid };
   }
 
   listJobs() {
@@ -721,17 +643,8 @@ export class JobManager {
       }));
   }
 
-  cancelAll() {
-    for (const id of [...this._localRunningIds]) {
-      const job = this.jobs.get(id);
-      if (job && job.status === "running") {
-        job.abortController?.abort();
-        if (job.child) {
-          killProcessTree(job.child);
-        }
-        this._persistJob(job);
-      }
-    }
+  async cancelAll() {
+    await Promise.allSettled([...this._localRunningIds].map(id => this.stopJob(id)));
   }
 
   formatJobStatus(job) {

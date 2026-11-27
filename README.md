@@ -79,7 +79,7 @@ git clone https://github.com/yeyuhants-prog/codex-bridge.git "$env:USERPROFILE\.
 
 1. Open **Skills & Customizations** (自定义扩展) in Antigravity's left sidebar and ensure **Codex Bridge** is toggled **ON**.
 2. Open the interactive control panel from the right-hand **Plugins** (`插件`) menu → **Codex Bridge**.
-3. Pick your **Codex model**, **reasoning effort**, **progression mode** (`manual` / `notify` / `autonomous`), and **sandbox** — opening the panel in a conversation automatically binds it for completion callbacks.
+3. Pick your **Codex model**, **reasoning effort**, **progression mode** (`manual` / `notify` / `autonomous`), and **sandbox** — each new job binds its callback when dispatched. Conflicting request and host conversation IDs are rejected.
 
 ## MCP Tools (9)
 
@@ -87,7 +87,7 @@ git clone https://github.com/yeyuhants-prog/codex-bridge.git "$env:USERPROFILE\.
 | --- | --- |
 | `codex_goal` | Create, inspect, update milestones, pause/resume, or delete persistent multi-step Goals shared with the Sidecar goal board. |
 | `codex_run` | Run a task synchronously via `codex exec` using active panel settings (or per-call overrides). Supports optional `goal_id` & `milestone_id`. |
-| `codex_resume` | Continue a previous Codex session by `session_id` (or `"last"`) with follow-up instructions. |
+| `codex_resume` | Continue by `resume_job_id` or an exact session UUID. Unknown sessions default to read-only. |
 | `codex_review` | Run Codex's built-in non-interactive Git code review (`uncommitted`, `base` branch, or `commit` SHA). |
 | `codex_start` | Launch a persistent background Codex worker and return `job_id` immediately; triggers auto-callback upon completion in `notify`/`autonomous` modes. |
 | `codex_status` | Inspect progress events, `Session ID`, or final output of a background job (including restart-interrupted jobs), with optional `wait_seconds` long-polling. |
@@ -123,6 +123,8 @@ npm test
 # End-to-end live check against your local Codex CLI (read-only, ephemeral)
 npm run test:live
 ```
+
+Structured resumes retain the parent directory, session, goal, callback destination and execution policy. A milestone override must belong to that goal. A cross-conversation panel resume returns HTTP 409 until the caller selects `keepOriginalCallback: true` or `transferCallback: true`. MCP callers can explicitly transfer with `transfer_callback: true`. The child records the previous destination in `transferredFrom`. Expanding writable directories or sandbox permissions requires boolean `allow_sandbox_escalation: true`.
 
 ## Project Structure
 

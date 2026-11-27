@@ -30,8 +30,10 @@
     - `持续自动推进 (autonomous)` — 后台任务完工后自动触发反重力验收、更新里程碑、未通过则 `codex_resume` 返工，通过则自动推进下一里程碑（带最大自动轮次上限与一键「暂停自动推进」保护）。
   - **执行权限（Sandbox）**与**派活方式**（`直接派活` / `先出任务单确认`）
 - **持久化目标与里程碑状态机（`goals.json`）**：总目标、子里程碑、验证命令、卡点与关联 `Session ID` 全部落盘保存，长对话压缩或重启不丢进度。
-- **按任务锁定回调目标与失败重试**：派活时从 Antigravity 可信宿主上下文锁定每个任务的 `conversationId` / `projectId`（`/api/state` 严格只读，彻底杜绝切换对话时串回调）；投递失败不会误标「已回调」，支持在面板一键定向重试回原对话。
+- **按任务锁定回调目标与失败重试**：派活时从 Antigravity 可信宿主上下文锁定每个任务的 `conversationId` / `projectId`；显式对话与宿主上下文冲突时拒绝派发；投递失败不会误标「已回调」，支持在面板一键定向重试回原对话。
 - **跨进程会话互斥锁与结构化续跑**：后台任务落盘至 `jobs.json` 并按 `Session ID` 加原子文件锁（`locks/`）；服务重启时若原 `codex.exe` 进程仍存活则标为 `running_detached`（等待结束或显式停止前禁止重复续跑）。通过 `resume_job_id` 或面板「结构化续跑」会继承原 `session_id`、`cwd`、`sandbox`、`goal_id` 与 `milestone_id`，并将 `-C` / `-s` 置于 `resume` 之前，默认沿用原权限且拦截未确认的提权。
+
+结构化续跑沿用父任务的目录、目标、执行权限和回调目标。同一目标内可以选择已有里程碑。跨对话面板请求先返回 HTTP 409，由调用方选择 `keepOriginalCallback: true` 保留来源或 `transferCallback: true` 转交。MCP 转交使用 `transfer_callback: true`，子任务的 `transferredFrom` 记录前一对话。扩大沙箱或新增可写目录需要布尔值 `allow_sandbox_escalation: true`。
 - **自动发现本机 Codex**：Windows 下自动定位 Codex Desktop 最新版 `codex.exe`（自动更新换哈希目录无缝兼容），同时支持 `PATH` 和 `CODEX_BIN`。
 - **零外部依赖**：纯 Node.js ESM（`>= 18`），免 `npm install`，通过 UTF-8 `stdin` 传提示词。
 
@@ -66,7 +68,7 @@ git clone https://github.com/yeyuhants-prog/codex-bridge.git ~/.gemini/config/pl
 | --- | --- |
 | `codex_goal` | 创建、查询、更新里程碑、暂停/恢复或删除持久化目标（与侧边栏目标板实时同步） |
 | `codex_run` | 同步执行 Codex 任务（自动应用面板选中的模型、思考深度与沙箱权限，可关联 `goal_id` / `milestone_id`） |
-| `codex_resume` | 按 `session_id`（或 `"last"`）延续上次 Codex 会话上下文 |
+| `codex_resume` | 按父任务 `resume_job_id` 或完整会话 UUID 续跑。未知会话默认只读 |
 | `codex_review` | 调用 `codex exec review` 对 Git 仓库做代码审查 |
 | `codex_start` | 后台异步启动持久化 Codex 任务并立即返回 `job_id`（完工自动触发回调） |
 | `codex_status` | 查看后台任务实时进度、断点中断状态或最终结果（支持 `wait_seconds` 长轮询） |

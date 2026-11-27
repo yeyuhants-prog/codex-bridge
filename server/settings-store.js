@@ -1,6 +1,9 @@
+import { problem } from "./validation.js";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
+import { readJson, writeJsonAtomic, withFileLock } from "./file-store.js";
+export { writeJsonAtomic };
 
 const DEFAULT_DATA_DIR = path.join(
   os.homedir(),
@@ -28,14 +31,6 @@ export function getJobsPath() {
 
 export function getGoalsPath() {
   return path.join(getDataDir(), "goals.json");
-}
-
-export function writeJsonAtomic(filePath, data) {
-  const dir = path.dirname(filePath);
-  fs.mkdirSync(dir, { recursive: true });
-  const tmpPath = `${filePath}.${process.pid}.${Date.now()}.tmp`;
-  fs.writeFileSync(tmpPath, JSON.stringify(data, null, 2) + "\n", "utf8");
-  fs.renameSync(tmpPath, filePath);
 }
 
 export const DEFAULT_SETTINGS = {
@@ -81,10 +76,8 @@ const VALID_EFFORTS = new Set([
 export function loadSettings() {
   const filePath = getSettingsPath();
   try {
-    if (!fs.existsSync(filePath)) {
-      return { ...DEFAULT_SETTINGS, updatedAt: null };
-    }
-    const raw = JSON.parse(fs.readFileSync(filePath, "utf8"));
+    const raw = readJson(filePath, null, v => v && typeof v === "object" && !Array.isArray(v));
+    if (!raw) return { ...DEFAULT_SETTINGS, updatedAt: null };
     const maxIter = Number(raw.maxAutoIterations);
     return {
       language: VALID_LANGUAGES.has(raw.language)
@@ -99,7 +92,7 @@ export function loadSettings() {
         : "",
       sandbox: VALID_SANDBOXES.has(raw.sandbox)
         ? raw.sandbox
-        : DEFAULT_SETTINGS.sandbox,
+        : "read-only",
       workflowMode: VALID_WORKFLOW_MODES.has(raw.workflowMode)
         ? raw.workflowMode
         : DEFAULT_SETTINGS.workflowMode,
@@ -125,113 +118,61 @@ export function loadSettings() {
           : Boolean(raw.skipGitRepoCheck),
       updatedAt: typeof raw.updatedAt === "string" ? raw.updatedAt : null,
     };
-  } catch {
-    return { ...DEFAULT_SETTINGS, updatedAt: null };
+  } catch (err) {
+    if (err.code !== "CORRUPT_STORE") throw err;
+    return { ...DEFAULT_SETTINGS, sandbox: "read-only", updatedAt: null };
   }
 }
 
 export function saveSettings(patch = {}) {
-  const current = loadSettings();
-  const maxIterPatch =
-    patch.maxAutoIterations !== undefined
-      ? Number(patch.maxAutoIterations)
-      : undefined;
-
-  const next = {
-    language:
-      patch.language !== undefined && VALID_LANGUAGES.has(patch.language)
-        ? patch.language
-        : current.language,
-    roleMode:
-      patch.roleMode !== undefined && VALID_ROLE_MODES.has(patch.roleMode)
-        ? patch.roleMode
-        : current.roleMode,
-    model:
-      patch.model !== undefined
-        ? String(patch.model ?? "").trim()
-        : current.model,
-    reasoningEffort:
-      patch.reasoningEffort !== undefined
-        ? VALID_EFFORTS.has(String(patch.reasoningEffort ?? "").trim())
-          ? String(patch.reasoningEffort ?? "").trim()
-          : current.reasoningEffort
-        : current.reasoningEffort,
-    sandbox:
-      patch.sandbox !== undefined && VALID_SANDBOXES.has(patch.sandbox)
-        ? patch.sandbox
-        : current.sandbox,
-    workflowMode:
-      patch.workflowMode !== undefined &&
-      VALID_WORKFLOW_MODES.has(patch.workflowMode)
-        ? patch.workflowMode
-        : current.workflowMode,
-    progressionMode:
-      patch.progressionMode !== undefined &&
-      VALID_PROGRESSION_MODES.has(patch.progressionMode)
-        ? patch.progressionMode
-        : current.progressionMode,
-    maxAutoIterations:
-      maxIterPatch !== undefined &&
-      Number.isInteger(maxIterPatch) &&
-      maxIterPatch >= 1 &&
-      maxIterPatch <= 100
-        ? maxIterPatch
-        : current.maxAutoIterations,
-    boundConversationId:
-      patch.boundConversationId !== undefined
-        ? String(patch.boundConversationId ?? "").trim()
-        : current.boundConversationId,
-    boundProjectId:
-      patch.boundProjectId !== undefined
-        ? String(patch.boundProjectId ?? "").trim()
-        : current.boundProjectId,
-    ephemeral:
-      patch.ephemeral !== undefined
-        ? Boolean(patch.ephemeral)
-        : current.ephemeral,
-    skipGitRepoCheck:
-      patch.skipGitRepoCheck !== undefined
-        ? Boolean(patch.skipGitRepoCheck)
-        : current.skipGitRepoCheck,
-    updatedAt: new Date().toISOString(),
-  };
-
-  writeJsonAtomic(getSettingsPath(), next);
-  return next;
+  return withFileLock(getSettingsPath(), () => {
+    for (const key of ["ephemeral", "skipGitRepoCheck"]) {
+      if (patch[key] !== undefined && typeof patch[key] !== "boolean") throw problem(400, key + " must be boolean.");
+    }
+    for (const [key, allowed] of Object.entries({ language: VALID_LANGUAGES, roleMode: VALID_ROLE_MODES,
+      reasoningEffort: VALID_EFFORTS, sandbox: VALID_SANDBOXES, workflowMode: VALID_WORKFLOW_MODES,
+      progressionMode: VALID_PROGRESSION_MODES })) {
+      if (patch[key] !== undefined && !allowed.has(patch[key])) throw problem(400, "Invalid setting: " + key);
+    }
+    if (patch.maxAutoIterations !== undefined && (!Number.isInteger(patch.maxAutoIterations) ||
+      patch.maxAutoIterations < 1 || patch.maxAutoIterations > 100)) throw problem(400, "Invalid maxAutoIterations.");
+    const next = loadSettings();
+    for (const key of Object.keys(DEFAULT_SETTINGS)) {
+      if (patch[key] === undefined) continue;
+      if (["model", "boundConversationId", "boundProjectId"].includes(key)) {
+        next[key] = String(patch[key] ?? "").trim();
+      } else {
+        next[key] = patch[key];
+      }
+    }
+    next.updatedAt = new Date().toISOString();
+    writeJsonAtomic(getSettingsPath(), next);
+    return next;
+  });
 }
 
 export function resetSettings() {
-  const current = loadSettings();
-  return saveSettings({
-    ...DEFAULT_SETTINGS,
-    // Keep bound conversation so resetting preferences does not break callback routing
-    boundConversationId: current.boundConversationId,
-    boundProjectId: current.boundProjectId,
+  return withFileLock(getSettingsPath(), () => {
+    const current = loadSettings();
+    return saveSettings({
+      ...DEFAULT_SETTINGS,
+      // Keep bound conversation so resetting preferences does not break callback routing
+      boundConversationId: current.boundConversationId,
+      boundProjectId: current.boundProjectId,
+    });
   });
 }
 
 export function loadHistory() {
-  const filePath = getHistoryPath();
-  try {
-    if (!fs.existsSync(filePath)) return [];
-    const arr = JSON.parse(fs.readFileSync(filePath, "utf8"));
-    return Array.isArray(arr) ? arr : [];
-  } catch {
-    return [];
-  }
+  return readJson(getHistoryPath(), [], Array.isArray);
 }
 
 export function appendHistory(entry) {
-  try {
+  return withFileLock(getHistoryPath(), () => {
     const list = loadHistory();
-    list.unshift({
-      at: new Date().toISOString(),
-      ...entry,
-    });
+    list.unshift({ at: new Date().toISOString(), ...entry });
     writeJsonAtomic(getHistoryPath(), list.slice(0, 30));
-  } catch {
-    // Non-fatal
-  }
+  });
 }
 
 export function getCodexHomeDir() {

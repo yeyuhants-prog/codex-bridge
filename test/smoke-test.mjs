@@ -6,7 +6,6 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const SERVER_PATH =
-  process.env.BRIDGE_SERVER ||
   path.resolve(__dirname, "..", "server", "mcp-server.js");
 const LIVE = process.argv.includes("--live");
 
@@ -70,7 +69,10 @@ class McpTestClient {
 
 async function main() {
   const tempDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-bridge-test-"));
-  const client = new McpTestClient({ CODEX_BRIDGE_DATA_DIR: tempDataDir });
+  const codexHome = path.join(tempDataDir, "codex-home");
+  fs.mkdirSync(codexHome);
+  const client = new McpTestClient({ CODEX_BRIDGE_DATA_DIR: tempDataDir, CODEX_HOME: codexHome,
+    ANTIGRAVITY_CONVERSATION_ID: "", ANTIGRAVITY_PROJECT_ID: "", ANTIGRAVITY_SOURCE_METADATA: "" });
   try {
     const init = await client.request("initialize", {
       protocolVersion: "2025-03-26",
@@ -162,7 +164,7 @@ async function main() {
         action: "create",
         title: "Verify backend auth fix",
         objective: "Reproduce 500 error and pass pytest",
-        cwd: process.cwd(),
+        cwd: tempDataDir,
         acceptance_criteria: ["pytest passes"],
         milestones: [
           { title: "Reproduce bug", verification: "pytest -k auth" },
@@ -204,7 +206,7 @@ async function main() {
         name: "codex_run",
         arguments: {
           prompt: "Reply with only: BRIDGE_OK",
-          cwd: process.cwd(),
+          cwd: tempDataDir,
           sandbox: "read-only",
           ephemeral: true,
         },

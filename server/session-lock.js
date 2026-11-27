@@ -1,164 +1,85 @@
+import { problem } from "./validation.js";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { getDataDir, writeJsonAtomic } from "./settings-store.js";
+import { getDataDir } from "./settings-store.js";
+import { withFileLock, writeJsonAtomic } from "./file-store.js";
+import { isPidAlive, matchesProcess, processIdentity, ownerIdentity } from "./process-identity.js";
+export { isPidAlive };
 
-const SPAWN_GRACE_MS = 30_000;
-
-export function isPidAlive(pid) {
-  const n = Number(pid);
-  if (!Number.isInteger(n) || n <= 0) return false;
-  try {
-    process.kill(n, 0);
-    return true;
-  } catch (err) {
-    // EPERM means the process exists but belongs to another user/elevation level
-    if (err && err.code === "EPERM") return true;
-    return false;
+export function normalizeSessionId(value) {
+  if (typeof value !== "string" || !/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(value.trim())) {
+    throw problem(400, "An exact session_id UUID is required.");
   }
+  return value.trim().toLowerCase();
 }
 
-export function getLocksDir() {
-  return path.join(getDataDir(), "locks");
-}
+export function getLocksDir() { return path.join(getDataDir(), "locks"); }
 
 export function getSessionLockPath(sessionId) {
-  const hash = crypto
-    .createHash("sha256")
-    .update(String(sessionId).trim())
-    .digest("hex")
-    .slice(0, 24);
-  return path.join(getLocksDir(), `session_${hash}.lock`);
-}
-
-function readLockFile(lockPath) {
-  try {
-    if (!fs.existsSync(lockPath)) return null;
-    const raw = JSON.parse(fs.readFileSync(lockPath, "utf8"));
-    return raw && typeof raw === "object" ? raw : null;
-  } catch {
-    return null;
-  }
-}
-
-function isLockRecordAlive(lock) {
-  if (!lock) return false;
-  // Once the Codex child PID is recorded, that child PID is authoritative.
-  if (lock.pid) {
-    return isPidAlive(lock.pid);
-  }
-  // During the brief pre-spawn window before child PID is assigned, check ownerPid.
-  if (lock.ownerPid && isPidAlive(lock.ownerPid)) {
-    const ageMs = Date.now() - Date.parse(lock.acquiredAt || 0);
-    return Number.isNaN(ageMs) || ageMs < SPAWN_GRACE_MS;
-  }
-  return false;
+  const hash = crypto.createHash("sha256").update(normalizeSessionId(sessionId)).digest("hex").slice(0, 24);
+  return path.join(getLocksDir(), "session_" + hash + ".lock");
 }
 
 export function inspectSessionLock(sessionId) {
-  if (!sessionId || !String(sessionId).trim()) {
-    return { locked: false, stale: false, lock: null };
+  const file = getSessionLockPath(sessionId);
+  let lock;
+  try { lock = JSON.parse(fs.readFileSync(file, "utf8")); }
+  catch (err) {
+    if (err.code === "ENOENT") return { locked: false };
+    if (!(err instanceof SyntaxError)) throw err;
   }
-  const lockPath = getSessionLockPath(sessionId);
-  const lock = readLockFile(lockPath);
-  if (!lock) {
-    return { locked: false, stale: false, lock: null };
+  if (!lock || typeof lock !== "object" || (!lock.ownerPid && !lock.pid)) {
+    try { return { locked: Date.now() - fs.statSync(file).mtimeMs < 30000, lock: null }; }
+    catch (err) { if (err.code === "ENOENT") return { locked: false }; throw err; }
   }
-  if (isLockRecordAlive(lock)) {
-    return { locked: true, stale: false, lock, lockPath };
+  let locked = isPidAlive(lock.pid || lock.ownerPid);
+  if (locked && lock.pid && lock.processIdentity) {
+    const current = processIdentity(lock.pid);
+    if (current) locked = matchesProcess(lock.processIdentity, current);
   }
-  return { locked: false, stale: true, lock, lockPath };
-}
-
-/**
- * Atomically acquire an exclusive cross-process lock for a Codex sessionId.
- * Returns { acquired: true, lockPath } or { acquired: false, existing }.
- */
-export function acquireSessionLock(
-  sessionId,
-  { jobId, pid = null, ownerPid = process.pid, cwd = "" } = {}
-) {
-  if (!sessionId || !String(sessionId).trim()) {
-    return { acquired: true, lockPath: null };
-  }
-  const sid = String(sessionId).trim();
-  const dir = getLocksDir();
-  fs.mkdirSync(dir, { recursive: true });
-  const lockPath = getSessionLockPath(sid);
-
-  const payload = {
-    sessionId: sid,
-    jobId: jobId || null,
-    pid: pid || null,
-    ownerPid,
-    cwd: cwd || "",
-    acquiredAt: new Date().toISOString(),
-  };
-
-  for (let attempt = 0; attempt < 4; attempt += 1) {
-    try {
-      const fd = fs.openSync(lockPath, "wx");
-      try {
-        fs.writeFileSync(fd, JSON.stringify(payload, null, 2) + "\n", "utf8");
-      } finally {
-        fs.closeSync(fd);
-      }
-      return { acquired: true, lockPath };
-    } catch (err) {
-      if (err?.code !== "EEXIST") throw err;
-
-      const existing = readLockFile(lockPath);
-      if (existing && isLockRecordAlive(existing)) {
-        // Idempotent if the exact same job already owns this lock.
-        if (jobId && existing.jobId === jobId) {
-          return { acquired: true, lockPath, alreadyOwned: true };
-        }
-        return { acquired: false, existing, lockPath };
-      }
-
-      // Stale lock from a dead process — remove and retry atomically.
-      try {
-        fs.unlinkSync(lockPath);
-      } catch {
-        // Another process may have already removed or replaced it; retry loop handles it.
-      }
+  if (locked && !lock.pid) {
+    if (lock.ownerIdentity) {
+      const current = ownerIdentity(lock.ownerPid);
+      if (current) locked = matchesProcess(lock.ownerIdentity, current);
+    } else {
+      locked = Date.now() - Date.parse(lock.acquiredAt || 0) < 30000;
     }
   }
-
-  const existing = readLockFile(lockPath);
-  return { acquired: false, existing, lockPath };
+  return { locked, stale: !locked, lock, lockPath: file };
 }
 
-export function updateSessionLockPid(sessionId, jobId, pid) {
-  if (!sessionId || !pid) return false;
-  const lockPath = getSessionLockPath(sessionId);
-  const existing = readLockFile(lockPath);
-  if (!existing) return false;
-  if (jobId && existing.jobId && existing.jobId !== jobId) return false;
-  writeJsonAtomic(lockPath, {
-    ...existing,
-    pid,
-    updatedAt: new Date().toISOString(),
+export function acquireSessionLock(sessionId, fields = {}) {
+  const file = getSessionLockPath(sessionId);
+  return withFileLock(path.join(getLocksDir(), "owners"), () => {
+    const info = inspectSessionLock(sessionId);
+    if (info.locked) return { acquired: false, existing: info.lock };
+    const ownerToken = crypto.randomUUID();
+    writeJsonAtomic(file, { ...fields, sessionId: normalizeSessionId(sessionId),
+      ownerPid: fields.ownerPid || process.pid, ownerIdentity: fields.pid ? null : ownerIdentity(fields.ownerPid),
+      ownerToken, acquiredAt: new Date().toISOString() });
+    return { acquired: true, ownerToken, lockPath: file };
   });
-  return true;
 }
 
-export function releaseSessionLock(sessionId, jobId, { force = false } = {}) {
-  if (!sessionId) return false;
-  const lockPath = getSessionLockPath(sessionId);
-  const existing = readLockFile(lockPath);
-  if (!existing) return false;
-  if (!force && jobId && existing.jobId && existing.jobId !== jobId) {
-    return false;
-  }
-  if (!force && existing.pid && isPidAlive(existing.pid)) {
-    // Refuse to drop a lock while the underlying Codex process is still running.
-    return false;
-  }
-  try {
-    fs.unlinkSync(lockPath);
+function changeOwnedLock(sessionId, token, action) {
+  if (!sessionId || !token) return false;
+  const file = getSessionLockPath(sessionId);
+  return withFileLock(path.join(getLocksDir(), "owners"), () => {
+    let lock;
+    try { lock = JSON.parse(fs.readFileSync(file, "utf8")); }
+    catch (err) { if (err.code === "ENOENT") return false; throw err; }
+    if (lock?.ownerToken !== token) return false;
+    action(file, lock);
     return true;
-  } catch {
-    return false;
-  }
+  });
+}
+
+export function updateSessionLockPid(sid, token, pid, identity) {
+  return changeOwnedLock(sid, token, (file, lock) =>
+    writeJsonAtomic(file, { ...lock, pid, processIdentity: identity || null }));
+}
+
+export function releaseSessionLock(sid, token) {
+  return changeOwnedLock(sid, token, file => fs.unlinkSync(file));
 }
