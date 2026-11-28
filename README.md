@@ -6,7 +6,7 @@
 
 **Just describe what you want in plain language — let Antigravity (Gemini) turn it into precise specs, dispatch your local OpenAI Codex (GPT) worker, and supervise every step until verified.**
 
-[![Version](https://img.shields.io/badge/version-1.7.0-7c3aed?style=flat-square)](./plugin.json)
+[![Version](https://img.shields.io/badge/version-1.8.0-7c3aed?style=flat-square)](./plugin.json)
 [![Node](https://img.shields.io/badge/node-%3E%3D18.0.0-22c55e?style=flat-square)](https://nodejs.org/)
 [![Dependencies](https://img.shields.io/badge/dependencies-zero-0ea5e9?style=flat-square)](#architecture)
 [![MCP](https://img.shields.io/badge/protocol-MCP%20Stdio-f59e0b?style=flat-square)](https://modelcontextprotocol.io/)
@@ -71,8 +71,10 @@ Native dark UI embedded directly inside Antigravity's **Plugins** side pane, wit
   Antigravity focuses on understanding your intent, writing tight specifications, orchestrating plugins, and verifying results — while delegating heavy coding, backend debugging, and data/analysis pipelines to Codex.
 - **Flexible Model Routing & Per-Task Control**
   Reads your local `~/.codex/models_cache.json` automatically. Use **Flexible per task** to say *"run this with `gpt-6.2-sol`"* on the fly, or switch to **Pinned model** to lock a single worker model.
-- **Three-Tier Monitoring & Stall Auto-Heal (`v1.7.0`)**
-  - **L1 Phase-Aware Watchdog**: Protects running local commands (`running_cmd`) from false kills, while automatically recovering stalled `waiting_api` / `reconnecting` streams via idempotent breakpoint resume.
+- **App Server and goal navigation in v1.8.0**
+  Choose Exec CLI or App Server for background work. App Server cards show the current turn, steering count and token budget. Native Goal continuation is experimental. Archived goals can reveal linked tasks across chats and pages, or open the owning chat. The tab badge distinguishes local jobs, open goals and activity elsewhere.
+- **Three-tier monitoring and recovery**
+  - **L1 Phase-Aware Watchdog**: The default `reconnect_only` warns during prolonged silence and recovers stuck reconnects. Choose `always` to stop on silence as well, or `off` to disable the watchdog.
   - **L2 Periodic Sub-Model Inspection**: Sends configurable periodic check-ins (`Off / 3 / 5 / 10 min`) to the original conversation so Antigravity can delegate fast, read-only health checks to a lightweight `flash_lite` subagent without cluttering the main context.
   - **Transport & Clean Exit Controls**: Switch between `Follow default`, `Prefer WebSocket`, and `HTTP SSE only`, disable desktop notify hooks on headless runs, and cleanly exit lingering post-completion streams after 5 seconds.
 - **Native Bilingual Side-Pane Control Panel (EN / 中文)**
@@ -144,7 +146,7 @@ flowchart LR
   Server <-->|JSONL Stream + UTF-8 stdin| Codex["Local OpenAI Codex CLI<br/>(codex exec / resume / review)"]
 ```
 
-## MCP Tools (9)
+## MCP Tools (10)
 
 | Tool | Description |
 | --- | --- |
@@ -154,8 +156,9 @@ flowchart LR
 | `codex_review` | Run Codex's built-in non-interactive Git code review (`uncommitted`, `base` branch, or `commit` SHA). |
 | `codex_start` | Launch a persistent background Codex worker and return `job_id` immediately; supports L1 auto-heal watchdog, periodic check-ins, and completion auto-callbacks. |
 | `codex_status` | Inspect live phase (`waiting_api` / `running_cmd` / `reconnecting`), progress events, auto-heal & periodic check counts, `Session ID`, or final output of a background job. |
+| `codex_steer` | Send a correction to a running App Server job. Pin `expected_turn_id` and check the accepted, rejected, queued or unknown receipt. |
 | `codex_cancel` | Terminate a running background Codex job along with its child process tree. |
-| `codex_config` | Read or update shared panel settings (`model`, `model_routing`, `reasoning_effort`, `sandbox`, `workflow_mode`, `progression_mode`, `task_timeout_seconds`, `transport`, `auto_heal_enabled`, `stall_threshold_seconds`, `max_auto_heals`, `monitor_interval_seconds`, `max_auto_iterations`) and list local Codex models. |
+| `codex_config` | Read or update shared panel settings (`model`, `model_routing`, `reasoning_effort`, `sandbox`, `workflow_mode`, `progression_mode`, `task_timeout_seconds`, `transport`, `execution_engine`, `native_goal_sync`, `token_budget`, `auto_heal_enabled`, `stall_policy`, `reconnect_stall_seconds`, `stall_threshold_seconds`, `max_auto_heals`, `monitor_interval_seconds`, `max_auto_iterations`) and list local Codex models. |
 | `codex_info` | Health check showing resolved Codex binary & version, active panel settings, watchdog/monitor configuration, active goal progress, and tracked jobs. |
 
 <details>
@@ -178,15 +181,12 @@ flowchart LR
 ## Testing
 
 ```bash
-# Zero-token MCP protocol, settings & persistent goal board smoke test
+# Smoke checks and regressions through v1.8, including Chromium panel interactions
 npm test
-
-# Full automated unit, acceptance, and regression suites (v1.4 ~ v1.7)
-node --test test/panel-ui.test.mjs
 node test/acceptance-v14.mjs
-node test/regression-v15.mjs
-node test/regression-v16.mjs
-node --test test/regression-v17.mjs
+
+# Repeat the 360px and 480px browser checks. Set CHROMIUM_PATH for a nonstandard installation.
+node test/panel-browser.mjs
 
 # End-to-end live check against your local Codex CLI (read-only, ephemeral)
 npm run test:live

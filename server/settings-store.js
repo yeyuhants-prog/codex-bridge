@@ -1,4 +1,4 @@
-import { problem } from "./validation.js";
+import { problem, validEngine, validTokenBudget, validateEngineOptions } from "./validation.js";
 import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
@@ -40,10 +40,15 @@ export const DEFAULT_SETTINGS = {
   model: "", // "" means follow ~/.codex/config.toml default
   modelRouting: "flexible",
   transport: "default",
+  executionEngine: "exec",
+  nativeGoalSync: false,
+  tokenBudget: 0,
   disableDesktopNotify: true,
   taskTimeoutSeconds: 7200,
   autoHealEnabled: true,
-  stallThresholdSeconds: 240,
+  stallPolicy: "reconnect_only",
+  stallThresholdSeconds: 300,
+  reconnectStallSeconds: 150,
   maxAutoHeals: 2,
   monitorIntervalSeconds: 300,
   reasoningEffort: "", // "" means follow model/config default
@@ -60,7 +65,9 @@ export const DEFAULT_SETTINGS = {
 const VALID_ROUTING = new Set(["flexible", "pinned"]);
 const VALID_TRANSPORT = new Set(["default", "websocket", "http"]);
 const validTimeout = value => value === 0 || (Number.isInteger(value) && value >= 60 && value <= 14400);
-const validStallThreshold = value => value === 0 || (Number.isInteger(value) && value >= 60 && value <= 1800);
+const VALID_STALL_POLICIES = new Set(["reconnect_only", "always", "off"]);
+const validStallThreshold = value => value === 0 || (Number.isInteger(value) && value >= 60 && value <= 3600);
+const validReconnectStall = value => value === 0 || (Number.isInteger(value) && value >= 60 && value <= 1800);
 const validMonitorInterval = value => value === 0 || (Number.isInteger(value) && value >= 60 && value <= 1800);
 const validMaxAutoHeals = value => Number.isInteger(value) && value >= 0 && value <= 5;
 const VALID_LANGUAGES = new Set(["zh", "en"]);
@@ -103,9 +110,14 @@ export function loadSettings() {
         : DEFAULT_SETTINGS.roleMode,
       modelRouting: VALID_ROUTING.has(raw.modelRouting) ? raw.modelRouting : DEFAULT_SETTINGS.modelRouting,
       transport: VALID_TRANSPORT.has(raw.transport) ? raw.transport : DEFAULT_SETTINGS.transport,
+      executionEngine: validEngine(raw.executionEngine) ? raw.executionEngine : DEFAULT_SETTINGS.executionEngine,
+      nativeGoalSync: typeof raw.nativeGoalSync === "boolean" ? raw.nativeGoalSync : DEFAULT_SETTINGS.nativeGoalSync,
+      tokenBudget: validTokenBudget(raw.tokenBudget) ? raw.tokenBudget : DEFAULT_SETTINGS.tokenBudget,
       disableDesktopNotify: typeof raw.disableDesktopNotify === "boolean" ? raw.disableDesktopNotify : DEFAULT_SETTINGS.disableDesktopNotify,
       taskTimeoutSeconds: validTimeout(raw.taskTimeoutSeconds) ? raw.taskTimeoutSeconds : DEFAULT_SETTINGS.taskTimeoutSeconds,
       autoHealEnabled: typeof raw.autoHealEnabled === "boolean" ? raw.autoHealEnabled : DEFAULT_SETTINGS.autoHealEnabled,
+      stallPolicy: VALID_STALL_POLICIES.has(raw.stallPolicy) ? raw.stallPolicy : DEFAULT_SETTINGS.stallPolicy,
+      reconnectStallSeconds: validReconnectStall(raw.reconnectStallSeconds) ? raw.reconnectStallSeconds : DEFAULT_SETTINGS.reconnectStallSeconds,
       stallThresholdSeconds: validStallThreshold(raw.stallThresholdSeconds) ? raw.stallThresholdSeconds : DEFAULT_SETTINGS.stallThresholdSeconds,
       maxAutoHeals: validMaxAutoHeals(raw.maxAutoHeals) ? raw.maxAutoHeals : DEFAULT_SETTINGS.maxAutoHeals,
       monitorIntervalSeconds: validMonitorInterval(raw.monitorIntervalSeconds) ? raw.monitorIntervalSeconds : DEFAULT_SETTINGS.monitorIntervalSeconds,
@@ -148,17 +160,19 @@ export function loadSettings() {
 }
 
 export function saveSettings(patch = {}) {
+  validateEngineOptions(patch);
   return withFileLock(getSettingsPath(), () => {
     for (const key of ["ephemeral", "skipGitRepoCheck", "disableDesktopNotify", "autoHealEnabled"]) {
       if (patch[key] !== undefined && typeof patch[key] !== "boolean") throw problem(400, key + " must be boolean.");
     }
     for (const [key, allowed] of Object.entries({ modelRouting: VALID_ROUTING, transport: VALID_TRANSPORT, language: VALID_LANGUAGES, roleMode: VALID_ROLE_MODES,
       reasoningEffort: VALID_EFFORTS, sandbox: VALID_SANDBOXES, workflowMode: VALID_WORKFLOW_MODES,
-      progressionMode: VALID_PROGRESSION_MODES })) {
+      progressionMode: VALID_PROGRESSION_MODES, stallPolicy: VALID_STALL_POLICIES })) {
       if (patch[key] !== undefined && !allowed.has(patch[key])) throw problem(400, "Invalid setting: " + key);
     }
     if (patch.taskTimeoutSeconds !== undefined && !validTimeout(patch.taskTimeoutSeconds)) throw problem(400, "Invalid taskTimeoutSeconds.");
     if (patch.stallThresholdSeconds !== undefined && !validStallThreshold(patch.stallThresholdSeconds)) throw problem(400, "Invalid stallThresholdSeconds.");
+    if (patch.reconnectStallSeconds !== undefined && !validReconnectStall(patch.reconnectStallSeconds)) throw problem(400, "Invalid reconnectStallSeconds.");
     if (patch.maxAutoHeals !== undefined && !validMaxAutoHeals(patch.maxAutoHeals)) throw problem(400, "Invalid maxAutoHeals.");
     if (patch.monitorIntervalSeconds !== undefined && !validMonitorInterval(patch.monitorIntervalSeconds)) throw problem(400, "Invalid monitorIntervalSeconds.");
     if (patch.maxAutoIterations !== undefined && (!Number.isInteger(patch.maxAutoIterations) ||
@@ -214,6 +228,7 @@ export function readCodexTomlDefaults() {
   const tomlPath = path.join(getCodexHomeDir(), "config.toml");
   const defaults = {
     model: null,
+    modelProvider: null,
     reasoningEffort: null,
     sandboxMode: null,
     verbosity: null,
@@ -229,6 +244,7 @@ export function readCodexTomlDefaults() {
       if (!m) continue;
       const [, key, val] = m;
       if (key === "model") defaults.model = val;
+      else if (key === "model_provider") defaults.modelProvider = val;
       else if (key === "model_reasoning_effort") defaults.reasoningEffort = val;
       else if (key === "sandbox_mode") defaults.sandboxMode = val;
       else if (key === "model_verbosity") defaults.verbosity = val;

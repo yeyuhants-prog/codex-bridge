@@ -1,9 +1,13 @@
 import { I18N } from "./i18n.mjs";
-import { taskRows, taskView, conversationOf, isActive, shortId, responseData } from "./view-model.mjs";
+import { taskRows, taskView, conversationOf, sameConversation, isActive, shortId, responseData, resolveGoalLocation, activityCounts } from "./view-model.mjs";
 
 const FALLBACK_EFFORTS = ["low", "medium", "high", "xhigh", "max", "ultra"];
 
 let state = null;
+let rows = [];
+let highlightKeys = new Set();
+let highlightTimer;
+const steerDrafts = new Map();
 let toastTimer = null;
 let scope = "current";
 let historyFilter = "all";
@@ -31,6 +35,7 @@ const el = {
   btnLang: document.getElementById("btn-lang"),
   tabs: document.querySelectorAll(".tab"),
   tabBadge: document.getElementById("tab-badge"),
+  tabRunBadge: document.getElementById("tab-run-badge"),
   panelControl: document.getElementById("panel-control"),
   panelGoals: document.getElementById("panel-goals"),
   roleGroup: document.getElementById("role-group"),
@@ -171,13 +176,29 @@ function renderHeader() {
     el.codexMeta.textContent = dict.notFoundMeta;
   }
 
-  const active = (state.jobs || []).filter(isActive);
-  const current = getCurrentConvId();
-  el.tabBadge.textContent = String(active.length);
-  el.tabBadge.title = dict.activeCount + " · " + active.length;
-  el.tabBadge.setAttribute("aria-label", el.tabBadge.title);
-  el.tabBadge.classList.toggle("hidden", !active.length);
-  el.tabBadge.classList.toggle("local", Boolean(current && active.some(job => conversationOf(job) === current)));
+  // Goal badge: exactly the number of goals listed in the goal selector (non-archived).
+  // Run badge: running jobs, local first (blue), otherwise other chats (muted).
+  const { goalsCount, goalStatusCounts, localActiveCount, otherActiveCount } = currentCounts();
+  const breakdown = Object.entries(goalStatusCounts)
+    .map(([status, n]) => `${dict.taskStatuses[status] || status} ${n}`).join(" · ");
+  const goalLabel = dict.goalBadgeLabel(goalsCount, breakdown);
+  el.tabBadge.textContent = String(goalsCount);
+  el.tabBadge.title = goalLabel;
+  el.tabBadge.setAttribute("aria-label", goalLabel);
+  el.tabBadge.classList.toggle("hidden", !goalsCount);
+
+  const external = !localActiveCount && otherActiveCount > 0;
+  const runLabel = dict.runBadgeLabel(localActiveCount, otherActiveCount);
+  el.tabRunBadge.textContent = external ? dict.elsewhere(otherActiveCount) : dict.runningShort(localActiveCount);
+  el.tabRunBadge.title = runLabel;
+  el.tabRunBadge.setAttribute("aria-label", runLabel);
+  el.tabRunBadge.classList.toggle("hidden", !localActiveCount && !otherActiveCount);
+  el.tabRunBadge.classList.toggle("local", localActiveCount > 0);
+  el.tabRunBadge.classList.toggle("external", external);
+}
+
+function currentCounts() {
+  return activityCounts(state.goalsStore?.goals || [], state.jobs || [], getCurrentConvId());
 }
 
 function renderModels() {
@@ -253,10 +274,14 @@ const preferenceGroups = [
   ["model-routing-group", "modelRouting", "modelRouting"],
   ["timeout-group", "timeout", "taskTimeoutSeconds"],
   ["monitor-group", "monitor", "monitorIntervalSeconds"],
+  ["engine-group", "engine", "executionEngine"],
+  ["budget-group", "budget", "tokenBudget"],
+  ["policy-group", "policy", "stallPolicy"],
+  ["reconnect-group", "reconnect", "reconnectStallSeconds"],
   ["stall-group", "stall", "stallThresholdSeconds"],
   ["transport-group", "transport", "transport"],
 ];
-const numericPrefs = new Set(["taskTimeoutSeconds", "monitorIntervalSeconds", "stallThresholdSeconds"]);
+const numericPrefs = new Set(["taskTimeoutSeconds", "monitorIntervalSeconds", "stallThresholdSeconds", "reconnectStallSeconds", "tokenBudget"]);
 for (const [id, attribute, setting] of preferenceGroups) {
   for (const btn of document.getElementById(id).querySelectorAll("button")) {
     btn.addEventListener("click", () => {
@@ -270,15 +295,18 @@ function renderSegments() {
   const dict = t();
   const { settings } = state;
   for (const [id, attribute, setting] of preferenceGroups) {
-    for (const btn of document.getElementById(id).querySelectorAll("button")) {
+    const group = document.getElementById(id);
+    for (const btn of group.querySelectorAll("button")) {
       btn.classList.toggle("active", btn.dataset[attribute] === String(settings[setting]));
+    }
+    if (numericPrefs.has(setting)) {
+      const label = document.getElementById(group.getAttribute("aria-labelledby"));
+      const custom = Number.isInteger(settings[setting]) && !group.querySelector(".active");
+      const unit = setting === "tokenBudget" ? " tokens" : " s";
+      label.textContent = dict[label.dataset.i18n] + (custom ? " · " + settings[setting].toLocaleString(getLang()) + unit : "");
     }
   }
   document.getElementById("model-routing-hint").textContent = settings.modelRouting === "pinned" ? dict.pinHint : dict.flexHint;
-  const timeoutGroup = document.getElementById("timeout-group");
-  if (!timeoutGroup.querySelector(".active") && Number.isInteger(settings.taskTimeoutSeconds)) {
-    document.getElementById("timeout-label").textContent = dict.timeoutTitle + " · " + settings.taskTimeoutSeconds + " s";
-  }
   for (const btn of el.roleGroup.querySelectorAll(".seg-btn")) {
     btn.classList.toggle("active", btn.dataset.role === settings.roleMode);
   }
@@ -297,6 +325,8 @@ function renderSegments() {
       btn.dataset.workflow === settings.workflowMode
     );
   }
+  document.getElementById("toggle-native-goal").checked = Boolean(settings.nativeGoalSync);
+  document.getElementById("sse-hint").hidden = !(state.tomlDefaults?.modelProvider === "openai_http" && settings.transport === "default");
   el.toggleAutoHeal.checked = settings.autoHealEnabled !== false;
   el.toggleEphemeral.checked = Boolean(settings.ephemeral);
   el.maxIterInput.value = String(settings.maxAutoIterations || 12);
@@ -318,6 +348,84 @@ async function mutatePanel(url, data) {
 document.getElementById("archive-finished-goals").addEventListener("click", () =>
   mutatePanel("/api/goals/archive", { completedOnly: true }));
 
+async function copyGoalDirectory(cwd, prefix = "") {
+  try {
+    await navigator.clipboard.writeText(cwd);
+    showToast([prefix, t().copiedCwd].filter(Boolean).join(" · "));
+  } catch {
+    // Embedded panels can deny the asynchronous clipboard API.
+    const field = node("textarea", "clipboard-field");
+    field.value = cwd;
+    const focused = document.activeElement;
+    document.body.append(field);
+    field.select();
+    let copied = false;
+    try { copied = document.execCommand("copy"); }
+    catch { /* Show the full directory for manual copying. */ }
+    finally { field.remove(); focused?.focus({ preventScroll: true }); }
+    showToast([prefix, copied ? t().copiedCwd : cwd].filter(Boolean).join(" · "));
+  }
+}
+
+function locateGoal(location) {
+  if (!location.matchedRowKeys.length) {
+    if (location.cwd) return copyGoalDirectory(location.cwd, t().noRecords);
+    return showToast(t().noRecords);
+  }
+  const keys = new Set(location.matchedRowKeys);
+  const current = getCurrentConvId();
+  for (const row of rows.filter(row => keys.has(row.key))) {
+    if (!sameConversation(conversationOf(row), current)) scope = "all";
+    collapsed.delete(JSON.stringify([isActive(row) ? el.jobsList.id : el.historyList.id, conversationOf(row)]));
+  }
+  const matchedHistory = rows.filter(row => keys.has(row.key) && !isActive(row));
+  historyFilter = location.sectionHint === "archived" ||
+    (location.sectionHint === "active" && matchedHistory.length && matchedHistory.every(row => row.archived)) ? "archived" : "all";
+  const view = taskView(rows, current, scope, historyFilter);
+  let position = 0;
+  for (const group of view.history) {
+    if ((!current || scope === "all") && collapsed.has(JSON.stringify([el.historyList.id, group.id]))) continue;
+    for (const row of group.rows) {
+      position++;
+      if (keys.has(row.key)) historyLimit = Math.max(historyLimit, position);
+    }
+  }
+  highlightKeys = keys;
+  renderTasks();
+  const first = el.panelGoals.querySelector(".locate-highlight");
+  first?.scrollIntoView({ behavior: "smooth", block: "center" });
+  clearTimeout(highlightTimer);
+  highlightTimer = setTimeout(() => {
+    highlightKeys.clear();
+    for (const card of el.panelGoals.querySelectorAll(".locate-highlight")) card.classList.remove("locate-highlight");
+  }, 2400);
+}
+
+function goalLocationActions(goal) {
+  const loc = resolveGoalLocation(goal, rows);
+  const actions = node("div", "goal-actions");
+  const locate = button(t().locateTasks, "mini-btn locate-tasks", () => locateGoal(loc));
+  locate.disabled = !loc.matchedRowKeys.length && !loc.cwd;
+  if (!loc.matchedRowKeys.length) locate.title = t().noRecords;
+  actions.append(locate);
+  if (!loc.hasUniqueConversation && loc.cwd) {
+    actions.append(button(t().copyCwd, "mini-btn copy-directory", () => copyGoalDirectory(loc.cwd)));
+  } else {
+    const open = button(t().openChat, "mini-btn open-chat", async () => {
+      if (sameConversation(loc.conversationId, getCurrentConvId())) return showToast(t().sameChat);
+      try { await window.sidecar.ui.toggleConversation(loc.conversationId); }
+      catch (error) { showToast(t().toastActionErr(error.message), true); }
+    });
+    const reason = !loc.hasUniqueConversation ? t().noChat : sameConversation(loc.conversationId, getCurrentConvId()) ? t().sameChat :
+      typeof window.sidecar?.ui?.toggleConversation !== "function" ? t().noHostChat : "";
+    open.disabled = Boolean(reason);
+    open.title = reason;
+    actions.append(open);
+    if (loc.hasUniqueConversation && sameConversation(loc.conversationId, getCurrentConvId())) actions.append(node("span", "helper", reason));
+  }
+  return actions;
+}
+
 function renderArchivedGoals(goals) {
   const drawer = document.getElementById("archived-goals");
   drawer.hidden = !goals.length;
@@ -332,6 +440,7 @@ function renderArchivedGoals(goals) {
     detail.append(node("summary", "", goal.title), node("p", "helper", [
       t().taskStatuses[goal.status], goal.objective, goal.cwd, ...goal.milestones.map(m => m.title),
     ].filter(Boolean).join("\n")),
+      goalLocationActions(goal),
       button(t().restoreGoal, "mini-btn restore-goal", () => mutatePanel("/api/goals/archive", { goalId: goal.id, archived: false })),
       button(t().deleteBtn, "mini-btn danger", () => mutatePanel("/api/goals/delete", { goalId: goal.id })));
     list.append(detail);
@@ -644,7 +753,14 @@ const promptObserver = new ResizeObserver(entries => {
 function updateIdleNote(note) {
   const idleSeconds = Math.floor((Date.now() - Date.parse(note.dataset.lastEvent)) / 1000);
   const phase = note.dataset.phase || "waiting_api";
-  note.hidden = !(idleSeconds >= 180);
+  // Older workers only recorded event times. New workers publish the policy decision.
+  const warn = note.dataset.silenceWarning === undefined ? idleSeconds >= 180 : note.dataset.silenceWarning === "true";
+  if (note.dataset.silenceWarning === "true") {
+    note.hidden = false;
+    note.textContent = t().silenceNote;
+    return;
+  }
+  note.hidden = !(phase === "waiting_api" && warn || phase === "running_cmd" && idleSeconds >= 180);
   if (!note.hidden) {
     const mins = Math.floor(idleSeconds / 60);
     const secs = idleSeconds % 60;
@@ -652,10 +768,51 @@ function updateIdleNote(note) {
   }
 }
 
+function steerControl(row) {
+  const turnId = row.activeTurnId;
+  const key = JSON.stringify([row.id, turnId, "draft"]);
+  const wrap = node("div", "steer-control");
+  const input = node("input", "steer-input");
+  input.type = "text";
+  input.maxLength = 16000;
+  input.placeholder = t().steerLabel;
+  input.setAttribute("aria-label", t().steerLabel);
+  input.dataset.key = key;
+  input.value = steerDrafts.get(key) || "";
+  input.addEventListener("input", () => steerDrafts.set(key, input.value));
+  const send = jobAction(row, "steer", t().steerSend, async () => {
+    const draft = input.value;
+    if (!draft.trim()) { input.focus(); return; }
+    let receipt;
+    try {
+      receipt = await post("/api/jobs/steer", { jobId: row.id, expectedTurnId: turnId, message: draft.trim() });
+    } catch (error) {
+      if (error.data?.status) receipt = error.data;
+      else if (error.status >= 400 && error.status < 500) receipt = { status: "rejected", error: error.message };
+      else receipt = { status: "unknown", error: error.message };
+    }
+    const sent = ["accepted", "queued"].includes(receipt.status);
+    if (sent && steerDrafts.get(key) === draft) {
+      steerDrafts.delete(key);
+      const field = [...el.jobsList.querySelectorAll(".steer-input")].find(field => field.dataset.key === key);
+      if (field) field.value = "";
+    }
+    const labels = { accepted: t().steerAccepted, queued: t().steerQueued, rejected: t().steerRejected, unknown: t().steerUnknown };
+    showToast([labels[receipt.status] || t().steerUnknown, receipt.error].filter(Boolean).join(" · "), !sent);
+  });
+  input.addEventListener("keydown", event => {
+    if (event.key === "Enter" && !event.isComposing) { event.preventDefault(); send.click(); }
+  });
+  wrap.append(input, send);
+  return wrap;
+}
+
 function taskCard(row) {
   const d = t();
   const live = isActive(row);
   const card = node("article", live ? "task-card live" : "task-card");
+  card.dataset.rowKey = row.key;
+  card.classList.toggle("locate-highlight", highlightKeys.has(row.key));
   const top = node("div", "task-top");
   const badge = node("span", "badge " + row.status, d.taskStatuses[row.status]);
   if (live) badge.prepend(node("i", "pulse-dot"));
@@ -678,6 +835,22 @@ function taskCard(row) {
     meta.append(tag);
   };
   add(row.conversationId ? shortId(row.conversationId) : d.unbound, "chat", row.conversationId);
+  if (live) {
+    const engine = row.engine || "exec";
+    add(engine === "app_server" ? "App Server" : "Exec CLI", engine === "app_server" ? "engine-live" : "");
+    if (row.activeTurnId) add(d.turnLabel + " · " + shortId(row.activeTurnId), "", row.activeTurnId);
+    if (engine === "app_server") {
+      add(d.steerCountLabel + " · " + (row.steerCount || 0));
+      const limit = row.tokenBudget ? row.tokenBudget.toLocaleString(getLang()) : d.noBudget;
+      add(d.budgetLabel + " · " + (row.usage?.total_tokens?.toLocaleString(getLang()) ?? "—") + " / " + limit);
+      if (row.nativeGoal) {
+        const goal = row.nativeGoal;
+        const usage = goal.tokensUsed != null ? goal.tokensUsed.toLocaleString(getLang()) + " / " +
+          (goal.tokenBudget?.toLocaleString(getLang()) || d.noBudget) : "";
+        add([d.nativeGoalLabel, d.taskStatuses[goal.status] || goal.status, usage].filter(Boolean).join(" · "), "", goal.objective);
+      }
+    }
+  }
   if (row.transferredFrom) add(d.transferred.replace("{id}", shortId(row.transferredFrom)), "transfer", row.transferredFrom);
   if (row.sandbox) add(row.sandbox, "sandbox " + row.sandbox);
   if (row.model) add(d.model + " · " + row.model);
@@ -706,6 +879,7 @@ function taskCard(row) {
     const idle = node("div", "task-note idle-warning");
     idle.dataset.lastEvent = row.lastEventAt || row.startedAt || "";
     idle.dataset.phase = row.phase || "waiting_api";
+    if (typeof row.silenceWarning === "boolean") idle.dataset.silenceWarning = String(row.silenceWarning);
     updateIdleNote(idle);
     card.append(idle);
   }
@@ -750,6 +924,7 @@ function taskCard(row) {
     }
   }
   if (actions.childElementCount) card.append(actions);
+  if (row.canSteer === true && row.engine === "app_server" && row.status === "running" && row.activeTurnId) card.append(steerControl(row));
   return card;
 }
 
@@ -763,7 +938,7 @@ function renderGroups(list, groups, grouped, limit, emptyText) {
     const closed = grouped && collapsed.has(key);
     const section = node("div", "task-group");
     if (grouped) {
-      const local = group.id && group.id === getCurrentConvId();
+      const local = sameConversation(group.id, getCurrentConvId());
       const heading = button("", "group-head", () => {
         if (closed) collapsed.delete(key);
         else collapsed.add(key);
@@ -799,7 +974,7 @@ document.getElementById("history-collapse-all").addEventListener("click", () => 
   expanded.clear();
   historyLimit = pageSize;
   for (const heading of el.panelGoals.querySelectorAll(".group-head")) {
-    if (!getCurrentConvId() || heading.title !== getCurrentConvId()) collapsed.add(heading.dataset.key);
+    if (!sameConversation(heading.title, getCurrentConvId())) collapsed.add(heading.dataset.key);
   }
   renderTasks();
 });
@@ -815,7 +990,11 @@ function renderTasks() {
   if (!state) return;
   const current = getCurrentConvId();
   const grouped = !current || scope === "all";
-  const v = taskView(taskRows(state.jobs, state.history), current, scope, historyFilter);
+  const v = taskView(rows, current, scope, historyFilter);
+  const { localActiveCount, otherActiveCount } = currentCounts();
+  const banner = document.getElementById("other-running");
+  banner.hidden = grouped || localActiveCount > 0 || !otherActiveCount;
+  if (!banner.hidden) banner.querySelector("span").textContent = t().otherRunning(otherActiveCount);
   for (const btn of el.scope.querySelectorAll("button")) {
     const local = btn.dataset.scope === "current";
     btn.querySelector("b").textContent = local ? v.currentCount : v.total;
@@ -848,6 +1027,10 @@ function setScope(value) {
   renderTasks();
 }
 for (const btn of el.scope.querySelectorAll("button")) btn.addEventListener("click", () => setScope(btn.dataset.scope));
+document.getElementById("switch-all").addEventListener("click", () => {
+  for (const row of rows.filter(isActive)) collapsed.delete(JSON.stringify([el.jobsList.id, conversationOf(row)]));
+  setScope("all");
+});
 el.all.addEventListener("click", () => setScope("all"));
 for (const btn of el.filter.querySelectorAll("button")) btn.addEventListener("click", () => {
   historyFilter = btn.dataset.filter;
@@ -857,7 +1040,7 @@ for (const btn of el.filter.querySelectorAll("button")) btn.addEventListener("cl
 el.more.addEventListener("click", () => { historyLimit += pageSize; renderTasks(); });
 el.less.addEventListener("click", () => { historyLimit = pageSize; renderTasks(); });
 
-let lastSettings, lastGoals, lastTasks;
+let lastSettings, lastGoals, lastTasks, locationRowsKey;
 function renderAll() {
   const lang = getLang();
   const settingsKey = JSON.stringify([state.settings, state.models, state.tomlDefaults]);
@@ -869,9 +1052,16 @@ function renderAll() {
     lastSettings = settingsKey;
   }
   renderHeader();
-  const goalKey = JSON.stringify([state.goalsStore, lang]);
-  if (goalKey !== lastGoals) { renderGoals(); lastGoals = goalKey; }
   const taskKey = JSON.stringify([state.jobs, state.history, getCurrentConvId(), lang]);
+  if (taskKey !== lastTasks) {
+    rows = taskRows(state.jobs, state.history);
+    locationRowsKey = JSON.stringify(rows.map(row => [row.key, row.id || row.jobId, row.goalId, row.sessionId, row.cwd,
+      conversationOf(row), row.projectId || row.callbackTarget?.projectId, row.status, row.archived]));
+    const activeDrafts = new Set(rows.filter(row => row.canSteer).map(row => JSON.stringify([row.id, row.activeTurnId, "draft"])));
+    for (const key of steerDrafts.keys()) if (!activeDrafts.has(key)) steerDrafts.delete(key);
+  }
+  const goalKey = JSON.stringify([state.goalsStore, locationRowsKey, getCurrentConvId(), lang, typeof window.sidecar?.ui?.toggleConversation]);
+  if (goalKey !== lastGoals) { renderGoals(); lastGoals = goalKey; }
   if (taskKey !== lastTasks) { renderTasks(); lastTasks = taskKey; }
   else for (const note of el.jobsList.querySelectorAll(".idle-warning")) updateIdleNote(note);
 }
@@ -957,6 +1147,9 @@ for (const btn of el.workflowGroup.querySelectorAll(".seg-btn")) {
   });
 }
 
+document.getElementById("switch-ws").addEventListener("click", () => updateSetting({ transport: "websocket" }));
+document.getElementById("toggle-native-goal").addEventListener("change", event => updateSetting({ nativeGoalSync: event.target.checked }));
+
 el.toggleAutoHeal.addEventListener("change", () => {
   updateSetting({ autoHealEnabled: el.toggleAutoHeal.checked });
 });
@@ -1005,8 +1198,7 @@ el.newGoalForm.addEventListener("submit", async (e) => {
       el.goalCwd.value = "";
       el.goalMilestones.value = "";
       el.newGoalForm.classList.add("hidden");
-      renderGoals();
-      renderHeader();
+      renderAll();
       showToast(t().toastGoalCreated);
     } else {
       showToast(data.error || t().toastActionErr("create"), true);

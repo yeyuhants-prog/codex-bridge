@@ -172,14 +172,21 @@ function buildCallbackMessage(job, settings, goal) {
         ? `\n**Codex Summary**:\n${preview}${summary.lastMessage.length > 1800 ? "\n...(truncated; call codex_status for full output)" : ""}`
         : `\n**Codex 回复摘要**:\n${preview}${summary.lastMessage.length > 1800 ? "\n...(已截断，可调用 codex_status 查看完整输出)" : ""}`
     );
-  } else if (job.error) {
+  }
+  if (job.error && (!summary.lastMessage || job.autoHealCircuitBroken)) {
     lines.push(
       isEn ? `\n**Error**: ${job.error}` : `\n**错误信息**: ${job.error}`
     );
   }
 
   lines.push("");
-  if (isAutonomousEligible) {
+  if (summary.errors?.includes("Turn token budget reached.")) {
+    lines.push(isEn ? "Turn token budget reached. Inspect completed work, verify the milestone and agree the remaining scope and budget before resuming."
+      : "本轮 Token 预算已用尽。请核对已完成的工作、验收里程碑，确认剩余范围和预算后再续跑。");
+  } else if (job.autoHealCircuitBroken) {
+    lines.push(isEn ? "Auto-heal has paused. Report the interruption and review the recovery options above."
+      : "自动续跑已熔断。请向用户报告中断原因，并评估上述恢复建议。");
+  } else if (isAutonomousEligible) {
     if (hasExactSession) {
       lines.push(
         isEn
@@ -290,7 +297,7 @@ function buildPeriodicCheckMessage(job, settings, goal, checkNum) {
   const isEn = settings.language === "en";
   const now = Date.now();
   const elapsedSec = Math.max(0, Math.round((now - Date.parse(job.startedAt || "")) / 1000) || 0);
-  const idleSec = Math.max(0, Math.round((now - Date.parse(job.lastEventAt || job.startedAt || "")) / 1000) || 0);
+  const idleSec = Math.max(0, Math.round((now - Date.parse(job.lastProgressAt || job.lastEventAt || job.startedAt || "")) / 1000) || 0);
   const fmtDur = (s) => (s >= 60 ? `${Math.floor(s / 60)}m ${s % 60}s` : `${s}s`);
   const phase = job.phase || "waiting_api";
   const lines = [
@@ -302,6 +309,7 @@ function buildPeriodicCheckMessage(job, settings, goal, checkNum) {
     `- **Model**: \`${job.model || "default"}\` | **Effort**: \`${job.reasoningEffort || "default"}\` | **Elapsed**: ${fmtDur(elapsedSec)} | **Idle**: ${fmtDur(idleSec)} | **Events**: ${job.eventCount || 0}`,
     `- **Working Dir**: \`${job.cwd}\``,
   ];
+  if (job.silenceWarning) lines.push(isEn ? "Silence warning: waiting for API response." : "静默告警：正在等待 API 响应。");
   if (job.autoHealCount > 0) {
     lines.push(`- **Auto-Heal**: #${job.autoHealCount}/${settings.maxAutoHeals ?? 2}`);
   }
@@ -318,9 +326,17 @@ function buildPeriodicCheckMessage(job, settings, goal, checkNum) {
   lines.push(
     "",
     isEn
-      ? `**Periodic Inspection Instruction (Delegate to Lightweight Sub-Model)**: Launch a read-only monitor via \`invoke_subagent(TypeName="research", Model="flash_lite", Role="Codex Progress Monitor", Prompt="...")\` to keep the Mastermind context clean. Inspect the recent events above and workspace status in \`${job.cwd}\` to judge whether Codex is: (1) progressing normally, (2) stuck in a retry/error loop or drifting, or (3) already done with edits/tests while stalled on reporting. Return a <=5-line verdict to the Mastermind. If healthy, reply briefly and keep waiting; if looping, drifted, or stalled, intervene via \`codex_cancel\` / \`codex_start(resume_job_id="${job.id}", ...)\`.`
-      : `**定时检验指令（委托轻量子模型巡检）**：请调用 \`invoke_subagent(TypeName="research", Model="flash_lite", Role="Codex Progress Monitor", Prompt="...")\`（只读轻量子模型，避免污染主脑上下文），结合上述最近事件与 \`${job.cwd}\` 工作区状态做一次快速体检：① 判断 Codex 是正常推进、陷入报错死循环/跑偏，还是其实代码与测试已跑完仅卡在汇报；② 向主脑返回 5 行以内结构化结论（状态 / 进展 / 风险 / 建议）。若一切正常，主脑简短同步后继续等待即可；若确认死循环、跑偏或网络卡死，再由主脑用 \`codex_cancel\` / \`codex_start(resume_job_id="${job.id}", ...)\` 介入纠偏。`
+      ? `**Periodic Inspection Instruction (Delegate to Lightweight Sub-Model)**: Launch a read-only monitor via \`invoke_subagent(TypeName="research", Model="flash_lite", Role="Codex Progress Monitor", Prompt="...")\` to keep the Mastermind context clean. Inspect the recent events above and workspace status in \`${job.cwd}\` to judge whether Codex is: (1) progressing normally, (2) stuck in a retry/error loop or drifting, or (3) already done with edits/tests while stalled on reporting. Return a <=5-line verdict to the Mastermind. If healthy, keep waiting.`
+      : `**定时检验指令（委托轻量子模型巡检）**：请调用 \`invoke_subagent(TypeName="research", Model="flash_lite", Role="Codex Progress Monitor", Prompt="...")\`（只读轻量子模型，避免污染主脑上下文），结合上述最近事件与 \`${job.cwd}\` 工作区状态做一次快速体检：① 判断 Codex 是正常推进、陷入报错死循环/跑偏，还是其实代码与测试已跑完仅卡在汇报；② 向主脑返回 5 行以内结构化结论（状态 / 进展 / 风险 / 建议）。若进展正常，请继续等待。`
   );
+  if (job.canSteer && job.activeTurnId) {
+    const call = `codex_steer(job_id=${JSON.stringify(job.id)}, expected_turn_id=${JSON.stringify(job.activeTurnId)}, message="...")`;
+    lines.push(isEn ? `For a course correction, first use ${call}. If delivery is unknown, inspect codex_status before resending.`
+      : `需要微调时优先在线纠偏：${call}。送达未知时，先用 codex_status 核对再决定是否重发。`);
+  }
+  const resume = `codex_start(resume_job_id=${JSON.stringify(job.id)}, ...)`;
+  lines.push(isEn ? `If intervention is needed and steering is unavailable or the job has seriously drifted, use codex_cancel, verify it stopped, then ${resume}.`
+    : `需要介入且无法在线纠偏或已严重跑偏时，用 codex_cancel 停止任务，确认已停后再用 ${resume} 续跑。`);
   return lines.join("\n");
 }
 
@@ -410,19 +426,20 @@ async function buildState(query = {}) {
     const models = readCodexModelsCatalog();
     const tomlDefaults = readCodexTomlDefaults();
     const settings = loadSettings();
-    const goalsStore = listGoals();
+    const storedGoals = listGoals();
+    const goalsStore = { ...storedGoals, goals: storedGoals.goals.map(({ pendingDispatches, ...goal }) => goal) };
     const jobs = readPersistedJobs().map(publicJob);
-    const history = loadHistory().map(row => {
+    const history = loadHistory().map(({ ownerId, lockToken, callbackClaim, checkInClaim, ...row }) => {
       const job = row.jobId && jobs.find(j => j.id === row.jobId);
       return { cwd: job?.cwd || null, conversationId: job?.conversationId || null, transferredFrom: job?.transferredFrom || null,
         durationMs: null, usage: null, model: "", reasoningEffort: "", ...row };
     });
-    return { pluginVersion: "1.7.0", codex, tomlDefaults, models, settings,
+    return { pluginVersion: "1.8.0", codex, tomlDefaults, models, settings,
       goalsStore, jobs, history, conversationId: convId || null };
   });
 }
 
-function publicJob({ lockToken, callbackClaim, processIdentity, checkInClaim, checkInLeaseUntil, ...job }) {
+function publicJob({ ownerId, lockToken, callbackClaim, processIdentity, checkInClaim, checkInLeaseUntil, ...job }) {
   return { ...job, conversationId: job.callbackTarget?.conversationId || job.conversationId || null,
     transferredFrom: job.transferredFrom || null, durationMs: job.durationMs ?? job.resultSummary?.durationMs ?? null,
     usage: job.usage ?? job.resultSummary?.usage ?? null, model: job.model || "", reasoningEffort: job.reasoningEffort || "" };
@@ -431,6 +448,9 @@ function publicJob({ lockToken, callbackClaim, processIdentity, checkInClaim, ch
 function api(route, handler, method) {
   app.api(route, async data => {
     try {
+      if (route === "/api/jobs/steer" && !process.env.ANTIGRAVITY_SIDECAR_UI_TOKEN?.trim()) {
+        throw problem(403, "Sidecar UI token required.");
+      }
       validateBooleans(data);
       return await handler(data);
     } catch (err) {
@@ -511,10 +531,15 @@ api(
       model: data.model,
       modelRouting: data.modelRouting,
       transport: data.transport,
+      executionEngine: data.executionEngine,
+      nativeGoalSync: data.nativeGoalSync,
+      tokenBudget: data.tokenBudget,
       taskTimeoutSeconds: data.taskTimeoutSeconds,
       disableDesktopNotify: data.disableDesktopNotify,
       autoHealEnabled: data.autoHealEnabled,
       stallThresholdSeconds: data.stallThresholdSeconds,
+      stallPolicy: data.stallPolicy,
+      reconnectStallSeconds: data.reconnectStallSeconds,
       maxAutoHeals: data.maxAutoHeals,
       monitorIntervalSeconds: data.monitorIntervalSeconds,
       reasoningEffort: data.reasoningEffort,
@@ -582,6 +607,17 @@ api(
   }, "POST"
 );
 
+api("/api/jobs/steer", async data => {
+  const host = app.config.conversationId;
+  if (data.conversationId !== undefined && (!host || host.toLowerCase() !== String(data.conversationId).toLowerCase())) {
+    throw problem(403, "Conversation differs from the sidecar host context.");
+  }
+  const receipt = await jobManager.steerJob({ jobId: data.jobId, message: data.message,
+    expectedTurnId: data.expectedTurnId, callerConversationId: host, waitSeconds: data.waitSeconds,
+    wait: data.wait ?? data.waitSeconds !== 0 });
+  return { ok: receipt.status === "accepted" || receipt.status === "queued", ...receipt };
+}, "POST");
+
 // Stop a running or detached-running job by PID and release its session lock
 api(
   "/api/jobs/stop",
@@ -621,6 +657,8 @@ api(
   (data) => {
     const goal = createGoal({
       title: data.title,
+      conversationId: app.config.conversationId || "",
+      projectId: app.config.projectId || "",
       objective: data.objective,
       cwd: data.cwd,
       acceptanceCriteria: data.acceptanceCriteria,

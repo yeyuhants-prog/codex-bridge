@@ -43,6 +43,8 @@ export function createGoal({
   title,
   objective = "",
   cwd = "",
+  conversationId = "",
+  projectId = "",
   acceptanceCriteria = [],
   milestones = [],
   maxIterations,
@@ -90,6 +92,8 @@ export function createGoal({
       title: String(title).trim(),
       objective: String(objective || "").trim(),
       cwd: String(cwd || "").trim(),
+      conversationId: conversationId.trim(),
+      projectId: projectId.trim(),
       acceptanceCriteria: (Array.isArray(acceptanceCriteria)
         ? acceptanceCriteria
         : []
@@ -308,7 +312,7 @@ export function abandonGoalDispatch(goalId, id) {
 
 export function recordGoalExecution(
   goalId,
-  { milestoneId, sessionId, jobId, reservationId, incrementIteration = true } = {}
+  { milestoneId, sessionId, jobId, conversationId, projectId, reservationId, incrementIteration = true } = {}
 ) {
   return withFileLock(getGoalsPath(), () => {
     const store = readStore();
@@ -331,6 +335,11 @@ export function recordGoalExecution(
     }
     if (sessionId) {
       goal.sessionId = sessionId;
+    }
+    if (conversationId && (!goal.conversationId || goal.conversationId.toLowerCase() === conversationId.toLowerCase()) &&
+        (!goal.projectId || !projectId || goal.projectId === projectId)) {
+      goal.conversationId ||= conversationId;
+      goal.projectId ||= projectId || "";
     }
     if (milestoneId) {
       const ms = goal.milestones.find((m) => m.id === milestoneId);

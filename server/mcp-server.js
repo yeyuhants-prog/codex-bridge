@@ -3,10 +3,12 @@ import {
   resolveCodexBinary,
   getCodexVersion,
   runCodex,
+  effectiveExecProvider,
   formatCodexResult,
 } from "./codex-runner.js";
+import { randomUUID } from "node:crypto";
 import { problem, validateBooleans } from "./validation.js";
-import { workingDirectory, resolveResume, workerModel } from "./run-policy.js";
+import { workingDirectory, resolveResume, workerModel, writableRoots, directoryList } from "./run-policy.js";
 import { processIdentity } from "./process-identity.js";
 import { JobManager, normalizeCallbackTarget, readPersistedJobs, reconcilePersistedJobs } from "./job-manager.js";
 import {
@@ -36,7 +38,7 @@ import {
 
 const SERVER_INFO = {
   name: "codex-mcp-bridge",
-  version: "1.7.0",
+  version: "1.8.0",
 };
 
 const SUPPORTED_PROTOCOL_VERSIONS = [
@@ -88,7 +90,7 @@ function sendProgress(progressToken, progress, message) {
  *    <user_information> Conversation ID (Sidecar verifies conversation existence
  *    via agentapi before delivering; never falls back to mutable global state).
  */
-function extractTrustedHostCallbackTarget(meta = {}, args = {}) {
+function extractTrustedHostCallbackTarget(meta = {}, args = {}, allowProjectOnly = false) {
   const metaConv =
     meta?.conversationId ||
     meta?.conversation_id ||
@@ -113,18 +115,20 @@ function extractTrustedHostCallbackTarget(meta = {}, args = {}) {
     }
   }
 
-  const targets = [[metaConv,metaProj,"mcp_meta"],[args.conversation_id,args.project_id,"agent_conversation_id"],[envConv,envProj,"host_env"]]
-    .filter(([id]) => id).map(([conversationId,projectId,source]) => {
-      const target = normalizeCallbackTarget({ conversationId,projectId,source });
-      if (!target) throw new Error("Invalid conversation_id.");
-      return target;
-    });
+  const contexts = [[metaConv,metaProj,"mcp_meta"],[args.conversation_id,args.project_id,"agent_conversation_id"],[envConv,envProj,"host_env"]];
+  const targets = contexts.filter(([id]) => id).map(([conversationId, projectId, source]) => {
+    const target = normalizeCallbackTarget({ conversationId, projectId, source });
+    if (!target) throw new Error("Invalid conversation_id.");
+    return target;
+  });
+  const projects = allowProjectOnly ? contexts.map(([, project]) => project?.trim()).filter(Boolean) :
+    targets.map(target => target.projectId).filter(Boolean);
   if (new Set(targets.map(t => t.conversationId.toLowerCase())).size > 1 ||
-      new Set(targets.map(t => t.projectId.toLowerCase()).filter(Boolean)).size > 1) {
+      new Set(projects.map(project => project.toLowerCase())).size > 1) {
     throw new Error("Conflicting conversation or project targets in request and host context.");
   }
-  if (targets.length) return targets[0];
-  return null;
+  if (targets.length) return { ...targets[0], projectId: projects[0] || "" };
+  return allowProjectOnly && projects.length ? { projectId: projects[0] } : null;
 }
 
 const COMMON_RUN_PROPERTIES = {
@@ -202,6 +206,12 @@ const COMMON_RUN_PROPERTIES = {
     description:
       "Optional path to a JSON Schema file constraining Codex's final response shape.",
   },
+};
+
+const ENGINE_PROPERTIES = {
+  execution_engine: { type: "string", enum: ["exec", "app_server"], description: "Background execution engine. Known sessions inherit their original engine." },
+  native_goal_sync: { type: "boolean", description: "Observe native thread goals on app_server. Disabled by default for single-turn execution." },
+  token_budget: { type: "integer", minimum: 0, maximum: 100000000, description: "App-server turn token budget. Zero disables the bridge limit." },
 };
 
 const TOOLS = [
@@ -341,6 +351,7 @@ const TOOLS = [
             "Must be true to widen sandbox permissions relative to the original job.",
         },
         transfer_callback: { type: "boolean", description: "Explicitly transfer the parent callback to this conversation." },
+        ...ENGINE_PROPERTIES,
         notify_on_complete: {
           type: "boolean",
           description:
@@ -378,6 +389,19 @@ const TOOLS = [
           description:
             "Optional long-poll wait time in seconds (0-120) to wait for the job to finish before returning.",
         },
+      },
+    },
+  },
+  {
+    name: "codex_steer",
+    description: "Correct the active app-server turn. Never automatically retry an unknown delivery.",
+    inputSchema: {
+      type: "object", required: ["job_id", "message"],
+      properties: {
+        job_id: { type: "string" }, message: { type: "string", minLength: 1, maxLength: 16000 },
+        expected_turn_id: { type: "string", description: "Defaults to the turn active at submission." },
+        conversation_id: { type: "string" }, wait_seconds: { type: "number", minimum: 0, maximum: 120,
+          default: 12, description: "Zero queues without waiting." },
       },
     },
   },
@@ -421,6 +445,8 @@ const TOOLS = [
         },
         goal_id: { type: "string", description: "Target goal_id (defaults to active goal)." },
         title: { type: "string", description: "Title for a new goal or new milestone." },
+        conversation_id: { type: "string", description: "Owning conversation (for create)." },
+        project_id: { type: "string", description: "Owning project (for create)." },
         objective: { type: "string", description: "Detailed goal description (for create)." },
         cwd: { type: "string", description: "Working directory for the goal (for create)." },
         acceptance_criteria: {
@@ -469,9 +495,12 @@ const TOOLS = [
         model_routing: { type: "string", enum: ["flexible", "pinned"] },
         task_timeout_seconds: { type: "integer", anyOf: [{ const: 0 }, { minimum: 60, maximum: 14400 }] },
         transport: { type: "string", enum: ["default", "websocket", "http"] },
+        ...ENGINE_PROPERTIES,
         disable_desktop_notify: { type: "boolean" },
         auto_heal_enabled: { type: "boolean", description: "Automatically resume background jobs interrupted by upstream API stalls." },
-        stall_threshold_seconds: { type: "integer", anyOf: [{ const: 0 }, { minimum: 60, maximum: 1800 }], description: "API silence threshold in seconds before watchdog marks stall (0 disables; local shell commands are exempt)." },
+        stall_policy: { type: "string", enum: ["reconnect_only", "always", "off"], description: "Background watchdog policy. reconnect_only warns on silence and stops stuck reconnects (default). always also stops prolonged silence, scaled by reasoning effort. off disables both checks." },
+        stall_threshold_seconds: { type: "integer", anyOf: [{ const: 0 }, { minimum: 60, maximum: 3600 }], description: "Base API silence threshold in seconds (default 300, 0 disables silence checks). In-flight tools and commands are exempt." },
+        reconnect_stall_seconds: { type: "integer", anyOf: [{ const: 0 }, { minimum: 60, maximum: 1800 }], description: "Seconds of continuous reconnecting before stopping a background job (default 150, 0 disables the reconnect check)." },
         max_auto_heals: { type: "integer", minimum: 0, maximum: 5, description: "Max consecutive automatic recovery resumes per task chain (0-5, default 2)." },
         monitor_interval_seconds: { type: "integer", anyOf: [{ const: 0 }, { minimum: 60, maximum: 1800 }], description: "Periodic progress check-in interval in seconds for lightweight sub-model monitoring (0 disables, default 300)." },
         role_mode: {
@@ -566,6 +595,8 @@ function mapCommonOptions(args, resume = false) {
 function resumeOptions(args, target) {
   return {
     ...mapCommonOptions(args, true),
+    transport: undefined, ephemeral: args.ephemeral,
+    executionEngine: args.execution_engine, nativeGoalSync: args.native_goal_sync, tokenBudget: args.token_budget,
     parentJobId: args.resume_job_id, sessionId: args.session_id,
     prompt: args.prompt, sandbox: args.sandbox, reasoningEffort: args.reasoning_effort,
     allowSandboxEscalation: args.allow_sandbox_escalation, transferCallback: args.transfer_callback,
@@ -575,7 +606,9 @@ function resumeOptions(args, target) {
 
 function recordRunHistory(mode, opts, result) {
   appendHistory({
-    mode, conversationId: opts.callbackTarget?.conversationId || null, transferredFrom: opts.transferredFrom || null,
+    engine: "exec", effectiveProvider: effectiveExecProvider(opts),
+    writableRoots: opts.writableRoots,
+    mode, conversationId: opts.callbackTarget?.conversationId || null, projectId: opts.callbackTarget?.projectId || "", transferredFrom: opts.transferredFrom || null,
     addDirs: opts.addDirs || [], skipGitRepoCheck: opts.skipGitRepoCheck,
     status: result.ok
       ? "completed"
@@ -600,6 +633,7 @@ function recordRunHistory(mode, opts, result) {
 }
 
 async function runWithGoal(opts, runtime) {
+  if (opts.sandbox === "workspace-write") opts.writableRoots = writableRoots(opts.cwd, directoryList(opts.addDirs || [], opts.cwd));
   let reservation = reserveGoalDispatch(opts.goalId, opts.milestoneId);
   try {
     return await runCodex({
@@ -607,7 +641,7 @@ async function runWithGoal(opts, runtime) {
       onSpawn(child) {
         runtime.onSpawn?.(child);
         if (reservation) {
-          recordGoalExecution(opts.goalId, { milestoneId: opts.milestoneId, reservationId: reservation });
+          recordGoalExecution(opts.goalId, { ...opts.callbackTarget, milestoneId: opts.milestoneId, reservationId: reservation });
           reservation = null;
         }
       },
@@ -650,8 +684,12 @@ async function handleToolCall(name, args = {}, meta = {}, signal) {
       `Model Routing: ${prefs.modelRouting}`,
       `Task Timeout: ${prefs.taskTimeoutSeconds ? prefs.taskTimeoutSeconds + "s" : "unlimited"}`,
       `Transport: ${prefs.transport}`,
+      `Background Engine: ${prefs.executionEngine}`,
+      `Native Goal Sync: ${prefs.nativeGoalSync}`,
+      `Token Budget: ${prefs.tokenBudget || "0 (unlimited)"}`,
       `Disable Desktop Notify: ${prefs.disableDesktopNotify}`,
-      `Auto-Heal Watchdog: ${prefs.autoHealEnabled ? `on (stall=${prefs.stallThresholdSeconds ? prefs.stallThresholdSeconds + "s" : "off"}, maxHeals=${prefs.maxAutoHeals})` : "off"}`,
+      `L1 Watchdog: policy=${prefs.stallPolicy}, silence=${prefs.stallThresholdSeconds}s, reconnect=${prefs.reconnectStallSeconds}s`,
+      `Auto-Heal: ${prefs.autoHealEnabled ? "on" : "off"} (maxHeals=${prefs.maxAutoHeals})`,
       `Periodic Inspection: ${prefs.monitorIntervalSeconds ? prefs.monitorIntervalSeconds + "s" : "off"}`,
       `Reasoning Effort: ${effectiveEffort}`,
       `Role Division: ${prefs.roleMode}`,
@@ -715,6 +753,7 @@ async function handleToolCall(name, args = {}, meta = {}, signal) {
 
     if (action === "create") {
       const goal = createGoal({
+        ...extractTrustedHostCallbackTarget(meta, args, true),
         title: args.title,
         objective: args.objective,
         cwd: args.cwd,
@@ -833,9 +872,14 @@ async function handleToolCall(name, args = {}, meta = {}, signal) {
     if (args.model_routing !== undefined) patch.modelRouting = args.model_routing;
     if (args.task_timeout_seconds !== undefined) patch.taskTimeoutSeconds = args.task_timeout_seconds;
     if (args.transport !== undefined) patch.transport = args.transport;
+    if (args.execution_engine !== undefined) patch.executionEngine = args.execution_engine;
+    if (args.native_goal_sync !== undefined) patch.nativeGoalSync = args.native_goal_sync;
+    if (args.token_budget !== undefined) patch.tokenBudget = args.token_budget;
     if (args.disable_desktop_notify !== undefined) patch.disableDesktopNotify = args.disable_desktop_notify;
     if (args.auto_heal_enabled !== undefined) patch.autoHealEnabled = args.auto_heal_enabled;
     if (args.stall_threshold_seconds !== undefined) patch.stallThresholdSeconds = args.stall_threshold_seconds;
+    if (args.stall_policy !== undefined) patch.stallPolicy = args.stall_policy;
+    if (args.reconnect_stall_seconds !== undefined) patch.reconnectStallSeconds = args.reconnect_stall_seconds;
     if (args.max_auto_heals !== undefined) patch.maxAutoHeals = args.max_auto_heals;
     if (args.monitor_interval_seconds !== undefined) patch.monitorIntervalSeconds = args.monitor_interval_seconds;
     if (args.model !== undefined) patch.model = args.model;
@@ -860,8 +904,12 @@ async function handleToolCall(name, args = {}, meta = {}, signal) {
       `- Model Routing: ${updated.modelRouting}`,
       `- Task Timeout: ${updated.taskTimeoutSeconds ? updated.taskTimeoutSeconds + "s" : "unlimited"}`,
       `- Transport: ${updated.transport}`,
+      `- Background Engine: ${updated.executionEngine}`,
+      `- Native Goal Sync: ${updated.nativeGoalSync}`,
+      `- Token Budget: ${updated.tokenBudget}`,
       `- Disable Desktop Notify: ${updated.disableDesktopNotify}`,
-      `- Auto-Heal Watchdog: ${updated.autoHealEnabled ? `on (stall=${updated.stallThresholdSeconds ? updated.stallThresholdSeconds + "s" : "off"}, maxHeals=${updated.maxAutoHeals})` : "off"}`,
+      `- L1 Watchdog: policy=${updated.stallPolicy}, silence=${updated.stallThresholdSeconds}s, reconnect=${updated.reconnectStallSeconds}s`,
+      `- Auto-Heal: ${updated.autoHealEnabled ? "on" : "off"} (maxHeals=${updated.maxAutoHeals})`,
       `- Periodic Inspection: ${updated.monitorIntervalSeconds ? updated.monitorIntervalSeconds + "s" : "off"}`,
       `- Reasoning Effort: ${updated.reasoningEffort || `(follow default: ${toml.reasoningEffort || "auto"})`}`,
       `- Sandbox: ${updated.sandbox}`,
@@ -927,7 +975,12 @@ async function handleToolCall(name, args = {}, meta = {}, signal) {
       };
     }
 
-    const opts = resolveResume(resumeOptions(args, extractTrustedHostCallbackTarget(meta, args)), readPersistedJobs());
+    const records = readPersistedJobs();
+    const prior = args.resume_job_id ? records.find(j => j.id === args.resume_job_id)
+      : records.find(j => j.sessionId && typeof args.session_id === "string" && j.sessionId.toLowerCase() === args.session_id.trim().toLowerCase());
+    if (prior?.engine === "app_server") throw problem(400, `Use codex_start(resume_job_id="${prior.id}") to resume this app_server job in the background.`);
+    const opts = resolveResume(resumeOptions(args, extractTrustedHostCallbackTarget(meta, args)), records);
+    if (opts.executionEngine === "app_server") throw problem(400, "Use codex_start(resume_job_id=...) for an app_server session.");
     const { sessionId: sid, cwd } = opts;
     reconcilePersistedJobs(jobManager._localRunningIds);
     // Cross-process per-session mutual exclusion
@@ -1019,6 +1072,24 @@ async function handleToolCall(name, args = {}, meta = {}, signal) {
     };
   }
 
+  if (name === "codex_steer") {
+    let receipt;
+    try {
+      const context = extractTrustedHostCallbackTarget(meta, args);
+      receipt = await jobManager.steerJob({ jobId: args.job_id, expectedTurnId: args.expected_turn_id,
+        message: args.message, callerConversationId: context?.conversationId,
+        waitSeconds: args.wait_seconds, wait: args.wait_seconds !== 0 });
+    } catch (err) {
+      receipt = { status: "rejected", jobId: args.job_id, turnId: args.expected_turn_id,
+        requestId: randomUUID(), error: err.message };
+    }
+    const text = [`Status: ${receipt.status}`, `Job ID: ${receipt.jobId || "(none)"}`,
+      `Session ID: ${receipt.sessionId || "(none)"}`, `Turn ID: ${receipt.turnId || "(none)"}`,
+      `Request ID: ${receipt.requestId}`, receipt.error || (receipt.status === "accepted"
+        ? "Codex acknowledged this turn." : "Queued for the owner. Acceptance is pending.")].join("\n");
+    return { content: [{ type: "text", text }], isError: ["unknown", "rejected"].includes(receipt.status) };
+  }
+
   if (name === "codex_start") {
     const trustedTarget = extractTrustedHostCallbackTarget(meta, args);
 
@@ -1054,9 +1125,10 @@ async function handleToolCall(name, args = {}, meta = {}, signal) {
     }
 
     const mode = args.session_id !== undefined ? "resume" : "run";
-    const common = mode === "resume" ? resolveResume(resumeOptions(args, trustedTarget), readPersistedJobs()) : mapCommonOptions(args);
+    const common = mode === "resume" ? resumeOptions(args, trustedTarget) : mapCommonOptions(args);
 
     const { job, reused } = jobManager.startJob({
+      executionEngine: args.execution_engine, nativeGoalSync: args.native_goal_sync, tokenBudget: args.token_budget,
       mode,
       sessionId: args.session_id,
       prompt: args.prompt,
@@ -1204,7 +1276,7 @@ async function handleRequest(msg) {
         },
         serverInfo: SERVER_INFO,
         instructions:
-          "Use codex_goal to create and track persistent multi-step goals & milestones, codex_run/codex_resume/codex_review for synchronous tasks, codex_start/codex_status/codex_cancel for persistent background workers with per-job locked callbacks and cross-process session locks, and codex_config/codex_info to inspect or update active preferences.",
+          "Use codex_goal to create and track persistent multi-step goals & milestones, codex_run/codex_resume/codex_review for synchronous tasks, codex_start/codex_status/codex_steer/codex_cancel for persistent background workers with per-job locked callbacks and cross-process session locks, and codex_config/codex_info to inspect or update active preferences.",
       });
       return;
     }

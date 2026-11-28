@@ -12,7 +12,7 @@ export function readOnlySnapshot(read) {
   try { return read(); } finally { snapshotDepth--; }
 }
 
-function retryWindowsIo(fn) {
+export function retryWindowsIo(fn) {
   for (let attempt = 0; ; attempt++) {
     try { return fn(); }
     catch (err) {

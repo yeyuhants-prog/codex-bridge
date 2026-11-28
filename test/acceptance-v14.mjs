@@ -278,7 +278,7 @@ function readJsonl(filePath) {
     .map((l) => JSON.parse(l));
 }
 
-async function freePort() {
+export async function freePort() {
   const reservation = net.createServer();
   await new Promise((resolve,reject) => reservation.once("error",reject).listen(0, "127.0.0.1", resolve));
   const port = reservation.address().port;
@@ -286,7 +286,7 @@ async function freePort() {
   return port;
 }
 
-async function startSidecar(env, port, token, cwd) {
+export async function startSidecar(env, port, token, cwd) {
   const child = spawn(
     process.execPath,
     [`--import=${pathToFileURL(SIDECAR_LOADER).href}`, SIDECAR_MAIN],

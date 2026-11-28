@@ -31,6 +31,7 @@
       <button type="button" class="tab" role="tab" tabindex="-1" aria-selected="false" aria-controls="panel-goals" data-tab="goals">
         <span data-i18n="tabGoals">目标与任务</span>
         <span id="tab-badge" class="tab-badge hidden">0</span>
+        <span id="tab-run-badge" class="tab-badge run hidden">0</span>
       </button>
     </nav>
 
@@ -80,6 +81,22 @@
         <p id="effort-desc" class="helper"></p>
       </section>
 
+      <section class="card">
+        <p class="card-title" id="engine-label" data-i18n="engineTitle">后台执行引擎</p>
+        <div id="engine-group" class="pill-grid" role="group" aria-labelledby="engine-label">
+          <button type="button" class="pill-btn" data-engine="exec" data-i18n="engineExec">Exec CLI（经典稳定）</button>
+          <button type="button" class="pill-btn" data-engine="app_server" data-i18n="engineApp">App Server（实时纠偏与预算）</button>
+        </div>
+        <p class="helper" id="budget-label" data-i18n="budgetTitle">单轮 Token 预算（App Server）</p>
+        <div id="budget-group" class="pill-grid" role="group" aria-labelledby="budget-label">
+          <button type="button" class="pill-btn" data-budget="0" data-i18n="noBudget">不限</button>
+          <button type="button" class="pill-btn" data-budget="100000">100K</button>
+          <button type="button" class="pill-btn" data-budget="300000">300K</button>
+          <button type="button" class="pill-btn" data-budget="500000">500K</button>
+        </div>
+        <label class="switch-label"><input id="toggle-native-goal" type="checkbox" /><span data-i18n="nativeToggle">原生 Goal 自动续轮（实验）</span></label>
+      </section>
+
       <!-- Progression Mode -->
       <section class="card">
         <div class="card-head">
@@ -115,12 +132,26 @@
           <button type="button" class="pill-btn" data-monitor="300" data-i18n="fiveMin">5 分钟</button>
           <button type="button" class="pill-btn" data-monitor="600" data-i18n="tenMin">10 分钟</button>
         </div>
-        <p class="helper" id="stall-label" data-i18n="stallTitle">断流假死阈值（不误杀本地命令）</p>
+        <p class="helper" id="policy-label" data-i18n="policyTitle">L1 看门狗策略</p>
+        <div id="policy-group" class="pill-grid" role="group" aria-labelledby="policy-label">
+          <button type="button" class="pill-btn" data-policy="reconnect_only" data-i18n="reconnectOnly">仅重连卡死自愈（推荐长难任务）</button>
+          <button type="button" class="pill-btn" data-policy="always" data-i18n="alwaysPolicy">重连 + 静默强杀</button>
+          <button type="button" class="pill-btn" data-policy="off" data-i18n="offOption">关闭</button>
+        </div>
+        <p class="helper" id="reconnect-label" data-i18n="reconnectTitle">重连自愈阈值</p>
+        <div id="reconnect-group" class="pill-grid" role="group" aria-labelledby="reconnect-label">
+          <button type="button" class="pill-btn" data-reconnect="0" data-i18n="offOption">关闭</button>
+          <button type="button" class="pill-btn" data-reconnect="120" data-i18n="twoMin">2 分钟</button>
+          <button type="button" class="pill-btn" data-reconnect="150" data-i18n="twoHalfMin">2.5 分钟</button>
+          <button type="button" class="pill-btn" data-reconnect="240" data-i18n="fourMin">4 分钟</button>
+        </div>
+        <p class="helper" id="stall-label" data-i18n="stallTitle">等待 API 响应的静默阈值</p>
         <div id="stall-group" class="pill-grid" role="group" aria-labelledby="stall-label">
           <button type="button" class="pill-btn" data-stall="0" data-i18n="offOption">关闭</button>
-          <button type="button" class="pill-btn" data-stall="120" data-i18n="twoMin">2 分钟</button>
-          <button type="button" class="pill-btn" data-stall="240" data-i18n="fourMin">4 分钟</button>
-          <button type="button" class="pill-btn" data-stall="480" data-i18n="eightMin">8 分钟</button>
+          <button type="button" class="pill-btn" data-stall="300" data-i18n="fiveMin">5 分钟</button>
+          <button type="button" class="pill-btn" data-stall="600" data-i18n="tenMin">10 分钟</button>
+          <button type="button" class="pill-btn" data-stall="900" data-i18n="fifteenMin">15 分钟</button>
+          <button type="button" class="pill-btn" data-stall="1800" data-i18n="halfHour">30 分钟</button>
         </div>
         <div class="inline-setting">
           <label class="switch-label">
@@ -171,6 +202,9 @@
           <button type="button" class="pill-btn" data-transport="websocket" data-i18n="transportWs">WebSocket 优先</button>
           <button type="button" class="pill-btn" data-transport="http" data-i18n="transportHttp">仅 HTTP SSE</button>
         </div>
+        <aside id="sse-hint" class="panel-notice" hidden>
+          <span data-i18n="sseHint"></span><button type="button" id="switch-ws" class="mini-btn" data-i18n="switchWs"></button>
+        </aside>
         <div class="toggle-row">
           <label class="switch-label">
             <input id="toggle-ephemeral" type="checkbox" />
@@ -235,6 +269,9 @@
         <button id="view-all" type="button" class="text-action" hidden></button>
         <section class="task-section" aria-labelledby="active-heading">
           <header class="section-head"><h3 id="active-heading" data-i18n="activeTitle">运行中任务</h3><span id="jobs-count" class="count">0</span></header>
+          <aside id="other-running" class="panel-notice" hidden>
+            <span></span><button type="button" id="switch-all" class="mini-btn" data-i18n="switchAll"></button>
+          </aside>
           <div id="jobs-list" class="task-list"></div>
         </section>
         <section class="task-section" aria-labelledby="history-heading">

@@ -3,6 +3,7 @@ const terminalStates = new Set(["completed", "failed", "timed_out", "cancelled",
 
 export const isActive = row => activeStates.has(row.status);
 export const conversationOf = row => row.conversationId || row.callbackTarget?.conversationId || "";
+export const sameConversation = (a, b) => Boolean(a && b && a.toLowerCase() === b.toLowerCase());
 export const shortId = id => "#" + id.slice(0, 8);
 
 function timestamp(row) {
@@ -64,6 +65,7 @@ export function taskRows(jobs = [], history = []) {
       archived: Boolean(job.archived || record?.archived), archivedAt: job.archivedAt || record?.archivedAt || null,
       conversationId: conversationOf(job) || (record && conversationOf(record)) || "",
       sessionId: job.sessionId || record?.sessionId,
+      goalId: job.goalId || record?.goalId,
       durationMs: job.durationMs ?? record?.durationMs, usage: job.usage ?? record?.usage,
       model: job.model || record?.model, reasoningEffort: job.reasoningEffort || record?.reasoningEffort,
       prompt: job.prompt || record?.prompt, promptPreview: job.promptPreview || record?.promptPreview
@@ -78,6 +80,37 @@ export function taskRows(jobs = [], history = []) {
   return rows.sort((a, b) => timestamp(b) - timestamp(a));
 }
 
+export function resolveGoalLocation(goal, rows) {
+  const jobIds = new Set((goal.milestones || []).map(m => m.jobId).filter(Boolean));
+  let matches = rows.filter(row => (goal.id && row.goalId === goal.id) || jobIds.has(row.id || row.jobId));
+  if (!matches.length && goal.sessionId && goal.sessionId !== "last" && goal.cwd) {
+    const legacy = rows.filter(row => row.sessionId === goal.sessionId && row.cwd === goal.cwd);
+    if (legacy.length === 1 && (!legacy[0].goalId || legacy[0].goalId === goal.id)) matches = legacy;
+  }
+  const candidateConversationIds = [];
+  for (const id of [goal.conversationId, ...matches.map(conversationOf)]) {
+    if (id && !candidateConversationIds.some(candidate => sameConversation(candidate, id))) candidateConversationIds.push(id);
+  }
+  const conversationId = goal.conversationId || (candidateConversationIds.length === 1 ? candidateConversationIds[0] : "");
+  const projects = new Set(matches.filter(row => sameConversation(conversationOf(row), conversationId))
+    .map(row => row.projectId || row.callbackTarget?.projectId).filter(Boolean));
+  const sectionHint = matches.some(isActive) ? "active" : matches.some(row => !row.archived) ? "history" : matches.length ? "archived" : null;
+  return { conversationId, projectId: goal.projectId || (projects.size === 1 ? [...projects][0] : ""),
+    candidateConversationIds, cwd: goal.cwd || matches.find(row => row.cwd)?.cwd || "",
+    matchedRowKeys: matches.map(row => row.key ?? row.id ?? historyKey(row)), sectionHint, hasUniqueConversation: Boolean(conversationId) };
+}
+
+export function activityCounts(goals, jobs, current) {
+  const active = jobs.filter(isActive);
+  const localActiveCount = current ? active.filter(row => sameConversation(conversationOf(row), current)).length : 0;
+  const visible = goals.filter(goal => !goal.archived);
+  const byStatus = {};
+  for (const goal of visible) byStatus[goal.status] = (byStatus[goal.status] || 0) + 1;
+  return { goalsCount: visible.length, goalStatusCounts: byStatus,
+    openGoalsCount: visible.filter(goal => ["active", "paused"].includes(goal.status)).length,
+    localActiveCount, otherActiveCount: active.filter(row => conversationOf(row) && !sameConversation(conversationOf(row), current)).length };
+}
+
 export function groupsFor(rows, current) {
   const groups = new Map();
   for (const row of rows) {
@@ -88,7 +121,7 @@ export function groupsFor(rows, current) {
     const name = row.cwd?.split(/[\\/]/).filter(Boolean).at(-1);
     if (name) group.directories.set(name, (group.directories.get(name) || 0) + 1);
   }
-  const priority = id => !id ? 2 : id === current ? 0 : 1;
+  const priority = id => !id ? 2 : sameConversation(id, current) ? 0 : 1;
   return [...groups.values()].sort((a, b) => priority(a.id) - priority(b.id)).map(group => ({
     id: group.id, rows: group.rows,
     directory: [...group.directories].sort((a, b) => b[1] - a[1])[0]?.[0] || ""
@@ -96,7 +129,7 @@ export function groupsFor(rows, current) {
 }
 
 export function taskView(rows, current, scope, filter) {
-  const local = current ? rows.filter(row => conversationOf(row) === current) : [];
+  const local = current ? rows.filter(row => sameConversation(conversationOf(row), current)) : [];
   const visible = current && scope === "current" ? local : rows;
   const finished = visible.filter(row => !isActive(row));
   const history = finished.filter(row => !row.archived);

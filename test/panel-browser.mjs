@@ -1,6 +1,7 @@
 // Optional Chromium interaction test. Pass the local Chrome/Edge executable as argv[2].
 // Only this loopback fixture is served. No bridge, host SDK, or real job is started.
 import assert from "node:assert/strict";
+import { existsSync } from "node:fs";
 import { execFile } from "node:child_process";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { createServer } from "node:http";
@@ -12,7 +13,7 @@ function preload() {
   const A = "aaaa0000-source";
   const B = "bbbb0000-target";
   const state = {
-    codex: { found: true, version: "codex-cli 0.171" }, pluginVersion: "1.6.0",
+    codex: { found: true, version: "codex-cli 0.171" }, pluginVersion: "1.8.0", tomlDefaults: { modelProvider: "openai_http" },
     settings: { language: "zh", sandbox: "read-only", modelRouting: "flexible", taskTimeoutSeconds: 7200, transport: "default" },
     models: [], goalsStore: { activeGoalId: "open", goals: [
       { id: "open", title: "Current goal", status: "active", milestones: [{ id: "m1", title: "Verify", status: "pending" }] },
@@ -31,7 +32,7 @@ function preload() {
       { at: "2024-01-01", status: "completed", prompt: "Unbound" },
     ],
   };
-  const fixture = window.fixture = { state, resumes: [], send: async () => ({ ok: true }) };
+  const fixture = window.fixture = { state, resumes: [], opened: [], steers: [], send: async () => ({ ok: true }) };
   // Drive polling explicitly, so the test also controls the response order.
   const interval = window.setInterval.bind(window);
   window.setInterval = (fn, ms, ...args) => {
@@ -41,6 +42,7 @@ function preload() {
   };
   window.sidecar = {
     conversationId: B,
+    ui: { toggleConversation: id => fixture.opened.push(id) },
     agent: { sendMessage: (...args) => fixture.send(...args) },
     async fetch(url, options = {}) {
       const body = JSON.parse(options.body || "{}");
@@ -65,6 +67,11 @@ function preload() {
           if (body.completedOnly ? g.status === "completed" : g.id === body.goalId) g.archived = body.archived ?? true;
         }
         return Response.json({ ok: true });
+      }
+      if (url === "/api/jobs/steer") {
+        fixture.steers.push(body);
+        const status = fixture.steerStatus;
+        return Response.json({ ok: ["accepted", "queued"].includes(status), status });
       }
       if (url === "/api/jobs/archive") {
         const matches = row => body.finishedOnly ? (!body.conversationId || body.conversationId === row.conversationId) :
@@ -112,11 +119,16 @@ async function exercise(width) {
     await wait(() => !$("#btn-send-task").disabled, "send did not settle");
   };
   const cfg = window.fixture;
-  await wait(() => $("#tab-badge").textContent === "1", "initial render");
+  await wait(() => /^(▶|运行) 1$/.test($("#tab-run-badge").textContent) && $("#tab-badge").textContent === String(all("#goal-select option").length || 1), "initial render");
   layout();
   for (const [attribute, setting, values] of [
     ["model-routing", "modelRouting", ["pinned", "flexible"]],
     ["timeout", "taskTimeoutSeconds", [0, 1800, 3600, 14400, 7200]],
+    ["engine", "executionEngine", ["app_server", "exec"]],
+    ["budget", "tokenBudget", [100000, 300000, 500000, 0]],
+    ["policy", "stallPolicy", ["always", "off", "reconnect_only"]],
+    ["stall", "stallThresholdSeconds", [0, 300, 600, 900, 1800]],
+    ["reconnect", "reconnectStallSeconds", [0, 120, 150, 240]],
     ["transport", "transport", ["websocket", "http", "default"]],
   ]) {
     for (const value of values) {
@@ -125,6 +137,15 @@ async function exercise(width) {
       await wait(() => cfg.state.settings[setting] === value && $(selector).getAttribute("aria-pressed") === "true", selector);
     }
   }
+  check(!$("#sse-hint").hidden, "show default SSE hint");
+  click("#switch-ws");
+  await wait(() => cfg.state.settings.transport === "websocket" && $("#sse-hint").hidden, "SSE switch persisted");
+  click("#toggle-native-goal");
+  await wait(() => cfg.state.settings.nativeGoalSync === true, "native Goal setting saved");
+  cfg.state.settings.nativeGoalSync = false;
+  await cfg.poll();
+  check(!$("#toggle-native-goal").checked, "external setting reflected");
+  layout();
   click('[data-tab="goals"]');
   check(!$(".idle-warning").hidden && $(".idle-warning").textContent.includes("已静默 3 分"), "three-minute stall warning");
   const now = Date.now;
@@ -135,6 +156,16 @@ async function exercise(width) {
     Date.now = () => now() + 181000;
     await cfg.poll();
     check(!$(".idle-warning").hidden, "unchanged snapshot crosses idle threshold");
+    const liveJob = cfg.state.jobs[0];
+    liveJob.silenceWarning = false;
+    await cfg.poll();
+    check($(".idle-warning").hidden, "worker policy suppresses the legacy age-based warning");
+    liveJob.silenceWarning = true;
+    await cfg.poll();
+    check(!$(".idle-warning").hidden, "worker silence warning is visible");
+    Object.assign(liveJob, { phase: "running_tool", silenceWarning: false });
+    await cfg.poll();
+    check($(".idle-warning").hidden && $("#jobs-list").textContent.includes("工具执行中"), "tool activity clears the silence warning");
   } finally { Date.now = now; }
   click(".milestone-toggle");
   check($(".milestone-list").hidden, "fold milestones");
@@ -153,7 +184,7 @@ async function exercise(width) {
   click(".archived-goal summary");
   click(".restore-goal");
   await wait(() => $(".goal-title").textContent === "Current goal", "restore single goal");
-  check($("#tab-badge").classList.contains("local") && $("#jobs-list .event-count").textContent.includes("17"), "local active event count");
+  check($("#tab-run-badge").classList.contains("local") && $("#jobs-list .event-count").textContent.includes("17"), "local active event count");
   check(!$("#history-list .task-card"), "initial local scope");
   scope("all");
   check(ready() && all("#history-list .task-card").length === 8, "history initial page");
@@ -281,10 +312,121 @@ async function exercise(width) {
   await wait(() => $('[data-filter="archived"]').textContent === "Archived (11)", "bulk archive history");
   check($("#jobs-list .live") && !$("#history-list .task-card"), "bulk archive kept active job");
   layout();
+
+  const { state } = cfg;
+  const current = window.sidecar.conversationId;
+  const source = "aaaa0000-source";
+  const board = state.goalsStore.goals;
+  for (const goal of board) goal.archived = true;
+  const archived = board[0];
+  archived.cwd = "/shared/project";
+  const detail = () => all(".archived-goal").find(item => item.dataset.id === archived.id);
+  scope("current");
+  await cfg.poll();
+  if (!$("#archived-goals").open) click("#archived-goals-heading");
+  detail().open = true;
+  check(detail().querySelector(".copy-directory"), "directory-only goal offers copy");
+  Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText: async value => { cfg.copied = value; } } });
+  detail().querySelector(".locate-tasks").click();
+  await wait(() => cfg.copied === archived.cwd && $("#toast").textContent.includes("No linked task records"), "directory fallback");
+  // Jobs and history change independently of goalsStore. The old archive drawer must update in place.
+  const live = state.jobs[0];
+  live.conversationId = source;
+  live.goalId = archived.id;
+  await cfg.poll();
+  const badge = $("#tab-run-badge");
+  const aria = () => badge.getAttribute("aria-label");
+  check(badge.textContent === "+1" && aria() === "Running in this chat 0 · Running in other chats 1" && badge.title === aria(), "external badge");
+  check(!$("#other-running").hidden && $("#other-running span").textContent.includes("1 running"), "other chat banner");
+  check(detail().open && !detail().querySelector(".open-chat").disabled, "job-only change invalidated goal cache");
+  detail().querySelector(".open-chat").click();
+  check(cfg.opened.join() === source, "host received exact conversation");
+  click("#switch-all");
+  check($("#jobs-list .live") && $("#other-running").hidden && $('[data-scope="all"]').getAttribute("aria-pressed") === "true", "banner reveals jobs");
+
+  delete live.goalId;
+  const target = state.history.find(row => row.jobId === "old");
+  target.goalId = archived.id;
+  // A history-only archived row beyond the first page, linked solely by goal ID.
+  state.jobs = state.jobs.filter(job => job.id !== "old");
+  Object.assign(target, { conversationId: source, archived: true, at: "1960-01-01" });
+  filter("archived");
+  await cfg.poll();
+  delete target.goalId;
+  await cfg.poll();
+  check(detail().querySelector(".copy-directory"), "removed history evidence invalidates archive controls");
+  target.goalId = archived.id;
+  await cfg.poll();
+  check(!detail().querySelector(".open-chat").disabled, "history-only association enables open chat");
+  const header = all("#history-list .group-head").find(b => b.title === source);
+  if (header.getAttribute("aria-expanded") === "true") header.click();
+  scope("current");
+  filter("failure");
+  let scroll;
+  const originalScroll = Element.prototype.scrollIntoView;
+  Element.prototype.scrollIntoView = function(options) { scroll = [this.dataset.rowKey, options]; originalScroll.call(this, options); };
+  detail().querySelector(".locate-tasks").click();
+  Element.prototype.scrollIntoView = originalScroll;
+  check($('[data-scope="all"]').getAttribute("aria-pressed") === "true" && $('[data-filter="archived"]').getAttribute("aria-pressed") === "true", "locate sets scope and filter");
+  check(scroll?.[0] === "history:old" && scroll[1].behavior === "smooth" && scroll[1].block === "center", "scroll linked archived row");
+  check($('[data-row-key="history:old"]').classList.contains("locate-highlight") && all("#history-list .task-card").length > 8, "open group, extend page and highlight");
+  window.sidecar.conversationId = source.toUpperCase();
+  await cfg.poll();
+  const same = detail().querySelector(".open-chat");
+  check(same.disabled && same.title.includes("already open"), "current conversation disabled and explained");
+  same.click();
+  check(cfg.opened.length === 1, "no duplicate host toggle");
+  board.push({ id: "paused", title: "Paused", status: "paused", milestones: [] });
+  scope("current");
+  await cfg.poll();
+  const goalBadge = $("#tab-badge");
+  check(badge.classList.contains("local") && badge.textContent === "▶ 1" && aria() === "Running in this chat 1 · Running in other chats 0" && $("#other-running").hidden, "local run badge");
+  check(goalBadge.textContent === String(board.filter(g => !g.archived).length) && goalBadge.title.startsWith("Goals "), "goal badge equals listed goals");
+  window.sidecar.conversationId = current;
+  await cfg.poll();
+  check(badge.textContent === "+1" && badge.classList.contains("external") && !badge.classList.contains("local"), "run badge independent of goals");
+  check(goalBadge.textContent === String(board.filter(g => !g.archived).length), "goal badge stable across chats");
+  state.jobs = [];
+  board.at(-1).status = "completed";
+  await cfg.poll();
+  check(badge.classList.contains("hidden") && $("#other-running").hidden, "no running jobs hides run badge");
+  check(goalBadge.textContent === String(board.filter(g => !g.archived).length) && !goalBadge.classList.contains("hidden") === board.some(g => !g.archived), "goal badge still counts finished goals");
+  Object.assign(live, { conversationId: current, engine: "app_server", activeTurnId: "turn-0123456789", canSteer: true,
+    steerCount: 2, tokenBudget: 100000, usage: { total_tokens: 2134 }, nativeGoal: { status: "active", tokensUsed: 3600, tokenBudget: 20000 } });
+  state.jobs = [live];
+  await cfg.poll();
+  check($("#jobs-list .engine-live").textContent === "App Server" && $("#jobs-list").textContent.includes("2,134 / 100,000") &&
+    $("#jobs-list").textContent.includes("3,600 / 20,000") && $("#jobs-list").textContent.includes("Steers · 2"), "App Server telemetry");
+  const setDraft = text => { $(".steer-input").value = text; $(".steer-input").dispatchEvent(new Event("input")); };
+  setDraft("keep this correction");
+  live.eventCount++;
+  await cfg.poll();
+  check($(".steer-input").value === "keep this correction", "steering draft preserved across polls");
+  for (const [status, label] of [["accepted", "accepted"], ["queued", "queued"], ["rejected", "rejected"], ["unknown", "delivery unknown"]]) {
+    cfg.steerStatus = status;
+    setDraft("correct " + status);
+    click(".steer-control button");
+    await wait(() => $("#toast").textContent.includes(label), "receipt " + status);
+    const req = cfg.steers.at(-1);
+    check(req.jobId === live.id && req.expectedTurnId === live.activeTurnId && req.message === "correct " + status, "turn pinned at send");
+  }
+  layout();
+  for (const patch of [{ canSteer: false }, { canSteer: true, status: "running_detached" }, { status: "running", activeTurnId: null }, { engine: "exec", activeTurnId: "x" }]) {
+    Object.assign(live, patch);
+    await cfg.poll();
+    check(!$(".steer-input"), "hide steering when unavailable");
+  }
 }
 
-const executable = process.argv[2];
-assert.ok(executable, "Pass the path to a Chromium-based browser executable");
+const browserNames = process.platform === "win32" ? ["chrome.exe", "msedge.exe"] : ["chromium", "chromium-browser", "google-chrome"];
+const installedBrowsers = (process.env.PATH || "").split(path.delimiter).filter(Boolean)
+  .flatMap(directory => browserNames.map(name => path.join(directory, name)));
+for (const root of [process.env.ProgramFiles, process.env["ProgramFiles(x86)"], process.env.LOCALAPPDATA].filter(Boolean)) {
+  installedBrowsers.push(path.join(root, "Google/Chrome/Application/chrome.exe"), path.join(root, "Microsoft/Edge/Application/msedge.exe"));
+}
+installedBrowsers.push("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome", "/Applications/Chromium.app/Contents/MacOS/Chromium");
+const executable = process.argv[2] || process.env.CHROMIUM_PATH || installedBrowsers.find(candidate => existsSync(candidate));
+assert.ok(executable, "Set CHROMIUM_PATH or pass a Chromium executable as argv[2]");
 const staticFiles = new Map();
 for (const file of ["index.html", "app.js", "styles.css", "i18n.mjs", "view-model.mjs"]) {
   staticFiles.set("/" + file, await readFile(new URL("../sidecars/codex_panel/" + file, import.meta.url), "utf8"));
@@ -337,7 +479,7 @@ try {
       "--window-size=700,900", "--dump-dom",
       "http://127.0.0.1:" + server.address().port + "/?width=" + width], { timeout: 30000, maxBuffer: 4e6, windowsHide: true });
     assert.ok(stdout.includes('data-result="passed"'), stdout.match(/data-failure="([^"]*)"/)?.[1] || "Browser exercise did not complete");
-    console.log(width + "px · settings, idle warning, goal and history archives, collapse, paging, routing, drafts, stale reads, reset and language passed");
+    console.log(width + "px · bilingual layout, settings, badges, cross-chat banner, archive navigation, steering receipts and existing panel workflows passed");
   }
 } finally {
   server.close();

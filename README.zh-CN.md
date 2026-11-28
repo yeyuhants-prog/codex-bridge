@@ -6,7 +6,7 @@
 
 **你只管说大白话，让 Antigravity（Gemini）把想法翻译成精准指令并全程监工，指挥本机 OpenAI Codex（GPT）把活干到验收通过。**
 
-[![Version](https://img.shields.io/badge/version-1.7.0-7c3aed?style=flat-square)](./plugin.json)
+[![Version](https://img.shields.io/badge/version-1.8.0-7c3aed?style=flat-square)](./plugin.json)
 [![Node](https://img.shields.io/badge/node-%3E%3D18.0.0-22c55e?style=flat-square)](https://nodejs.org/)
 [![Dependencies](https://img.shields.io/badge/dependencies-zero-0ea5e9?style=flat-square)](#架构一览)
 [![MCP](https://img.shields.io/badge/protocol-MCP%20Stdio-f59e0b?style=flat-square)](https://modelcontextprotocol.io/)
@@ -71,8 +71,10 @@
   默认开启 **主脑派活模式**：Antigravity 专注发挥自然语言理解、拆解任务单、调度插件和阶段验收的长板，把重度编码、后端排查和数据分析脚本全部交给本机 Codex 执行。
 - **灵活模型路由 & 一键指定干活模型**
   自动读取你本机的 `~/.codex/models_cache.json`。支持 **`按指令灵活切换 (flexible)`**（对话里随口说“用 `gpt-6.2-sol` 跑”就能生效），也支持 **`锁定指定模型 (pinned)`** 严格固定执行模型。
-- **三层监控与断流自动自愈（`v1.7.0`）**
-  - **L1 阶段感知看门狗**：实时区分正在跑本地命令（`running_cmd`，**自动豁免不误杀**）与 API 静默/重连卡死（`waiting_api` / `reconnecting`），超时自动停掉假死流并用幂等指令断点续跑。
+- **v1.8.0 执行引擎与目标定位**
+  后台任务可选 Exec CLI 或 App Server。App Server 卡片显示当前轮次、纠偏次数和 Token 预算，支持实时纠偏及实验性的原生 Goal 自动续轮。已归档目标可跨对话、跨页定位关联任务，也可打开归属对话。页签角标区分当前运行任务、活跃目标和其他对话的活动。
+- **三层监控与断流自动自愈**
+  - **L1 阶段感知看门狗**：默认 `reconnect_only` 对长时间静默给出提示，对重连卡死执行自愈。`always` 也会停止长时间静默的任务，`off` 关闭看门狗。
   - **L2 轻量子模型定时巡检**：支持配置巡检间隔（`关闭 / 3 / 5 / 10 分钟`），定时推送检验提醒回原对话，由只读轻量子模型（`flash_lite`）快速体检并回传 ≤5 行结论，既防跑偏又不污染主脑上下文。
   - **传输通道切换 & 完工 5 秒拖尾清理**：支持切换 `跟随默认` / `WebSocket 优先` / `仅 HTTP SSE`，无头运行默认屏蔽桌面弹窗钩子（`notify=[]`），完工后自动清理残留退出拖尾。
 - **原生中英双语侧边栏面板**
@@ -144,7 +146,7 @@ flowchart LR
   Server <-->|JSONL 事件流 + UTF-8 stdin| Codex["本机 OpenAI Codex CLI<br/>(codex exec / resume / review)"]
 ```
 
-## 提供的 9 个 MCP 工具
+## 提供的 10 个 MCP 工具
 
 | 工具 | 用途 |
 | --- | --- |
@@ -154,8 +156,9 @@ flowchart LR
 | `codex_review` | 调用 `codex exec review` 对 Git 仓库做代码审查 |
 | `codex_start` | 后台异步启动持久化 Codex 任务并立即返回 `job_id`（支持 L1 断流自动自愈、定时巡检与完工自动回调） |
 | `codex_status` | 查看后台任务实时阶段（`waiting_api` / `running_cmd` / `reconnecting`）、自愈/巡检次数、进展事件或最终结果 |
+| `codex_steer` | 为运行中的 App Server 任务发送纠偏指令。用 `expected_turn_id` 锁定轮次，区分已接受、被拒绝、已排队和送达未知四种回执。 |
 | `codex_cancel` | 终止正在运行的后台 Codex 任务并清理子进程树 |
-| `codex_config` | 读取/更新与侧边栏共享的默认配置（模型、路由、思考深度、时长上限、传输通道、看门狗与定时巡检间隔），并列出本机可用模型 |
+| `codex_config` | 读取/更新与侧边栏共享的默认配置（模型、路由、思考深度、时长上限、传输通道、执行引擎、原生 Goal、Token 预算、看门狗策略、重连与静默阈值、定时巡检间隔），并列出本机可用模型 |
 | `codex_info` | 健康检查，查看 `codex` 路径、版本、面板配置、看门狗/定时巡检状态与当前目标进度 |
 
 <details>
@@ -178,15 +181,12 @@ flowchart LR
 ## 自测
 
 ```bash
-# 零 Token 消耗的 MCP 协议、配置与持久化目标板冒烟测试
+# 冒烟测试及截至 v1.8 的回归套件，含 Chromium 面板交互
 npm test
-
-# 完整单元测试、验收与回归套件（v1.4 ~ v1.7）
-node --test test/panel-ui.test.mjs
 node test/acceptance-v14.mjs
-node test/regression-v15.mjs
-node test/regression-v16.mjs
-node --test test/regression-v17.mjs
+
+# 单独复跑 360px 与 480px 浏览器验证。非标准安装位置可通过 CHROMIUM_PATH 指定。
+node test/panel-browser.mjs
 
 # 真机执行一次只读临时 codex_run 端到端校验
 npm run test:live

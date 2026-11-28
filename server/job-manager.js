@@ -1,12 +1,17 @@
 import { readJson, withFileLock } from "./file-store.js";
+import { createConsumer, publish, waitForAck, pruneControls } from "./job-control.js";
 import { processIdentity, matchesProcess } from "./process-identity.js";
-import { validateBooleans, problem } from "./validation.js";
-import { resolveResume, workerModel, directoryList, workingDirectory } from "./run-policy.js";
+import { validateBooleans, validateEngineOptions, problem } from "./validation.js";
+import { resolveResume, workerModel, directoryList, workingDirectory, writableRoots } from "./run-policy.js";
+import { prepareAppServerTurn, runAppServerTurn } from "./app-server-runner.js";
 import { taskRows, historyKey } from "../sidecars/codex_panel/view-model.mjs";
 import crypto from "node:crypto";
+import fs from "node:fs";
 import path from "node:path";
 import {
   runCodex,
+  effectiveReasoningEffort,
+  effectiveExecProvider,
   formatCodexResult,
   killPidTree,
 } from "./codex-runner.js";
@@ -19,7 +24,7 @@ import {
 import { abandonGoalDispatch, reserveGoalDispatch, recordGoalExecution } from "./goal-store.js";
 import {
   isPidAlive, normalizeSessionId,
-  inspectSessionLock,
+  inspectSessionLock, getSessionLockPath,
   acquireSessionLock,
   updateSessionLockPid,
   releaseSessionLock,
@@ -46,7 +51,25 @@ export const callbackTerminal = new Set(["completed", "failed", "timed_out", "in
 
 export function readPersistedJobs() {
   const jobs = readJson(getJobsPath(), [], rows => Array.isArray(rows) && rows.every(row => typeof row?.id === "string"));
-  return jobs.map(job => ({ archived: false, archivedAt: null, lastEventAt: job.startedAt, ...job }));
+  return jobs.map(job => ({ archived: false, archivedAt: null, lastEventAt: job.startedAt, engine: "exec", steerCount: 0, steerHistory: [], ...job, canSteer: steerable(job) }));
+}
+
+function steerable(job) {
+  return job.engine === "app_server" && job.status === "running" && Boolean(job.canSteer && job.activeTurnId && job.ownerId);
+}
+
+function validMessage(message) {
+  return typeof message === "string" && message.length <= 16000 && Boolean(message.trim());
+}
+
+let cleanupTimer;
+function scheduleCleanup() {
+  if (cleanupTimer) return;
+  cleanupTimer = setInterval(() => {
+    try { withFileLock(getJobsPath(), () => pruneControls(readPersistedJobs(), isPidAlive)); }
+    catch (err) { console.error("[codex-bridge] Control cleanup:", err.message); }
+  }, 60_000);
+  cleanupTimer.unref();
 }
 
 function writePersistedJobs(list) {
@@ -220,6 +243,7 @@ export function reconcilePersistedJobs(localRunningIds = new Set()) {
       const justStarted = Date.now() - Date.parse(rec.startedAt) < 30000;
       if (ownerAlive && rec.status !== "running_detached" && (childAlive || justStarted)) continue;
       if (childAlive) {
+        if (!ownerAlive && rec.canSteer) { rec.canSteer = false; changed = true; }
         if (rec.status === "running") { rec.status = "running_detached"; changed = true; }
         if (rec.sessionId && !inspectSessionLock(rec.sessionId).locked) {
           const lease = acquireSessionLock(rec.sessionId, { jobId: rec.id, pid: rec.pid,
@@ -228,6 +252,8 @@ export function reconcilePersistedJobs(localRunningIds = new Set()) {
         }
       } else {
         rec.status = rec.status === "stopping" ? "cancelled" : "interrupted";
+        rec.activeTurnId = null;
+        rec.canSteer = false;
         rec.finishedAt ||= new Date().toISOString();
         rec.error ||= "Process ended before the owner recorded completion.";
         if (rec.sessionId && rec.lockToken) releaseSessionLock(rec.sessionId, rec.lockToken);
@@ -241,6 +267,8 @@ export function reconcilePersistedJobs(localRunningIds = new Set()) {
 
 export class JobManager {
   constructor() {
+    this.ownerId = crypto.randomUUID();
+    scheduleCleanup();
     this.jobs = new Map();
     this._localRunningIds = new Set();
     this._syncFromDisk();
@@ -290,8 +318,13 @@ export class JobManager {
       processIdentity: job.processIdentity || null, lockToken: job.lockToken || null,
       conversationId: job.callbackTarget?.conversationId || null, transferredFrom: job.transferredFrom || null,
       durationMs: job.result?.durationMs ?? job.resultSummary?.durationMs ?? null,
-      usage: job.result?.usage ?? job.resultSummary?.usage ?? null,
+      usage: job.result?.usage ?? job.resultSummary?.usage ?? job.usage ?? null,
       mode: job.mode,
+      engine: job.engine, effectiveProvider: job.effectiveProvider ?? null,
+      activeTurnId: job.activeTurnId ?? null, canSteer: steerable(job),
+      ownerId: job.ownerId || null, steerCount: job.steerCount || 0, steerHistory: job.steerHistory || [],
+      nativeGoal: job.nativeGoal ?? null, nativeGoalSync: job.nativeGoalSync, tokenBudget: job.tokenBudget,
+      ephemeral: job.ephemeral, writableRoots: job.writableRoots,
       status: job.status,
       cwd: job.cwd,
       model: job.model || "",
@@ -303,14 +336,21 @@ export class JobManager {
       promptPreview: job.promptPreview,
       startedAt: job.startedAt,
       lastEventAt: job.lastEventAt || job.startedAt,
+      lastProgressAt: job.lastProgressAt || job.startedAt,
       timeoutSeconds: job.timeoutSeconds,
       phase: job.phase || "waiting_api",
       activeCommands: job.activeCommands || 0,
+      activeTools: job.activeTools || 0,
       reconnectCount: job.reconnectCount || 0,
       autoHealCount: job.autoHealCount || 0,
       autoHealFromJobId: job.autoHealFromJobId || null,
       autoHealedToJobId: job.autoHealedToJobId || null,
       stallReason: job.stallReason || null,
+      stallKind: job.stallKind || null,
+      silenceWarning: Boolean(job.silenceWarning),
+      recoveryChainId: job.recoveryChainId || job.id,
+      zeroErrorSilenceKills: job.zeroErrorSilenceKills || 0,
+      autoHealCircuitBroken: Boolean(job.autoHealCircuitBroken),
       lastCheckInAt: job.lastCheckInAt || null,
       checkInCount: job.checkInCount || 0,
       lastCheckInError: job.lastCheckInError || null,
@@ -408,19 +448,26 @@ export class JobManager {
   startJob(options) {
     this._syncFromDisk();
     validateBooleans(options);
+    validateEngineOptions(options);
+    const records = reconcilePersistedJobs(this._localRunningIds);
+    if (options.mode === "resume" || options.parentJobId || options.sessionId) options = resolveResume(options, records);
     if (typeof options.prompt !== "string" || !options.prompt.trim()) throw problem(400, "A prompt is required.");
     options.cwd = workingDirectory(options.cwd);
     options.addDirs = directoryList(options.addDirs || [], options.cwd);
-    reconcilePersistedJobs(this._localRunningIds);
     const settings = loadSettings();
+    const engine = options.executionEngine ?? settings.executionEngine;
+    options = { ...options, sandbox: options.sandbox || (engine === "exec" ? "workspace-write" : settings.sandbox),
+      ephemeral: options.ephemeral ?? settings.ephemeral, transport: options.transport ?? settings.transport,
+      skipGitRepoCheck: options.skipGitRepoCheck ?? settings.skipGitRepoCheck,
+      disableDesktopNotify: options.disableDesktopNotify ?? settings.disableDesktopNotify,
+      tokenBudget: options.tokenBudget ?? settings.tokenBudget, nativeGoalSync: options.nativeGoalSync ?? settings.nativeGoalSync };
+    const prepared = engine === "app_server" ? prepareAppServerTurn(options) : null;
+    const roots = options.sandbox === "workspace-write" ? writableRoots(options.cwd, options.addDirs) : [];
     const timeoutMs = options.timeoutMs === undefined ? settings.taskTimeoutSeconds * 1000 : options.timeoutMs;
-    const stallTimeoutMs =
-      options.stallTimeoutMs !== undefined
-        ? options.stallTimeoutMs
-        : settings.autoHealEnabled && settings.stallThresholdSeconds > 0
-          ? settings.stallThresholdSeconds * 1000
-          : 0;
-    const reconnectStallMs = options.reconnectStallMs;
+    const stallPolicy = options.stallPolicy ?? settings.stallPolicy;
+    const stallTimeoutMs = options.stallTimeoutMs ?? settings.stallThresholdSeconds * 1000;
+    const reconnectStallMs = options.reconnectStallMs ?? settings.reconnectStallSeconds * 1000;
+    const reasoningEffort = effectiveReasoningEffort(options, settings.reasoningEffort);
     const model = workerModel(settings, options.model, options.force_model);
     const mode = options.mode || (options.sessionId ? "resume" : "run");
     const exactSid =
@@ -483,24 +530,38 @@ export class JobManager {
         : "unrouted";
 
     const startedAt = new Date().toISOString();
+    const parent = records.find(record => record.id === options.parentJobId);
+    const recoveryChainId = parent?.recoveryChainId ?? parent?.id ?? crypto.randomUUID();
+    // A manual resume can select an older ancestor. Records are stored newest first.
+    const previousAttempt = parent && (records.find(record => record.recoveryChainId === recoveryChainId) || parent);
     const job = {
       id: jobId,
       parentJobId: options.parentJobId || null,
       lockToken, transferredFrom: options.transferredFrom || null, addDirs: options.addDirs,
       skipGitRepoCheck: options.skipGitRepoCheck ?? settings.skipGitRepoCheck,
       mode,
+      engine, effectiveProvider: engine === "exec" ? effectiveExecProvider(options) : prepared.modelProvider ?? null,
+      activeTurnId: null, canSteer: false, nativeGoal: null, nativeGoalSync: options.nativeGoalSync, tokenBudget: options.tokenBudget,
+      ephemeral: options.ephemeral, writableRoots: roots,
       status: "running",
       cwd: options.cwd ? path.resolve(options.cwd) : process.cwd(),
       model: model || "",
-      reasoningEffort: options.reasoningEffort || "",
+      reasoningEffort,
       sandbox: options.sandbox || "workspace-write",
       goalId: options.goalId || null,
       milestoneId: options.milestoneId || null,
       prompt: options.prompt,
       promptPreview: (options.prompt || "").replace(/\s+/g, " ").slice(0, 160),
       startedAt, lastEventAt: startedAt, timeoutSeconds: timeoutMs / 1000,
+      lastProgressAt: startedAt,
+      recoveryChainId,
+      zeroErrorSilenceKills: previousAttempt?.zeroErrorSilenceKills ?? 0,
+      autoHealCircuitBroken: false,
+      stallKind: null,
+      silenceWarning: false,
       phase: "waiting_api",
       activeCommands: 0,
+      activeTools: 0,
       reconnectCount: 0,
       autoHealCount: Number.isInteger(options.autoHealCount) ? options.autoHealCount : 0,
       autoHealFromJobId: options.autoHealFromJobId || null,
@@ -512,7 +573,7 @@ export class JobManager {
       archived: false, archivedAt: null,
       finishedAt: null,
       pid: null,
-      ownerPid: process.pid,
+      ownerPid: process.pid, ownerId: this.ownerId, steerCount: 0, steerHistory: [],
       sessionId: exactSid || null,
       eventCount: 0,
       recentEvents: [],
@@ -557,13 +618,35 @@ export class JobManager {
     }
 
     let pendingAutoHeal = null;
-    const promise = Promise.resolve().then(() => runCodex({
+    // A panel/MCP process can request cancellation without owning this stdio pipe.
+    // Observe atomic jobs.json replacements so the owner can interrupt a silent turn.
+    const jobsPath = getJobsPath();
+    const checkExternalStop = () => {
+      try {
+        if (readPersistedJobs().some(j => j.id === jobId && ["stopping", "cancelled"].includes(j.status))) abortController.abort();
+      } catch (err) { console.error("[codex-bridge] Cannot read cancellation request:", err.message); }
+    };
+    if (prepared) fs.watchFile(jobsPath, { persistent: false, interval: 350 }, checkExternalStop);
+    const run = prepared ? opts => runAppServerTurn(opts, prepared) : runCodex;
+    let acceptedTurnId = null;
+    const lockSession = sid => {
+      if (!lockedSessionId) {
+        const acq = acquireSessionLock(sid, {
+          jobId, pid: job.pid, ownerPid: process.pid, cwd: job.cwd, processIdentity: job.processIdentity,
+        });
+        if (!acq.acquired) throw new Error("Session already locked");
+        lockedSessionId = sid;
+        job.lockToken = lockToken = acq.ownerToken;
+      }
+      job.sessionId = sid;
+    };
+    const promise = Promise.resolve().then(() => run({
       ...options,
       mode,
       cwd: job.cwd,
       sandbox: job.sandbox, skipGitRepoCheck: job.skipGitRepoCheck,
       sessionId: exactSid || undefined,
-      timeoutMs, stallTimeoutMs, reconnectStallMs, model,
+      timeoutMs, stallPolicy, stallTimeoutMs, reconnectStallMs, reasoningEffort, model,
       transport: options.transport ?? settings.transport,
       disableDesktopNotify: options.disableDesktopNotify ?? settings.disableDesktopNotify,
       signal: abortController.signal,
@@ -576,33 +659,46 @@ export class JobManager {
           if (!updateSessionLockPid(lockedSessionId, lockToken, job.pid, job.processIdentity)) throw new Error("Lost session lock");
         }
         this._persistJob(job);
-        if (reservation) {
-          recordGoalExecution(job.goalId, { reservationId: reservation, milestoneId: job.milestoneId, sessionId: job.sessionId, jobId });
+        if (job.goalId && engine === "exec") {
+          recordGoalExecution(job.goalId, { ...job.callbackTarget, reservationId: reservation, incrementIteration: Boolean(reservation),
+            milestoneId: job.milestoneId, sessionId: job.sessionId, jobId });
           reservation = null;
         }
       },
-      onProgress: ({ eventCount, summary, sessionId, phase, activeCommands, reconnectCount }) => {
-        job.lastEventAt = new Date().toISOString();
-        job.eventCount = eventCount;
-        if (phase) job.phase = phase;
-        if (typeof activeCommands === "number") job.activeCommands = activeCommands;
-        if (typeof reconnectCount === "number") job.reconnectCount = reconnectCount;
+      onThreadReady: ({ sessionId, effectiveProvider }) => {
+        lockSession(sessionId);
+        job.effectiveProvider = effectiveProvider;
+        this._persistJob(job);
+      },
+      onNativeGoal: goal => { job.nativeGoal = goal; this._persistJob(job); },
+      onControlReady: control => {
+        job.control = control;
+        job.consumer = createConsumer(jobId, command => this._consumeSteer(job, command));
+      },
+      onTurnAccepted: ({ turnId }) => {
+        if (acceptedTurnId === turnId) return;
+        if (acceptedTurnId) throw new Error("Unexpected second turn for job " + jobId);
+        if (job.goalId) recordGoalExecution(job.goalId, { ...job.callbackTarget, reservationId: reservation, incrementIteration: Boolean(reservation),
+          milestoneId: job.milestoneId, sessionId: job.sessionId, jobId });
+        reservation = null;
+        acceptedTurnId = job.activeTurnId = turnId;
+        job.canSteer = true;
+        this._persistJob(job);
+      },
+      onProgress: ({ event, eventCount, summary, sessionId, usage, phase, activeCommands, activeTools, reconnectCount, lastProgressAt, silenceWarning, stallKind }) => {
+        const at = new Date().toISOString();
+        if (usage) job.usage = usage;
+        if (event) job.lastEventAt = at;
+        Object.assign(job, { eventCount, phase, activeCommands, activeTools, reconnectCount, lastProgressAt, silenceWarning, stallKind });
         if (sessionId) sessionId = normalizeSessionId(sessionId);
         const gotNewSession = sessionId && sessionId !== job.sessionId;
-        if (sessionId) job.sessionId = sessionId;
-        if (gotNewSession && !lockedSessionId) {
-          const acq = acquireSessionLock(sessionId, {
-            jobId: job.id,
-            pid: job.pid,
-            ownerPid: process.pid,
-            cwd: job.cwd, processIdentity: job.processIdentity,
-          });
-          if (!acq.acquired) throw new Error("Session already locked");
-          lockedSessionId = sessionId;
-          job.lockToken = lockToken = acq.ownerToken;
+        if (gotNewSession) lockSession(sessionId);
+        if (event?.type === "turn/completed") {
+          job.activeTurnId = null;
+          job.canSteer = false;
         }
         job.recentEvents.push({
-          at: job.lastEventAt,
+          at,
           summary,
         });
         if (job.recentEvents.length > 40) {
@@ -624,6 +720,9 @@ export class JobManager {
         job.sessionId = result.sessionId?.toLowerCase() || job.sessionId;
         job.phase = result.ok ? "completed" : result.phase || job.phase;
         job.stallReason = result.stallReason || null;
+        job.stallKind = result.stallKind;
+        job.silenceWarning = result.silenceWarning;
+        job.lastProgressAt = result.lastProgressAt;
         const wasCancelled = job.status === "stopping" || abortController.signal.aborted ||
           readPersistedJobs().some(j => j.id === job.id && ["stopping","cancelled"].includes(j.status));
         job.status = wasCancelled ? "cancelled" : result.ok
@@ -638,6 +737,15 @@ export class JobManager {
         if (result.stalled && result.stallReason) {
           job.error = result.stallReason;
         }
+        if (!wasCancelled && result.stalled && result.stallKind === "zero_error_silence") {
+          job.zeroErrorSilenceKills += 1;
+          if (job.zeroErrorSilenceKills >= 2) {
+            job.autoHealCircuitBroken = true;
+            job.error += " (Auto-heal circuit breaker: repeated zero-error silence kills in this recovery chain. Split the task, switch to reconnect_only, or use the app_server streaming engine.)";
+          }
+        } else {
+          job.zeroErrorSilenceKills = 0;
+        }
         job.finishedAt = new Date().toISOString();
         if (job.status === "cancelled") {
           job.callbackStatus = "skipped";
@@ -647,6 +755,8 @@ export class JobManager {
         const maxHeals = liveSettings.maxAutoHeals ?? 2;
         if (
           !wasCancelled &&
+          !job.ephemeral &&
+          !job.autoHealCircuitBroken &&
           result.stalled &&
           liveSettings.autoHealEnabled &&
           (job.autoHealCount || 0) < maxHeals &&
@@ -658,14 +768,11 @@ export class JobManager {
             maxHeals,
             stallReason: result.stallReason,
             notifyOnComplete: job.notifyOnComplete,
-            stallTimeoutMs,
-            reconnectStallMs,
-            postTurnGraceMs: options.postTurnGraceMs,
           };
           job.notifyOnComplete = false;
           job.callbackStatus = "skipped";
         }
-        if (job.goalId && job.sessionId) {
+        if (engine === "exec" && job.goalId && job.sessionId) {
           recordGoalExecution(job.goalId, {
             milestoneId: job.milestoneId,
             sessionId: job.sessionId,
@@ -674,7 +781,8 @@ export class JobManager {
           });
         }
         appendHistory({
-          mode: job.mode, jobId: job.id, conversationId: callbackTarget?.conversationId || null,
+          mode: job.mode, jobId: job.id, conversationId: callbackTarget?.conversationId || null, projectId: callbackTarget?.projectId || "",
+          engine, effectiveProvider: job.effectiveProvider, writableRoots: roots, ephemeral: job.ephemeral,
           transferredFrom: job.transferredFrom, addDirs: job.addDirs, skipGitRepoCheck: job.skipGitRepoCheck,
           status: job.status,
           model: job.model || "(codex default)",
@@ -699,11 +807,15 @@ export class JobManager {
         }
       })
       .finally(() => {
+        if (prepared) fs.unwatchFile(jobsPath, checkExternalStop);
+        job.activeTurnId = job.control = null;
+        job.canSteer = false;
         job.child = null;
         this._localRunningIds.delete(jobId);
         try {
           this._persistJob(job);
         } finally {
+          job.consumer?.close();
           try { abandonGoalDispatch(job.goalId, reservation); }
           finally {
             try { if (lockedSessionId) releaseSessionLock(lockedSessionId, lockToken); }
@@ -716,9 +828,10 @@ export class JobManager {
                     autoHealFromJobId: job.id,
                     isAutoHeal: true,
                     notifyOnComplete: pendingAutoHeal.notifyOnComplete,
-                    stallTimeoutMs: pendingAutoHeal.stallTimeoutMs,
-                    reconnectStallMs: pendingAutoHeal.reconnectStallMs,
-                    postTurnGraceMs: pendingAutoHeal.postTurnGraceMs,
+                    stallPolicy: options.stallPolicy,
+                    stallTimeoutMs: options.stallTimeoutMs,
+                    reconnectStallMs: options.reconnectStallMs,
+                    postTurnGraceMs: options.postTurnGraceMs,
                   });
                   job.autoHealedToJobId = healed.job.id;
                   this._persistJob(job);
@@ -750,7 +863,7 @@ export class JobManager {
    * - Enforces cross-process per-session mutual exclusion (reuses active job if already running).
    */
   resumeFromJob(oldJobId, overrides = {}) {
-    return this.startJob(resolveResume({ ...overrides, parentJobId: oldJobId }, readPersistedJobs()));
+    return this.startJob({ ...overrides, parentJobId: oldJobId });
   }
 
   async getStatus(jobId, waitSeconds = 0) {
@@ -776,6 +889,79 @@ export class JobManager {
 
     this._syncFromDisk();
     return this.jobs.get(jobId) || job;
+  }
+
+  async steerJob({ jobId, expectedTurnId, message, callerConversationId, conversationId,
+    wait = true, waitSeconds = 12 }) {
+    if (typeof wait !== "boolean" || !Number.isFinite(waitSeconds) || waitSeconds < 0 || waitSeconds > 120 ||
+        (wait && waitSeconds === 0)) throw problem(400, "Invalid steer wait.");
+    if (!validMessage(message)) throw problem(400, "message must contain 1 to 16000 characters.");
+    const requestId = crypto.randomUUID();
+    const receipt = { requestId, jobId };
+    let command, local, localResult;
+    withFileLock(getJobsPath(), () => {
+      const job = readPersistedJobs().find(row => row.id === jobId);
+      if (!job) throw problem(404, "Job not found.");
+      const bound = job.callbackTarget?.conversationId?.toLowerCase();
+      const contexts = [callerConversationId, conversationId].filter(id => id !== undefined && id !== null);
+      if (bound && (!contexts.length || contexts.some(id => typeof id !== "string" || id.toLowerCase() !== bound))) {
+        throw problem(403, "Steer requires the bound conversation.");
+      }
+      if (job.engine !== "app_server" || job.status === "running_detached") {
+        throw problem(409, "Stop the job and continue with codex_start(resume_job_id=" + jobId + ").");
+      }
+      const turn = expectedTurnId === undefined ? job.activeTurnId : expectedTurnId;
+      Object.assign(receipt, { sessionId: job.sessionId, turnId: turn, currentTurnId: job.activeTurnId });
+      if (!steerable(job) || turn !== job.activeTurnId || !isPidAlive(job.ownerPid)) {
+        Object.assign(receipt, { status: "rejected", error: "No matching active turn." });
+        return;
+      }
+      const now = Date.now();
+      command = { requestId, jobId, ownerId: job.ownerId, ownerPid: job.ownerPid, threadId: job.sessionId,
+        expectedTurnId: turn, message, createdAt: new Date(now).toISOString(),
+        expiresAt: new Date(now + (wait ? waitSeconds * 1000 : 12000)).toISOString() };
+      if (this._localRunningIds.has(jobId)) local = this.jobs.get(jobId)?.consumer;
+      localResult = publish(command, wait && local);
+    });
+    if (!command) return receipt;
+    void local?.drain();
+    if (!wait) return { ...receipt, status: "queued" };
+    const result = await waitForAck(command, waitSeconds * 1000, localResult);
+    return { ...receipt, ...result };
+  }
+
+  async _consumeSteer(job, cmd) {
+    const disk = readPersistedJobs().find(row => row.id === job.id);
+    let result;
+    try {
+      if (!disk || !steerable(disk) || !steerable(job) || cmd.ownerId !== this.ownerId ||
+          disk.ownerId !== cmd.ownerId || cmd.jobId !== job.id || cmd.ownerPid !== process.pid ||
+          cmd.threadId !== job.sessionId || cmd.threadId !== disk.sessionId ||
+          cmd.expectedTurnId !== disk.activeTurnId || cmd.expectedTurnId !== job.activeTurnId ||
+          !(Date.parse(cmd.createdAt) <= Date.now() && Date.parse(cmd.expiresAt) > Date.now()) || !validMessage(cmd.message)) {
+        throw new Error("Expired command, changed owner or no matching active turn.");
+      }
+      const lease = readJson(getSessionLockPath(cmd.threadId), null, value => Boolean(value));
+      if (!lease || lease.ownerToken !== job.lockToken || lease.jobId !== job.id) throw new Error("Lost session ownership.");
+      const ack = await job.control.sendSteer(cmd.expectedTurnId, cmd.message);
+      if (ack?.turnId !== cmd.expectedTurnId) throw new Error("Codex acknowledged a different turn.");
+      result = { status: "accepted", turnId: ack.turnId };
+    } catch (err) {
+      result = { status: "rejected", error: err.message, currentTurnId: job.activeTurnId };
+    }
+    result.at = new Date().toISOString();
+    const event = { requestId: cmd.requestId, at: result.at, turnId: cmd.expectedTurnId,
+      status: result.status, preview: typeof cmd.message === "string" ? cmd.message.slice(0, 160) : "" };
+    if (cmd.ownerId === this.ownerId && disk?.ownerId === this.ownerId) {
+      mutateJob(job.id, row => {
+        if (row.ownerId !== this.ownerId) return;
+        if (result.status === "accepted") row.steerCount++;
+        row.steerHistory = [...row.steerHistory, event].slice(-20);
+        job.steerCount = row.steerCount;
+        job.steerHistory = row.steerHistory;
+      });
+    }
+    return result;
   }
 
   async stopJob(jobId) {
@@ -805,12 +991,21 @@ export class JobManager {
         if (!stopped) return { found: true, cancelled: false, error: "Process termination has not been confirmed." };
       } finally { clearTimeout(timer); }
     } else {
+      if (job.engine === "app_server" && isPidAlive(job.ownerPid)) {
+        for (let i = 0; i < 35; i++) {
+          await new Promise(resolve => setTimeout(resolve, 100));
+          const ended = readPersistedJobs().find(j => j.id === jobId)?.status === "cancelled";
+          if (ended && !isPidAlive(job.pid)) return { found: true, cancelled: true, pid: job.pid };
+        }
+      }
       if (isPidAlive(job.pid) && !killPidTree(job.pid, job.processIdentity)) {
         return { found: true, cancelled: false, error: "Unable to confirm process tree termination." };
       }
       for (let i = 0; i < 30 && isPidAlive(job.pid); i++) await new Promise(resolve => setTimeout(resolve, 100));
       if (isPidAlive(job.pid)) return { found: true, cancelled: false, error: "Process still running." };
       job.status = "cancelled";
+      job.canSteer = false;
+      job.activeTurnId = null;
       job.finishedAt = new Date().toISOString();
       this._persistJob(job);
       if (job.sessionId) releaseSessionLock(job.sessionId, job.lockToken);
@@ -849,10 +1044,13 @@ export class JobManager {
   }
 
   formatJobStatus(job) {
+    const steering = [`Engine: ${job.engine || "exec"}`, `Active Turn: ${job.activeTurnId || "(none)"}`,
+      `Can Steer: ${steerable(job)}`, `Steer Count: ${job.steerCount || 0}`];
     const timeout = "Task Timeout: " + (job.timeoutSeconds === 0 ? "unlimited" :
       job.timeoutSeconds === undefined ? "(unrecorded)" : job.timeoutSeconds + "s");
     if (job.result) {
-      const extra = [timeout];
+      const extra = [timeout, ...steering];
+      if (job.autoHealCircuitBroken) extra.push(job.error);
       if (job.parentJobId) extra.push(`Parent Job: ${job.parentJobId}`);
       if (job.goalId) {
         extra.push(
@@ -869,7 +1067,7 @@ export class JobManager {
       `Job ID: ${job.id}`,
       `Status: ${job.status}`,
       `Phase: ${job.phase || "waiting_api"}${job.reconnectCount ? ` (reconnects=${job.reconnectCount})` : ""}`,
-      timeout,
+      timeout, ...steering,
       `Mode: ${job.mode}`,
       `Session ID: ${job.sessionId || "(none)"}`,
       `Working Dir: ${job.cwd}`,

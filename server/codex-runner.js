@@ -5,6 +5,7 @@ import path from "node:path";
 import os from "node:os";
 
 import { normalizeSessionId } from "./session-lock.js";
+import { readCodexTomlDefaults } from "./settings-store.js";
 import { isPidAlive, matchesProcess, processIdentity, windowsPowerShell } from "./process-identity.js";
 
 const IS_WINDOWS = process.platform === "win32";
@@ -99,7 +100,7 @@ export function resolveCodexBinary(refresh = false) {
   return found || null;
 }
 
-function executable(file, args) {
+export function executable(file, args) {
   return /\.[cm]?js$/i.test(file) ? [process.execPath, [file, ...args]] : [file, args];
 }
 
@@ -159,6 +160,34 @@ export function killProcessTree(child) {
   }
 }
 
+const effortConfigKey = /^\s*model_reasoning_effort\s*=/;
+
+export function effectiveExecProvider(options) {
+  if (options.modelProvider) return options.modelProvider;
+  if (options.transport === "websocket") return "openai";
+  if (options.transport === "http") return "openai_http";
+  if (Array.isArray(options.config)) {
+    for (const value of [...options.config].reverse()) {
+      const match = typeof value === "string" && /^\s*model_provider\s*=\s*["']?([\w.-]+)["']?\s*$/.exec(value);
+      if (match) return match[1];
+    }
+  }
+  return options.profile ? null : readCodexTomlDefaults().modelProvider;
+}
+
+export function effectiveReasoningEffort(options, fallback = "") {
+  // Codex applies the last explicit -c assignment ahead of bridge preferences.
+  if (Array.isArray(options.config)) {
+    for (let i = options.config.length - 1; i >= 0; i--) {
+      const entry = options.config[i];
+      if (typeof entry === "string" && effortConfigKey.test(entry)) {
+        return entry.replace(effortConfigKey, "").trim().replace(/^["']|["']$/g, "");
+      }
+    }
+  }
+  return options.reasoningEffort || fallback;
+}
+
 function appendCommonConfigArgs(args, opts, { allowProfile = true } = {}) {
   if (opts.model) {
     args.push("-m", String(opts.model));
@@ -167,8 +196,8 @@ function appendCommonConfigArgs(args, opts, { allowProfile = true } = {}) {
     args.push("-p", String(opts.profile));
   }
   const configList = Array.isArray(opts.config) ? [...opts.config] : [];
-  const provider = { websocket: "openai", http: "openai_http" }[opts.transport];
-  if (provider) configList.push(`model_provider="${provider}"`);
+  const provider = opts.modelProvider || { websocket: "openai", http: "openai_http" }[opts.transport];
+  if (provider) configList.push("model_provider=" + JSON.stringify(provider));
   if (opts.disableDesktopNotify !== false && !configList.some(kv => typeof kv === "string" && /^\s*notify\s*=/.test(kv))) {
     configList.push("notify=[]");
   }
@@ -176,7 +205,7 @@ function appendCommonConfigArgs(args, opts, { allowProfile = true } = {}) {
     opts.reasoningEffort &&
     !configList.some(
       (kv) =>
-        typeof kv === "string" && kv.trim().startsWith("model_reasoning_effort=")
+        typeof kv === "string" && effortConfigKey.test(kv)
     )
   ) {
     configList.push(
@@ -337,6 +366,72 @@ function summarizeEvent(evt) {
 
 const RECOVERABLE_ERROR_RE =
   /reconnecting|stream disconnected|retrying|temporarily unavailable|connection reset|econnreset/i;
+const RECONNECT_ERROR_RE = /reconnecting|stream disconnected|connection reset|econnreset/i;
+const LONG_TOOL_TYPES = new Set(["web_search", "mcp_tool_call", "tool_call", "file_search", "code_interpreter"]);
+
+export function effortSilenceMultiplier(effort) {
+  switch (effort) {
+    case "low":
+    case "medium": return 1;
+    case "xhigh": return 3;
+    case "max":
+    case "ultra": return 5;
+    default: return 2; // high or inherited/unknown effort
+  }
+}
+
+// A replayed start (even after completion) must never create a phantom active item.
+export function activityTracker() {
+  const active = new Set();
+  const completed = new Set();
+  const anonymous = new Map();
+  return (item, started) => {
+    if (item.id == null || item.id === "") {
+      const count = anonymous.get(item.type) || 0;
+      anonymous.set(item.type, Math.max(0, count + (started ? 1 : -1)));
+    } else if (!started) {
+      active.delete(item.id);
+      completed.add(item.id);
+    } else if (!completed.has(item.id)) {
+      active.add(item.id);
+    }
+    let count = active.size;
+    for (const value of anonymous.values()) count += value;
+    return count;
+  };
+}
+
+export function startStallWatchdog(state, { stallPolicy = "reconnect_only", stallTimeoutMs = 0, reconnectStallMs = 0, reasoningEffort }, notifyProgress, terminate, inactive) {
+  const effectiveSilenceMs = stallTimeoutMs * effortSilenceMultiplier(reasoningEffort);
+  if (stallPolicy === "off" || !(reconnectStallMs > 0 || stallTimeoutMs > 0)) return null;
+  const shortest = Math.min(...[stallTimeoutMs, reconnectStallMs].filter(ms => ms > 0));
+  const checkEvery = Math.min(5000, Math.max(40, Math.floor(shortest / 4)));
+  const stallTimer = setInterval(() => {
+    if (state.turnCompleted || state.cancelled || state.timedOut || state.stalled || inactive()) return;
+    if (state.activeCommands > 0 || state.activeTools > 0) return;
+    const now = Date.now();
+    const silentMs = now - state.lastEventMs;
+    if (state.phase === "reconnecting" && reconnectStallMs > 0 && now - state.reconnectingSince >= reconnectStallMs) {
+      state.stallKind = "reconnect";
+      state.stallReason = `Stuck reconnecting for ${Math.round((now - state.reconnectingSince) / 1000)}s (${state.reconnectCount} retries)`;
+    } else if (state.phase === "waiting_api" && stallPolicy === "always" && effectiveSilenceMs > 0 && silentMs >= effectiveSilenceMs) {
+      state.stallKind = "zero_error_silence";
+      state.stallReason = `Upstream API silent for ${Math.round(silentMs / 1000)}s while waiting for response`;
+    } else {
+      if (state.phase === "waiting_api" && stallPolicy === "reconnect_only" && stallTimeoutMs > 0 && silentMs >= stallTimeoutMs && !state.silenceWarning) {
+        state.silenceWarning = true;
+        notifyProgress("Silence warning while waiting for API response");
+      }
+      return;
+    }
+    state.stalled = true;
+    state.errors.push(state.stallReason);
+    notifyProgress(state.stallReason);
+    terminate();
+  }, checkEvery);
+  stallTimer.unref();
+  return stallTimer;
+}
 
 export function evaluateRunOutcome({
   exitCode,
@@ -402,12 +497,8 @@ export function runCodex(options) {
   const timeoutMs = options.timeoutMs === undefined ? 600_000 : options.timeoutMs;
   const graceMs = options.postTurnGraceMs ?? 5000;
   const stallTimeoutMs = typeof options.stallTimeoutMs === "number" && options.stallTimeoutMs > 0 ? options.stallTimeoutMs : 0;
-  const reconnectStallMs =
-    typeof options.reconnectStallMs === "number" && options.reconnectStallMs > 0
-      ? options.reconnectStallMs
-      : stallTimeoutMs > 0
-        ? Math.min(90_000, stallTimeoutMs)
-        : 0;
+  const reconnectStallMs = options.reconnectStallMs ?? 0;
+  const stallPolicy = options.stallPolicy ?? "reconnect_only";
 
   return new Promise((resolve, reject) => {
     const startedAt = Date.now();
@@ -429,15 +520,21 @@ export function runCodex(options) {
       stderr: "",
       timedOut: false,
       stalled: false,
+      stallKind: null,
       stallReason: null,
+      silenceWarning: false,
+      lastProgressAt: new Date(startedAt).toISOString(),
       cancelled: false,
       phase: "waiting_api",
       activeCommands: 0,
+      activeTools: 0,
       reconnectCount: 0,
       reconnectingSince: null,
       lastEventMs: startedAt,
     };
 
+    let trackCommand = activityTracker();
+    let trackTool = activityTracker();
     let stdoutBuffer = "";
     let totalBytes = 0;
     let protocolFailure = null;
@@ -473,6 +570,27 @@ export function runCodex(options) {
       }
     };
 
+    function watchdogState() {
+      return {
+        phase: state.phase,
+        activeCommands: state.activeCommands,
+        activeTools: state.activeTools,
+        reconnectCount: state.reconnectCount,
+        reconnectingSince: state.reconnectingSince,
+        lastProgressAt: state.lastProgressAt,
+        stallKind: state.stallKind,
+        silenceWarning: state.silenceWarning,
+      };
+    }
+
+    function notifyProgress(summary, event) {
+      pushRecentEvent(summary);
+      try {
+        options.onProgress?.({ eventCount: state.eventCount, sessionId: state.sessionId,
+          summary, event, ...watchdogState() });
+      } catch (err) { failStream("Progress bookkeeping failed: " + err.message); }
+    }
+
     const handleLine = (line) => {
       const trimmed = line.trim();
       if (!trimmed) return;
@@ -499,22 +617,28 @@ export function runCodex(options) {
       state.eventCount += 1;
       state.lastEventMs = Date.now();
 
+      const itemEvent = (evt.type === "item.started" || evt.type === "item.completed") && evt.item;
+      if (itemEvent || evt.type === "turn.completed") {
+        state.lastProgressAt = new Date(state.lastEventMs).toISOString();
+        state.silenceWarning = false;
+        state.reconnectingSince = null;
+        state.reconnectCount = 0;
+      }
+      if (itemEvent) {
+        const started = evt.type === "item.started";
+        if (evt.item.type === "command_execution") state.activeCommands = trackCommand(evt.item, started);
+        if (LONG_TOOL_TYPES.has(evt.item.type)) state.activeTools = trackTool(evt.item, started);
+      }
       if (evt.type === "thread.started") {
         const sid = normalizeSessionId(evt.thread_id);
         if (options.mode === "resume" && sid !== normalizeSessionId(options.sessionId)) return failStream("Unexpected resumed session UUID");
         state.sessionId = sid;
-        state.phase = state.activeCommands > 0 ? "running_cmd" : "waiting_api";
-        state.reconnectingSince = null;
-        state.reconnectCount = 0;
-      } else if (evt.type === "turn.started") {
-        state.phase = state.activeCommands > 0 ? "running_cmd" : "waiting_api";
-        state.reconnectingSince = null;
-        state.reconnectCount = 0;
       } else if (evt.type === "turn.completed") {
         state.turnCompleted = true;
         state.activeCommands = 0;
-        state.phase = "completed";
-        state.reconnectingSince = null;
+        state.activeTools = 0;
+        trackCommand = activityTracker();
+        trackTool = activityTracker();
         clearTimeout(graceTimer);
         if (graceMs > 0) {
           clearTimeout(timer);
@@ -536,29 +660,18 @@ export function runCodex(options) {
           evt.error?.message || evt.message || JSON.stringify(evt);
         if (RECOVERABLE_ERROR_RE.test(msg)) {
           state.warnings.push(msg);
-          state.reconnectCount += 1;
-          if (!state.reconnectingSince) state.reconnectingSince = state.lastEventMs;
-          if (state.activeCommands === 0) state.phase = "reconnecting";
+          if (RECONNECT_ERROR_RE.test(msg)) {
+            state.reconnectCount += 1;
+            state.reconnectingSince ??= state.lastEventMs;
+          }
         } else {
           state.errors.push(msg);
         }
-      } else if (evt.type === "item.started" && evt.item) {
-        state.reconnectingSince = null;
-        state.reconnectCount = 0;
-        if (evt.item.type === "command_execution") {
-          state.activeCommands += 1;
-          state.phase = "running_cmd";
-        } else {
-          state.phase = state.activeCommands > 0 ? "running_cmd" : "waiting_api";
-        }
       } else if (evt.type === "item.completed" && evt.item) {
-        state.reconnectingSince = null;
-        state.reconnectCount = 0;
         const item = evt.item;
         if (item.type === "agent_message" && typeof item.text === "string") {
           state.messages.push(item.text);
         } else if (item.type === "command_execution") {
-          state.activeCommands = Math.max(0, state.activeCommands - 1);
           state.commands.push({
             command: item.command || "",
             exitCode: item.exit_code ?? null,
@@ -576,26 +689,13 @@ export function runCodex(options) {
             });
           }
         }
-        state.phase = state.activeCommands > 0 ? "running_cmd" : "waiting_api";
       }
 
-      const summary = summarizeEvent(evt);
-      pushRecentEvent(summary);
-
-      if (typeof options.onProgress === "function") {
-        try {
-          options.onProgress({
-            eventCount: state.eventCount,
-            summary: summary || evt.type || "event",
-            event: evt,
-            sessionId: state.sessionId,
-            phase: state.phase,
-            activeCommands: state.activeCommands,
-            reconnectCount: state.reconnectCount,
-            reconnectingSince: state.reconnectingSince,
-          });
-        } catch (err) { failStream("Progress bookkeeping failed: " + err.message); }
-      }
+      if (state.turnCompleted) state.phase = "completed";
+      else if (state.activeCommands > 0) state.phase = "running_cmd";
+      else if (state.activeTools > 0) state.phase = "running_tool";
+      else state.phase = state.reconnectingSince !== null ? "reconnecting" : "waiting_api";
+      notifyProgress(summarizeEvent(evt) || evt.type, evt);
     };
 
     child.stdout.setEncoding("utf8");
@@ -641,26 +741,8 @@ export function runCodex(options) {
     }
     startTaskTimer();
 
-    if (stallTimeoutMs > 0) {
-      const checkEvery = Math.min(5000, Math.max(40, Math.floor(Math.min(stallTimeoutMs, reconnectStallMs || stallTimeoutMs) / 4)));
-      stallTimer = setInterval(() => {
-        if (state.turnCompleted || state.cancelled || state.timedOut || state.stalled || protocolFailure) return;
-        if (state.phase === "running_cmd" || state.activeCommands > 0) return;
-        const now = Date.now();
-        if (state.phase === "reconnecting" && state.reconnectingSince && reconnectStallMs > 0 && now - state.reconnectingSince >= reconnectStallMs) {
-          state.stalled = true;
-          state.stallReason = `Stuck reconnecting for ${Math.round((now - state.reconnectingSince) / 1000)}s (${state.reconnectCount} retries)`;
-          state.errors.push(state.stallReason);
-          terminate();
-        } else if (state.phase === "waiting_api" && now - state.lastEventMs >= stallTimeoutMs) {
-          state.stalled = true;
-          state.stallReason = `Upstream API silent for ${Math.round((now - state.lastEventMs) / 1000)}s while waiting for response`;
-          state.errors.push(state.stallReason);
-          terminate();
-        }
-      }, checkEvery);
-      stallTimer.unref();
-    }
+    stallTimer = startStallWatchdog(state, { stallPolicy, stallTimeoutMs, reconnectStallMs, reasoningEffort: effectiveReasoningEffort(options) },
+      notifyProgress, terminate, () => protocolFailure);
 
     const onAbort = () => {
       state.cancelled = true;
@@ -740,8 +822,7 @@ export function runCodex(options) {
         timedOut: state.timedOut,
         stalled: state.stalled,
         stallReason: state.stallReason,
-        phase: state.phase,
-        reconnectCount: state.reconnectCount,
+        ...watchdogState(),
         cancelled: state.cancelled,
         eventCount: state.eventCount,
         recentEvents: state.recentEvents,

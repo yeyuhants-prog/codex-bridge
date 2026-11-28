@@ -1,3 +1,4 @@
+import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
@@ -85,9 +86,8 @@ async function main() {
     const toolsRes = await client.request("tools/list");
     const toolNames = toolsRes.tools.map((t) => t.name);
     console.log("2) tools/list OK:", toolNames.join(", "));
-    if (toolNames.length !== 9) {
-      throw new Error(`Expected 9 tools, got ${toolNames.length}`);
-    }
+    assert.deepEqual(toolNames.sort(), ["codex_run", "codex_resume", "codex_review", "codex_start",
+      "codex_status", "codex_cancel", "codex_goal", "codex_config", "codex_info", "codex_steer"].sort());
 
     const infoRes = await client.request("tools/call", {
       name: "codex_info",

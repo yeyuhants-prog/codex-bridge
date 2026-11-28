@@ -242,10 +242,47 @@ h1 {
   font-variant-numeric: tabular-nums;
 }
 
+.tab-badge.run { margin-left: 4px; }
+.tab-badge.external {
+  background: rgba(148, 163, 218, 0.12);
+  color: var(--cb-muted);
+}
+
+.panel-notice {
+  display: grid;
+  justify-items: start;
+  gap: 6px;
+  margin: 8px 0;
+  padding: 9px 11px;
+  border-left: 3px solid var(--cb-sky);
+  border-radius: 5px;
+  background: var(--cb-sky-soft);
+  overflow-wrap: anywhere;
+}
+
+.task-card.locate-highlight {
+  outline: 2px solid var(--cb-sky);
+  outline-offset: -2px;
+  background-color: var(--cb-sky-soft);
+}
+
+.clipboard-field { position: fixed; inset: 0 auto auto 0; opacity: 0; pointer-events: none; }
+.steer-control { display: flex; gap: 6px; }
+.steer-input {
+  min-width: 0;
+  flex: 1;
+  border: 1px solid var(--cb-border-strong);
+  border-radius: 6px;
+  padding: 4px 8px;
+  color: var(--cb-fg);
+  background: var(--cb-inset);
+}
+.chip.engine-live { color: var(--cb-sky); border-color: var(--cb-sky); }
+
 .tab-badge.local {
-  background: linear-gradient(135deg, #8b5cf6, #38bdf8);
+  background: #0369a1;
   color: #ffffff;
-  box-shadow: 0 0 10px rgba(139, 92, 246, 0.45);
+  box-shadow: 0 0 8px rgba(56, 189, 248, 0.4);
 }
 
 .hero-actions {

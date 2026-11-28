@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { once } from "node:events";
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import fs from "node:fs";
@@ -34,7 +35,9 @@ afterEach(() => {
 test("v1.7 settings validate watchdog, auto-heal, and periodic inspection bounds", () => {
   const defaults = loadSettings();
   assert.equal(defaults.autoHealEnabled, true);
-  assert.equal(defaults.stallThresholdSeconds, 240);
+  assert.equal(defaults.stallThresholdSeconds, 300);
+  assert.equal(defaults.stallPolicy, "reconnect_only");
+  assert.equal(defaults.reconnectStallSeconds, 150);
   assert.equal(defaults.maxAutoHeals, 2);
   assert.equal(defaults.monitorIntervalSeconds, 300);
 
@@ -47,10 +50,11 @@ test("v1.7 settings validate watchdog, auto-heal, and periodic inspection bounds
   }
   assert.equal(saveSettings({ autoHealEnabled: false }).autoHealEnabled, false);
 
-  for (const bad of [-1, 59, 1801, 60.5, "240", null]) {
+  for (const bad of [-1, 59, 3601, 60.5, "240", null]) {
     assert.throws(() => saveSettings({ stallThresholdSeconds: bad }), { status: 400 });
     assert.throws(() => saveSettings({ monitorIntervalSeconds: bad }), { status: 400 });
   }
+  assert.throws(() => saveSettings({ monitorIntervalSeconds: 1801 }), { status: 400 });
   for (const bad of [-1, 6, 1.5, "2", null]) {
     assert.throws(() => saveSettings({ maxAutoHeals: bad }), { status: 400 });
   }
@@ -59,7 +63,7 @@ test("v1.7 settings validate watchdog, auto-heal, and periodic inspection bounds
   writeJsonAtomic(getSettingsPath(), { autoHealEnabled: "bad", stallThresholdSeconds: 12, maxAutoHeals: 99, monitorIntervalSeconds: -5 });
   const migrated = loadSettings();
   assert.equal(migrated.autoHealEnabled, true);
-  assert.equal(migrated.stallThresholdSeconds, 240);
+  assert.equal(migrated.stallThresholdSeconds, 300);
   assert.equal(migrated.maxAutoHeals, 2);
   assert.equal(migrated.monitorIntervalSeconds, 300);
 });
@@ -71,7 +75,7 @@ test("L1 watchdog kills waiting_api silence and stuck reconnecting, but NEVER ki
     console.log(JSON.stringify({ type: "turn.started" }));
     setInterval(() => {}, 30000);
   `);
-  const apiStall = await runCodex({ mode: "run", cwd: dir, timeoutMs: 5000, stallTimeoutMs: 220, postTurnGraceMs: 0 });
+  const apiStall = await runCodex({ mode: "run", cwd: dir, timeoutMs: 5000, stallPolicy: "always", stallTimeoutMs: 220, postTurnGraceMs: 0 });
   assert.equal(apiStall.ok, false);
   assert.equal(apiStall.stalled, true);
   assert.match(apiStall.stallReason, /Upstream API silent/);
@@ -97,14 +101,14 @@ test("L1 watchdog kills waiting_api silence and stuck reconnecting, but NEVER ki
       console.log(JSON.stringify({ type: "item.completed", item: { type: "command_execution", command: "gradle assembleDebug", exit_code: 0 } }));
       console.log(JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: "BUILD_OK" } }));
       console.log(JSON.stringify({ type: "turn.completed" }));
-    }, 550);
+    }, 1800);
   `);
   const phases = [];
   const cmdOk = await runCodex({
-    mode: "run", cwd: dir, timeoutMs: 5000, stallTimeoutMs: 180, postTurnGraceMs: 0,
+    mode: "run", cwd: dir, timeoutMs: 5000, stallPolicy: "always", reasoningEffort: "low", stallTimeoutMs: 600, postTurnGraceMs: 0,
     onProgress: ({ phase }) => phases.push(phase),
   });
-  assert.equal(cmdOk.ok, true);
+  assert.equal(cmdOk.ok, true, JSON.stringify(cmdOk));
   assert.equal(cmdOk.stalled, false);
   assert.equal(cmdOk.lastMessage, "BUILD_OK");
   assert.ok(phases.includes("running_cmd"));
@@ -131,7 +135,7 @@ test("JobManager auto-heals a stalled job cleanly via resume_job_id without burn
     }
   `);
 
-  saveSettings({ autoHealEnabled: true, stallThresholdSeconds: 60, maxAutoHeals: 2, progressionMode: "notify" });
+  saveSettings({ autoHealEnabled: true, stallPolicy: "always", stallThresholdSeconds: 60, maxAutoHeals: 2, progressionMode: "notify" });
   const goal = createGoal({ title: "Resilient goal", cwd: dir, milestones: [{ id: "m1", title: "Step 1" }] });
   const manager = new JobManager();
   const convId = "11111111-1111-4111-8111-111111111111";
@@ -172,6 +176,7 @@ test("JobManager auto-heals a stalled job cleanly via resume_job_id without burn
   assert.equal(healedJob.autoHealFromJobId, first.id);
   assert.equal(healedJob.callbackStatus, "pending");
   assert.equal(healedJob.callbackTarget?.conversationId, convId);
+  assert.deepEqual([getGoal(goal.id).conversationId, getGoal(goal.id).projectId], [convId, "proj-1"]);
   assert.match(healedJob.resultSummary.lastMessage, /HEALED:\[Auto-Heal Resume #1\/2\]/);
   // Auto-heal must NOT burn an extra goal iteration
   assert.equal(getGoal(goal.id).iterationCount, 1);
@@ -200,19 +205,26 @@ test("MCP codex_config and codex_info expose v1.7 watchdog & periodic inspection
     await client.init();
     const res = await client.callTool("codex_config", {
       auto_heal_enabled: true,
-      stall_threshold_seconds: 180,
+      stall_policy: "always",
+      reconnect_stall_seconds: 75,
+      stall_threshold_seconds: 3600,
       max_auto_heals: 3,
       monitor_interval_seconds: 240,
       list_models: false,
     });
     assert.notEqual(res.isError, true, res.content[0].text);
-    assert.match(res.content[0].text, /Auto-Heal Watchdog: on \(stall=180s, maxHeals=3\)/);
+    assert.match(res.content[0].text, /L1 Watchdog: policy=always, silence=3600s, reconnect=75s/);
+    assert.match(res.content[0].text, /Auto-Heal: on \(maxHeals=3\)/);
     assert.match(res.content[0].text, /Periodic Inspection: 240s/);
 
     const info = await client.callTool("codex_info", {});
-    assert.match(info.content[0].text, /v1\.7\.0/);
-    assert.match(info.content[0].text, /Auto-Heal Watchdog: on \(stall=180s, maxHeals=3\)/);
+    assert.match(info.content[0].text, /v1\.8\.0/);
+    assert.match(info.content[0].text, /L1 Watchdog: policy=always, silence=3600s, reconnect=75s/);
+    assert.match(info.content[0].text, /Auto-Heal: on \(maxHeals=3\)/);
     assert.match(info.content[0].text, /Periodic Inspection: 240s/);
+    for (const args of [{ stall_policy: "invalid" }, { reconnect_stall_seconds: 59 }, { stall_threshold_seconds: 3601 }]) {
+      assert.equal((await client.callTool("codex_config", args)).isError, true);
+    }
   } finally {
     client.close();
   }
@@ -303,7 +315,8 @@ test("Sidecar periodic inspection delivers heartbeat strictly to locked conversa
     while (Date.now() < deadline) {
       if (fs.existsSync(logFile)) {
         sent = fs.readFileSync(logFile, "utf8").trim().split(/\r?\n/).filter(Boolean).map(l => JSON.parse(l)).filter(e => e.cmd === "send-message");
-        if (sent.length >= 1) break;
+        // The mock logs send-message before the sidecar receives its acknowledgement.
+        if (sent.length >= 1 && readPersistedJobs().find(j => j.id === "codex_periodic_1")?.checkInCount >= 1) break;
       }
       await new Promise(r => setTimeout(r, 80));
     }
@@ -320,8 +333,25 @@ test("Sidecar periodic inspection delivers heartbeat strictly to locked conversa
     await new Promise(r => setTimeout(r, 500));
     const sentAfter = fs.readFileSync(logFile, "utf8").trim().split(/\r?\n/).filter(Boolean).map(l => JSON.parse(l)).filter(e => e.cmd === "send-message");
     assert.equal(sentAfter.length, 1);
+
+    const postSettings = (data) => fetch(`http://127.0.0.1:${port}/api/settings`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Sidecar-Token": "v17-test-token" },
+      body: JSON.stringify(data),
+    });
+    const saved = await postSettings({ stallPolicy: "off", reconnectStallSeconds: 1800 });
+    assert.equal(saved.status, 200);
+    const { settings } = await saved.json();
+    assert.equal(settings.stallPolicy, "off");
+    assert.equal(settings.reconnectStallSeconds, 1800);
+    assert.equal((await postSettings({ stallPolicy: "invalid" })).status, 400);
+    assert.equal((await postSettings({ reconnectStallSeconds: 1801 })).status, 400);
   } finally {
-    try { sidecar.kill(); } catch {}
+    if (sidecar.exitCode === null && sidecar.signalCode === null) {
+      const closed = once(sidecar, "close");
+      sidecar.kill();
+      await closed;
+    }
   }
 
   // Direct unit check on finishPeriodicCheckIn lease ownership

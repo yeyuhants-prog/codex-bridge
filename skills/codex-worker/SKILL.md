@@ -32,7 +32,8 @@ work as a complementary pair controlled from `[Codex Bridge](sidecar://codex-bri
      for confirmation before dispatching.
 
 2. **Dispatch Executable Spec to Codex**
-   - Write a crystal-clear prompt specifying:
+   - For creative and design tasks give core facts, audience and acceptance criteria. Leave room for the worker to choose the composition and approach.
+   - For engineering debugging and data pipelines specify:
      - **Objective** & **Target files / `cwd`**
      - **Constraints & edge cases** (what NOT to touch, schemas, units)
      - **Verification commands** Codex must run before finishing
@@ -47,7 +48,9 @@ work as a complementary pair controlled from `[Codex Bridge](sidecar://codex-bri
    - Keep the Mastermind context clean by delegating the check to a read-only lightweight subagent:
      `invoke_subagent(TypeName="research", Model="flash_lite", Role="Codex Progress Monitor", Prompt="...")`
    - Ask the monitor to inspect recent events and workspace state (`cwd`) and return a `<= 5`-line verdict: healthy progress, retry/error loop, scope drift, or work already finished while stalled on reporting.
-   - Note that the L1 Watchdog in the bridge already distinguishes `running_cmd` (protected) vs `waiting_api` / `reconnecting` and automatically resumes stalled API streams up to `max_auto_heals` times before escalating.
+   - L1 defaults to `reconnect_only`. Silent reasoning generates a warning. Stuck reconnects can trigger recovery. The `always` policy also stops prolonged silence, and `off` disables both checks.
+   - If the inspection finds drift and `canSteer` is true, prefer `codex_steer(job_id=..., expected_turn_id=..., message=...)`. On a queued or unknown receipt, inspect the turn, steer count and recent progress via `codex_status`. If delivery remains uncertain, report it and take over the next decision. For severe drift or unavailable steering, cancel, confirm termination and resume by job ID.
+   - On a token-budget stop Gemini takes over. Verify completed work and report remaining scope and usage. Agree the budget for the next turn before restarting.
 
 4. **Receive `[Codex Bridge Auto-Callback]` & Steer**
    - When Codex finishes, the Sidecar validates the locked `conversation_id` via
