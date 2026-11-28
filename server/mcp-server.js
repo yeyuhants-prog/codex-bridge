@@ -5,8 +5,8 @@ import {
   runCodex,
   formatCodexResult,
 } from "./codex-runner.js";
-import { validateBooleans } from "./validation.js";
-import { workingDirectory, resolveResume } from "./run-policy.js";
+import { problem, validateBooleans } from "./validation.js";
+import { workingDirectory, resolveResume, workerModel } from "./run-policy.js";
 import { processIdentity } from "./process-identity.js";
 import { JobManager, normalizeCallbackTarget, readPersistedJobs, reconcilePersistedJobs } from "./job-manager.js";
 import {
@@ -25,7 +25,7 @@ import {
   addMilestone,
   updateMilestone,
   recordGoalExecution, reserveGoalDispatch, abandonGoalDispatch,
-  deleteGoal,
+  archiveGoal, archiveCompletedGoals, deleteGoal,
   formatGoalSummary,
 } from "./goal-store.js";
 import {
@@ -36,7 +36,7 @@ import {
 
 const SERVER_INFO = {
   name: "codex-mcp-bridge",
-  version: "1.5.0",
+  version: "1.7.0",
 };
 
 const SUPPORTED_PROTOCOL_VERSIONS = [
@@ -128,6 +128,8 @@ function extractTrustedHostCallbackTarget(meta = {}, args = {}) {
 }
 
 const COMMON_RUN_PROPERTIES = {
+  force_model: { type: "boolean", description: "Explicitly override the pinned worker model for this call." },
+  timeout_seconds: { type: "number", minimum: 0, description: "Turn timeout in seconds. Use 0 for unlimited or omit to use the panel setting." },
   cwd: {
     type: "string",
     description:
@@ -216,11 +218,6 @@ const TOOLS = [
             "Clear, detailed task instructions for Codex (supports multiline text and Chinese/English).",
         },
         ...COMMON_RUN_PROPERTIES,
-        timeout_seconds: {
-          type: "number",
-          default: 600,
-          description: "Maximum seconds to wait before aborting (default 600).",
-        },
       },
       required: ["prompt"],
     },
@@ -260,17 +257,14 @@ const TOOLS = [
             "Must be true to widen sandbox permissions relative to the original job (narrowing is always allowed).",
         },
         model: COMMON_RUN_PROPERTIES.model,
+        force_model: COMMON_RUN_PROPERTIES.force_model,
         reasoning_effort: COMMON_RUN_PROPERTIES.reasoning_effort,
         goal_id: COMMON_RUN_PROPERTIES.goal_id,
         milestone_id: COMMON_RUN_PROPERTIES.milestone_id,
         images: COMMON_RUN_PROPERTIES.images,
         config: COMMON_RUN_PROPERTIES.config,
         skip_git_repo_check: COMMON_RUN_PROPERTIES.skip_git_repo_check,
-        timeout_seconds: {
-          type: "number",
-          default: 600,
-          description: "Maximum seconds to wait before aborting (default 600).",
-        },
+        timeout_seconds: COMMON_RUN_PROPERTIES.timeout_seconds,
       },
       required: ["prompt"],
     },
@@ -310,13 +304,10 @@ const TOOLS = [
           description: "Optional custom review instructions.",
         },
         model: COMMON_RUN_PROPERTIES.model,
+        force_model: COMMON_RUN_PROPERTIES.force_model,
         reasoning_effort: COMMON_RUN_PROPERTIES.reasoning_effort,
         config: COMMON_RUN_PROPERTIES.config,
-        timeout_seconds: {
-          type: "number",
-          default: 600,
-          description: "Maximum seconds to wait before aborting (default 600).",
-        },
+        timeout_seconds: COMMON_RUN_PROPERTIES.timeout_seconds,
       },
       required: [],
     },
@@ -366,11 +357,6 @@ const TOOLS = [
             "Optional Antigravity Project ID associated with conversation_id (auto-resolved via agentapi if omitted).",
         },
         ...COMMON_RUN_PROPERTIES,
-        timeout_seconds: {
-          type: "number",
-          default: 1800,
-          description: "Maximum runtime in seconds (default 1800 = 30 min).",
-        },
       },
     },
   },
@@ -427,6 +413,7 @@ const TOOLS = [
             "add_milestone",
             "set_status",
             "set_active",
+            "archive", "unarchive", "archive_completed",
             "delete",
           ],
           default: "get",
@@ -479,6 +466,14 @@ const TOOLS = [
           enum: ["zh", "en"],
           description: "UI & callback language ('zh' for Chinese, 'en' for English).",
         },
+        model_routing: { type: "string", enum: ["flexible", "pinned"] },
+        task_timeout_seconds: { type: "integer", anyOf: [{ const: 0 }, { minimum: 60, maximum: 14400 }] },
+        transport: { type: "string", enum: ["default", "websocket", "http"] },
+        disable_desktop_notify: { type: "boolean" },
+        auto_heal_enabled: { type: "boolean", description: "Automatically resume background jobs interrupted by upstream API stalls." },
+        stall_threshold_seconds: { type: "integer", anyOf: [{ const: 0 }, { minimum: 60, maximum: 1800 }], description: "API silence threshold in seconds before watchdog marks stall (0 disables; local shell commands are exempt)." },
+        max_auto_heals: { type: "integer", minimum: 0, maximum: 5, description: "Max consecutive automatic recovery resumes per task chain (0-5, default 2)." },
+        monitor_interval_seconds: { type: "integer", anyOf: [{ const: 0 }, { minimum: 60, maximum: 1800 }], description: "Periodic progress check-in interval in seconds for lightweight sub-model monitoring (0 disables, default 300)." },
         role_mode: {
           type: "string",
           enum: ["orchestrator", "flexible"],
@@ -538,11 +533,16 @@ const TOOLS = [
 
 function mapCommonOptions(args, resume = false) {
   const prefs = loadSettings();
+  const seconds = args.timeout_seconds === undefined ? prefs.taskTimeoutSeconds : args.timeout_seconds;
+  if (!Number.isFinite(seconds) || seconds < 0) throw problem(400, "Invalid timeout_seconds.");
   const linkedGoal = args.goal_id ? getGoal(args.goal_id) : getGoal();
   return {
     cwd: resume ? args.cwd : workingDirectory(args.cwd, linkedGoal),
     sandbox: args.sandbox || prefs.sandbox || "workspace-write",
-    model: args.model || prefs.model || undefined,
+    model: workerModel(prefs, args.model, args.force_model),
+    force_model: args.force_model,
+    transport: prefs.transport,
+    disableDesktopNotify: prefs.disableDesktopNotify,
     reasoningEffort:
       args.reasoning_effort || prefs.reasoningEffort || undefined,
     goalId: args.goal_id || undefined,
@@ -559,10 +559,7 @@ function mapCommonOptions(args, resume = false) {
         ? Boolean(args.skip_git_repo_check)
         : prefs.skipGitRepoCheck,
     outputSchema: args.output_schema,
-    timeoutMs:
-      typeof args.timeout_seconds === "number" && args.timeout_seconds > 0
-        ? args.timeout_seconds * 1000
-        : undefined,
+    timeoutMs: seconds * 1000,
   };
 }
 
@@ -570,7 +567,7 @@ function resumeOptions(args, target) {
   return {
     ...mapCommonOptions(args, true),
     parentJobId: args.resume_job_id, sessionId: args.session_id,
-    prompt: args.prompt, sandbox: args.sandbox, model: args.model, reasoningEffort: args.reasoning_effort,
+    prompt: args.prompt, sandbox: args.sandbox, reasoningEffort: args.reasoning_effort,
     allowSandboxEscalation: args.allow_sandbox_escalation, transferCallback: args.transfer_callback,
     callbackTarget: target, notifyOnComplete: args.notify_on_complete, skipGitRepoCheck: args.skip_git_repo_check,
   };
@@ -650,6 +647,12 @@ async function handleToolCall(name, args = {}, meta = {}, signal) {
       `Codex Binary: ${resolved ? `${resolved.path} (${resolved.source})` : "NOT FOUND"}`,
       `Codex Version: ${version}`,
       `Active Model: ${effectiveModel}`,
+      `Model Routing: ${prefs.modelRouting}`,
+      `Task Timeout: ${prefs.taskTimeoutSeconds ? prefs.taskTimeoutSeconds + "s" : "unlimited"}`,
+      `Transport: ${prefs.transport}`,
+      `Disable Desktop Notify: ${prefs.disableDesktopNotify}`,
+      `Auto-Heal Watchdog: ${prefs.autoHealEnabled ? `on (stall=${prefs.stallThresholdSeconds ? prefs.stallThresholdSeconds + "s" : "off"}, maxHeals=${prefs.maxAutoHeals})` : "off"}`,
+      `Periodic Inspection: ${prefs.monitorIntervalSeconds ? prefs.monitorIntervalSeconds + "s" : "off"}`,
       `Reasoning Effort: ${effectiveEffort}`,
       `Role Division: ${prefs.roleMode}`,
       `Sandbox Policy: ${prefs.sandbox}`,
@@ -675,12 +678,22 @@ async function handleToolCall(name, args = {}, meta = {}, signal) {
           content: [{ type: "text", text: "No persistent goals recorded yet." }],
         };
       }
-      const lines = store.goals.map((g) => {
+      const goalLine = (g) => {
         const done = g.milestones.filter((m) => m.status === "done").length;
         const activeMark = g.id === store.activeGoalId ? "★ " : "";
         return `- ${activeMark}\`${g.id}\` [${g.status}] **${g.title}** (${done}/${g.milestones.length} done, iter ${g.iterationCount || 0}/${g.maxIterations || 12})`;
-      });
+      };
+      const lines = ["Open goals", ...store.goals.filter(g => !g.archived).map(goalLine),
+        "Archived goals", ...store.goals.filter(g => g.archived).map(goalLine)];
       return { content: [{ type: "text", text: lines.join("\n") }] };
+    }
+
+    if (action === "archive_completed") {
+      return { content: [{ type: "text", text: `Archived ${archiveCompletedGoals()} finished goals.` }] };
+    }
+    if (action === "archive" || action === "unarchive") {
+      const goal = archiveGoal(args.goal_id ?? listGoals().activeGoalId, action === "archive");
+      return { content: [{ type: "text", text: `${goal.archived ? "Archived" : "Restored"} goal ${goal.id}.` }] };
     }
 
     if (action === "get") {
@@ -817,6 +830,14 @@ async function handleToolCall(name, args = {}, meta = {}, signal) {
     const patch = {};
     if (args.language !== undefined) patch.language = args.language;
     if (args.role_mode !== undefined) patch.roleMode = args.role_mode;
+    if (args.model_routing !== undefined) patch.modelRouting = args.model_routing;
+    if (args.task_timeout_seconds !== undefined) patch.taskTimeoutSeconds = args.task_timeout_seconds;
+    if (args.transport !== undefined) patch.transport = args.transport;
+    if (args.disable_desktop_notify !== undefined) patch.disableDesktopNotify = args.disable_desktop_notify;
+    if (args.auto_heal_enabled !== undefined) patch.autoHealEnabled = args.auto_heal_enabled;
+    if (args.stall_threshold_seconds !== undefined) patch.stallThresholdSeconds = args.stall_threshold_seconds;
+    if (args.max_auto_heals !== undefined) patch.maxAutoHeals = args.max_auto_heals;
+    if (args.monitor_interval_seconds !== undefined) patch.monitorIntervalSeconds = args.monitor_interval_seconds;
     if (args.model !== undefined) patch.model = args.model;
     if (args.reasoning_effort !== undefined)
       patch.reasoningEffort = args.reasoning_effort;
@@ -836,6 +857,12 @@ async function handleToolCall(name, args = {}, meta = {}, signal) {
       `- Language: ${updated.language}`,
       `- Role Division: ${updated.roleMode}`,
       `- Model: ${updated.model || `(follow Codex default: ${toml.model || "auto"})`}`,
+      `- Model Routing: ${updated.modelRouting}`,
+      `- Task Timeout: ${updated.taskTimeoutSeconds ? updated.taskTimeoutSeconds + "s" : "unlimited"}`,
+      `- Transport: ${updated.transport}`,
+      `- Disable Desktop Notify: ${updated.disableDesktopNotify}`,
+      `- Auto-Heal Watchdog: ${updated.autoHealEnabled ? `on (stall=${updated.stallThresholdSeconds ? updated.stallThresholdSeconds + "s" : "off"}, maxHeals=${updated.maxAutoHeals})` : "off"}`,
+      `- Periodic Inspection: ${updated.monitorIntervalSeconds ? updated.monitorIntervalSeconds + "s" : "off"}`,
       `- Reasoning Effort: ${updated.reasoningEffort || `(follow default: ${toml.reasoningEffort || "auto"})`}`,
       `- Sandbox: ${updated.sandbox}`,
       `- Workflow Mode: ${updated.workflowMode}`,
@@ -974,10 +1001,9 @@ async function handleToolCall(name, args = {}, meta = {}, signal) {
       model: common.model,
       reasoningEffort: common.reasoningEffort,
       config: args.config,
-      timeoutMs:
-        typeof args.timeout_seconds === "number" && args.timeout_seconds > 0
-          ? args.timeout_seconds * 1000
-          : 600_000,
+      timeoutMs: common.timeoutMs,
+      transport: common.transport,
+      disableDesktopNotify: common.disableDesktopNotify,
     };
     const result = await runCodex({
       ...opts,

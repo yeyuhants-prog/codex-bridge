@@ -15,7 +15,7 @@ import {
   readCodexModelsCatalog,
 } from "../../server/settings-store.js";
 import {
-  listGoals, iterationLimit,
+  listGoals, iterationLimit, archiveGoal, archiveCompletedGoals,
   getGoal,
   createGoal,
   setActiveGoal,
@@ -25,10 +25,12 @@ import {
   deleteGoal,
 } from "../../server/goal-store.js";
 import {
-  JobManager,
+  JobManager, archiveExecutions,
   normalizeCallbackTarget,
   reconcilePersistedJobs,
-  claimCallback, beginCallbackSend, finishCallback, readPersistedJobs, callbackTerminal,
+  claimCallback, beginCallbackSend, finishCallback,
+  claimPeriodicCheckIn, finishPeriodicCheckIn,
+  readPersistedJobs, callbackTerminal,
 } from "../../server/job-manager.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -115,7 +117,7 @@ function buildCallbackMessage(job, settings, goal) {
   const isAutonomousEligible =
     mode === "autonomous" &&
     goal &&
-    goal.status === "active" &&
+    !goal.archived && goal.status === "active" &&
     used < limit;
 
   const lines = [
@@ -284,6 +286,72 @@ async function deliverCallbackForJob(id, settings, retry = false) {
   }
 }
 
+function buildPeriodicCheckMessage(job, settings, goal, checkNum) {
+  const isEn = settings.language === "en";
+  const now = Date.now();
+  const elapsedSec = Math.max(0, Math.round((now - Date.parse(job.startedAt || "")) / 1000) || 0);
+  const idleSec = Math.max(0, Math.round((now - Date.parse(job.lastEventAt || job.startedAt || "")) / 1000) || 0);
+  const fmtDur = (s) => (s >= 60 ? `${Math.floor(s / 60)}m ${s % 60}s` : `${s}s`);
+  const phase = job.phase || "waiting_api";
+  const lines = [
+    isEn
+      ? `[Codex Bridge Periodic Check #${checkNum}] Active background Codex job heartbeat`
+      : `[Codex Bridge 定时检验 #${checkNum}] 后台 Codex 任务进展巡检`,
+    ``,
+    `- **Job ID**: \`${job.id}\` | **Status**: \`${job.status}\` | **Phase**: \`${phase}\`${job.reconnectCount ? ` (reconnects=${job.reconnectCount})` : ""}`,
+    `- **Model**: \`${job.model || "default"}\` | **Effort**: \`${job.reasoningEffort || "default"}\` | **Elapsed**: ${fmtDur(elapsedSec)} | **Idle**: ${fmtDur(idleSec)} | **Events**: ${job.eventCount || 0}`,
+    `- **Working Dir**: \`${job.cwd}\``,
+  ];
+  if (job.autoHealCount > 0) {
+    lines.push(`- **Auto-Heal**: #${job.autoHealCount}/${settings.maxAutoHeals ?? 2}`);
+  }
+  if (goal) {
+    lines.push(`- **Goal**: ${goal.title} (\`${goal.id}\`${job.milestoneId ? ` / \`${job.milestoneId}\`` : ""})`);
+  }
+  const recent = (job.recentEvents || []).slice(-5);
+  if (recent.length) {
+    lines.push(
+      isEn ? `\n**Recent Events**:` : `\n**最近事件**:`,
+      ...recent.map((e) => `  - [${e.at}] ${e.summary}`)
+    );
+  }
+  lines.push(
+    "",
+    isEn
+      ? `**Periodic Inspection Instruction (Delegate to Lightweight Sub-Model)**: Launch a read-only monitor via \`invoke_subagent(TypeName="research", Model="flash_lite", Role="Codex Progress Monitor", Prompt="...")\` to keep the Mastermind context clean. Inspect the recent events above and workspace status in \`${job.cwd}\` to judge whether Codex is: (1) progressing normally, (2) stuck in a retry/error loop or drifting, or (3) already done with edits/tests while stalled on reporting. Return a <=5-line verdict to the Mastermind. If healthy, reply briefly and keep waiting; if looping, drifted, or stalled, intervene via \`codex_cancel\` / \`codex_start(resume_job_id="${job.id}", ...)\`.`
+      : `**定时检验指令（委托轻量子模型巡检）**：请调用 \`invoke_subagent(TypeName="research", Model="flash_lite", Role="Codex Progress Monitor", Prompt="...")\`（只读轻量子模型，避免污染主脑上下文），结合上述最近事件与 \`${job.cwd}\` 工作区状态做一次快速体检：① 判断 Codex 是正常推进、陷入报错死循环/跑偏，还是其实代码与测试已跑完仅卡在汇报；② 向主脑返回 5 行以内结构化结论（状态 / 进展 / 风险 / 建议）。若一切正常，主脑简短同步后继续等待即可；若确认死循环、跑偏或网络卡死，再由主脑用 \`codex_cancel\` / \`codex_start(resume_job_id="${job.id}", ...)\` 介入纠偏。`
+  );
+  return lines.join("\n");
+}
+
+async function deliverPeriodicCheckIn(id, settings) {
+  const claimed = claimPeriodicCheckIn(id, settings.monitorIntervalSeconds);
+  const token = claimed.checkInClaim;
+  const target = normalizeCallbackTarget(claimed.callbackTarget);
+  if (!target) {
+    finishPeriodicCheckIn(id, token, { delivered: false, error: "No locked conversationId." });
+    return { ok: false };
+  }
+  const verified = await verifyConversationTarget(target.conversationId, target.projectId);
+  if (!verified.valid) {
+    finishPeriodicCheckIn(id, token, { delivered: false, error: verified.reason });
+    return { ok: false };
+  }
+  try {
+    const goal = claimed.goalId ? getGoal(claimed.goalId) : null;
+    const checkNum = (claimed.checkInCount || 0) + 1;
+    const message = buildPeriodicCheckMessage(claimed, settings, goal, checkNum);
+    const sendRes = await agentApi(["send-message", verified.conversationId, message], verified.projectId);
+    if (sendRes && sendRes.error) throw new Error(String(sendRes.error));
+    finishPeriodicCheckIn(id, token, { delivered: true });
+    console.log(`[codex-panel] Delivered periodic check #${checkNum} for job ${id} -> conv ${verified.conversationId}`);
+    return { ok: true };
+  } catch (err) {
+    finishPeriodicCheckIn(id, token, { delivered: false, error: err?.message || String(err) });
+    return { ok: false };
+  }
+}
+
 let watcherBusy = false;
 async function checkAndDispatchCallbacks() {
   if (watcherBusy) return;
@@ -304,6 +372,24 @@ async function checkAndDispatchCallbacks() {
     for (const job of pending) {
       try { await deliverCallbackForJob(job.id, settings); }
       catch (err) { if (err.status !== 409) console.error("[codex-panel] callback:", err.message); }
+    }
+
+    if (settings.monitorIntervalSeconds > 0) {
+      const now = Date.now();
+      const intervalMs = settings.monitorIntervalSeconds * 1000;
+      const dueChecks = jobs.filter(
+        (j) =>
+          j &&
+          ["running", "running_detached"].includes(j.status) &&
+          j.notifyOnComplete !== false &&
+          normalizeCallbackTarget(j.callbackTarget) &&
+          !(j.checkInClaim && Date.parse(j.checkInLeaseUntil) > now) &&
+          now - (Date.parse(j.lastCheckInAt || j.startedAt) || now) >= intervalMs
+      );
+      for (const job of dueChecks) {
+        try { await deliverPeriodicCheckIn(job.id, settings); }
+        catch (err) { if (err.status !== 409) console.error("[codex-panel] periodic check:", err.message); }
+      }
     }
   } finally {
     watcherBusy = false;
@@ -331,12 +417,12 @@ async function buildState(query = {}) {
       return { cwd: job?.cwd || null, conversationId: job?.conversationId || null, transferredFrom: job?.transferredFrom || null,
         durationMs: null, usage: null, model: "", reasoningEffort: "", ...row };
     });
-    return { pluginVersion: "1.5.0", codex, tomlDefaults, models, settings,
+    return { pluginVersion: "1.7.0", codex, tomlDefaults, models, settings,
       goalsStore, jobs, history, conversationId: convId || null };
   });
 }
 
-function publicJob({ lockToken, callbackClaim, processIdentity, ...job }) {
+function publicJob({ lockToken, callbackClaim, processIdentity, checkInClaim, checkInLeaseUntil, ...job }) {
   return { ...job, conversationId: job.callbackTarget?.conversationId || job.conversationId || null,
     transferredFrom: job.transferredFrom || null, durationMs: job.durationMs ?? job.resultSummary?.durationMs ?? null,
     usage: job.usage ?? job.resultSummary?.usage ?? null, model: job.model || "", reasoningEffort: job.reasoningEffort || "" };
@@ -423,6 +509,14 @@ api(
       language: data.language,
       roleMode: data.roleMode,
       model: data.model,
+      modelRouting: data.modelRouting,
+      transport: data.transport,
+      taskTimeoutSeconds: data.taskTimeoutSeconds,
+      disableDesktopNotify: data.disableDesktopNotify,
+      autoHealEnabled: data.autoHealEnabled,
+      stallThresholdSeconds: data.stallThresholdSeconds,
+      maxAutoHeals: data.maxAutoHeals,
+      monitorIntervalSeconds: data.monitorIntervalSeconds,
       reasoningEffort: data.reasoningEffort,
       sandbox: data.sandbox,
       workflowMode: data.workflowMode,
@@ -445,6 +539,18 @@ api(
   "POST"
 );
 
+api("/api/jobs/archive", archiveExecutions, "POST");
+api("/api/goals/archive", data => {
+  if (data.completedOnly === true) {
+    if (data.goalId || data.archived === false) throw problem(400, "Select a single goal or completedOnly.");
+    archiveCompletedGoals();
+  } else {
+    if (!data.goalId) throw problem(400, "goalId is required.");
+    archiveGoal(data.goalId, data.archived);
+  }
+  return { ok: true, goalsStore: listGoals() };
+}, "POST");
+
 // Structured background resume by old job_id (inherits exact sessionId, cwd, sandbox, goal, milestone)
 api(
   "/api/jobs/resume",
@@ -466,7 +572,7 @@ api(
       callbackTarget = { conversationId: target, projectId: verified.projectId, source: "sidecar_host" };
     }
     const { job, reused, reason } = jobManager.resumeFromJob(old.id, {
-      prompt: data.prompt, sandbox: data.sandbox, cwd: data.cwd,
+      prompt: data.prompt, sandbox: data.sandbox, cwd: data.cwd, model: data.model, force_model: data.force_model,
       sessionId: data.sessionId ?? data.session_id, goalId: data.goalId ?? data.goal_id,
       milestoneId: data.milestoneId ?? data.milestone_id, addDirs: data.addDirs ?? data.add_dirs,
       notifyOnComplete: data.notifyOnComplete ?? data.notify_on_complete, skipGitRepoCheck: data.skipGitRepoCheck ?? data.skip_git_repo_check,

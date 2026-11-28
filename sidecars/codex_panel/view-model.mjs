@@ -23,6 +23,10 @@ function legacyMatch(record, candidates) {
   return matches.length === 1 ? matches[0] : null;
 }
 
+export function historyKey(row) {
+  return "history:" + (row.historyKey || row.jobId || JSON.stringify([row.sessionId, row.at, row.mode, row.conversationId, row.promptPreview || row.prompt]));
+}
+
 // Session IDs identify threads. A legacy match must identify one execution
 // in both directions, even when several resumes ran in the same thread.
 export function taskRows(jobs = [], history = []) {
@@ -34,7 +38,7 @@ export function taskRows(jobs = [], history = []) {
       if (!records.has(row.jobId)) records.set(row.jobId, row);
       continue;
     }
-    const key = row.jobId || JSON.stringify([row.sessionId, row.at, row.mode, row.conversationId, row.promptPreview || row.prompt]);
+    const key = historyKey(row);
     if (!unmatched.has(key)) unmatched.set(key, row);
   }
 
@@ -56,7 +60,8 @@ export function taskRows(jobs = [], history = []) {
     if (!isActive(job) && !terminalStates.has(job.status)) continue;
     const record = records.get(job.id);
     rows.push({
-      ...record, ...job, key: job.id, kind: "job",
+      ...record, ...job, key: job.id, kind: "job", historyKey: record ? historyKey(record) : null,
+      archived: Boolean(job.archived || record?.archived), archivedAt: job.archivedAt || record?.archivedAt || null,
       conversationId: conversationOf(job) || (record && conversationOf(record)) || "",
       sessionId: job.sessionId || record?.sessionId,
       durationMs: job.durationMs ?? record?.durationMs, usage: job.usage ?? record?.usage,
@@ -67,7 +72,7 @@ export function taskRows(jobs = [], history = []) {
   for (const [key, record] of unmatched) {
     const status = record.status || "completed";
     if (!terminalStates.has(status)) continue;
-    rows.push({ ...record, status, key: "history:" + key,
+    rows.push({ ...record, status, key, historyKey: key, archived: Boolean(record.archived), archivedAt: record.archivedAt || null,
       kind: record.jobId ? "archived" : "sync", conversationId: conversationOf(record) });
   }
   return rows.sort((a, b) => timestamp(b) - timestamp(a));
@@ -93,11 +98,13 @@ export function groupsFor(rows, current) {
 export function taskView(rows, current, scope, filter) {
   const local = current ? rows.filter(row => conversationOf(row) === current) : [];
   const visible = current && scope === "current" ? local : rows;
-  const history = visible.filter(row => !isActive(row));
+  const finished = visible.filter(row => !isActive(row));
+  const history = finished.filter(row => !row.archived);
+  const archived = finished.filter(row => row.archived);
   return {
-    total: rows.length, currentCount: local.length, historyCount: history.length,
+    total: rows.length, currentCount: local.length, historyCount: history.length, archivedCount: archived.length,
     active: groupsFor(visible.filter(isActive), current),
-    history: groupsFor(history.filter(row => filter === "all" ||
+    history: groupsFor(filter === "archived" ? archived : history.filter(row => filter === "all" ||
       (filter === "success" ? row.status === "completed" : ["failed","timed_out","interrupted"].includes(row.status))), current)
   };
 }

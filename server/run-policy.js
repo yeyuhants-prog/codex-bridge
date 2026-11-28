@@ -11,6 +11,14 @@ import { problem, validateBooleans } from "./validation.js";
 const root = fileURLToPath(new URL("../", import.meta.url));
 const samePath = (a, b) => path.relative(a, b) === "";
 
+export function workerModel(prefs, model, force) {
+  if (model !== undefined && typeof model !== "string") throw problem(400, "Invalid model.");
+  if (model !== undefined && prefs.modelRouting === "pinned" && prefs.model && model !== prefs.model && force !== true) {
+    throw problem(400, `Model is pinned to ${prefs.model}. Pass force_model=true or switch routing to flexible.`);
+  }
+  return model || prefs.model || undefined;
+}
+
 export function workingDirectory(cwd, goal) {
   const fromCaller = cwd ?? goal?.cwd;
   if (fromCaller !== undefined && typeof fromCaller !== "string") throw problem(400, "Invalid cwd.");
@@ -71,10 +79,9 @@ export function resolveResume(options, jobs) {
   const callbackTarget = parent && !options.transferCallback ? original : options.callbackTarget || original;
   const transferredFrom = options.transferCallback && original && original.conversationId !== callbackTarget?.conversationId
     ? original.conversationId : baseline?.transferredFrom || null;
-  const previousModel = baseline?.model === "(codex default)" ? "" : baseline?.model;
   const previousEffort = baseline?.reasoningEffort === "(default)" ? "" : baseline?.reasoningEffort;
   return { ...options, mode: "resume", sessionId: sid, cwd: dir, goalId, milestoneId, sandbox, addDirs, callbackTarget, transferredFrom,
-    model: options.model || previousModel || prefs.model, reasoningEffort: options.reasoningEffort || previousEffort || prefs.reasoningEffort,
+    model: workerModel(prefs, options.model, options.force_model), reasoningEffort: options.reasoningEffort || previousEffort || prefs.reasoningEffort,
     skipGitRepoCheck: options.skipGitRepoCheck ?? baseline?.skipGitRepoCheck ?? prefs.skipGitRepoCheck,
     notifyOnComplete: options.notifyOnComplete ?? baseline?.notifyOnComplete ?? (prefs.progressionMode !== "manual"),
     prompt: options.prompt || "Continue the previous task in " + dir + ", inspect its progress and verify the remaining work." };

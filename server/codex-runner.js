@@ -167,6 +167,11 @@ function appendCommonConfigArgs(args, opts, { allowProfile = true } = {}) {
     args.push("-p", String(opts.profile));
   }
   const configList = Array.isArray(opts.config) ? [...opts.config] : [];
+  const provider = { websocket: "openai", http: "openai_http" }[opts.transport];
+  if (provider) configList.push(`model_provider="${provider}"`);
+  if (opts.disableDesktopNotify !== false && !configList.some(kv => typeof kv === "string" && /^\s*notify\s*=/.test(kv))) {
+    configList.push("notify=[]");
+  }
   if (
     opts.reasoningEffort &&
     !configList.some(
@@ -336,6 +341,7 @@ const RECOVERABLE_ERROR_RE =
 export function evaluateRunOutcome({
   exitCode,
   timedOut,
+  stalled = false,
   cancelled,
   turnCompleted,
   turnFailed,
@@ -345,7 +351,7 @@ export function evaluateRunOutcome({
   const finalErrors = [...errors];
   const finalWarnings = [...warnings];
 
-  if (timedOut || cancelled || turnFailed) {
+  if (timedOut || stalled || cancelled || turnFailed) {
     return { ok: false, errors: finalErrors, warnings: finalWarnings };
   }
 
@@ -393,10 +399,15 @@ export function runCodex(options) {
   }
   const { args, stdinPrompt } = built;
 
-  const timeoutMs =
-    typeof options.timeoutMs === "number" && options.timeoutMs > 0
-      ? options.timeoutMs
-      : 600_000;
+  const timeoutMs = options.timeoutMs === undefined ? 600_000 : options.timeoutMs;
+  const graceMs = options.postTurnGraceMs ?? 5000;
+  const stallTimeoutMs = typeof options.stallTimeoutMs === "number" && options.stallTimeoutMs > 0 ? options.stallTimeoutMs : 0;
+  const reconnectStallMs =
+    typeof options.reconnectStallMs === "number" && options.reconnectStallMs > 0
+      ? options.reconnectStallMs
+      : stallTimeoutMs > 0
+        ? Math.min(90_000, stallTimeoutMs)
+        : 0;
 
   return new Promise((resolve, reject) => {
     const startedAt = Date.now();
@@ -417,13 +428,23 @@ export function runCodex(options) {
       recentEvents: [],
       stderr: "",
       timedOut: false,
+      stalled: false,
+      stallReason: null,
       cancelled: false,
+      phase: "waiting_api",
+      activeCommands: 0,
+      reconnectCount: 0,
+      reconnectingSince: null,
+      lastEventMs: startedAt,
     };
 
     let stdoutBuffer = "";
     let totalBytes = 0;
     let protocolFailure = null;
     let terminationTimer;
+    let graceTimer;
+    let stallTimer = null;
+    let cleanedUpTail = false;
     function terminate() {
       if (child.exitCode !== null || child.signalCode) return;
       if (killProcessTree(child) === false && !terminationTimer) {
@@ -467,18 +488,43 @@ export function runCodex(options) {
       if (!evt || typeof evt !== "object" || typeof evt.type !== "string" ||
           (evt.item && typeof evt.item !== "object")) return failStream("Invalid event object");
       if (state.eventCount >= 50000) return failStream("Event limit exceeded");
-      if (evt.type === "turn.started") { state.turnCompleted = false; }
+      if (evt.type === "turn.started") {
+        if (state.turnCompleted && graceMs > 0) startTaskTimer();
+        clearTimeout(graceTimer);
+        state.turnCompleted = false;
+      }
       if (state.turnCompleted && (evt.type === "error" || evt.type === "turn.failed")) {
         state.turnFailed = true;
       }
       state.eventCount += 1;
+      state.lastEventMs = Date.now();
 
       if (evt.type === "thread.started") {
         const sid = normalizeSessionId(evt.thread_id);
         if (options.mode === "resume" && sid !== normalizeSessionId(options.sessionId)) return failStream("Unexpected resumed session UUID");
         state.sessionId = sid;
+        state.phase = state.activeCommands > 0 ? "running_cmd" : "waiting_api";
+        state.reconnectingSince = null;
+        state.reconnectCount = 0;
+      } else if (evt.type === "turn.started") {
+        state.phase = state.activeCommands > 0 ? "running_cmd" : "waiting_api";
+        state.reconnectingSince = null;
+        state.reconnectCount = 0;
       } else if (evt.type === "turn.completed") {
         state.turnCompleted = true;
+        state.activeCommands = 0;
+        state.phase = "completed";
+        state.reconnectingSince = null;
+        clearTimeout(graceTimer);
+        if (graceMs > 0) {
+          clearTimeout(timer);
+          graceTimer = setTimeout(() => {
+            if (child.exitCode !== null || child.signalCode) return;
+            cleanedUpTail = true;
+            terminate();
+          }, graceMs);
+          graceTimer.unref();
+        }
         if (evt.usage) state.usage = evt.usage;
       } else if (evt.type === "turn.failed") {
         state.turnFailed = true;
@@ -490,14 +536,29 @@ export function runCodex(options) {
           evt.error?.message || evt.message || JSON.stringify(evt);
         if (RECOVERABLE_ERROR_RE.test(msg)) {
           state.warnings.push(msg);
+          state.reconnectCount += 1;
+          if (!state.reconnectingSince) state.reconnectingSince = state.lastEventMs;
+          if (state.activeCommands === 0) state.phase = "reconnecting";
         } else {
           state.errors.push(msg);
         }
+      } else if (evt.type === "item.started" && evt.item) {
+        state.reconnectingSince = null;
+        state.reconnectCount = 0;
+        if (evt.item.type === "command_execution") {
+          state.activeCommands += 1;
+          state.phase = "running_cmd";
+        } else {
+          state.phase = state.activeCommands > 0 ? "running_cmd" : "waiting_api";
+        }
       } else if (evt.type === "item.completed" && evt.item) {
+        state.reconnectingSince = null;
+        state.reconnectCount = 0;
         const item = evt.item;
         if (item.type === "agent_message" && typeof item.text === "string") {
           state.messages.push(item.text);
         } else if (item.type === "command_execution") {
+          state.activeCommands = Math.max(0, state.activeCommands - 1);
           state.commands.push({
             command: item.command || "",
             exitCode: item.exit_code ?? null,
@@ -515,6 +576,7 @@ export function runCodex(options) {
             });
           }
         }
+        state.phase = state.activeCommands > 0 ? "running_cmd" : "waiting_api";
       }
 
       const summary = summarizeEvent(evt);
@@ -527,6 +589,10 @@ export function runCodex(options) {
             summary: summary || evt.type || "event",
             event: evt,
             sessionId: state.sessionId,
+            phase: state.phase,
+            activeCommands: state.activeCommands,
+            reconnectCount: state.reconnectCount,
+            reconnectingSince: state.reconnectingSince,
           });
         } catch (err) { failStream("Progress bookkeeping failed: " + err.message); }
       }
@@ -557,13 +623,43 @@ export function runCodex(options) {
     });
 
     let timer = null;
-    if (timeoutMs > 0) {
-      timer = setTimeout(() => {
-        state.timedOut = true;
-        state.errors.push(`Timed out after ${Math.round(timeoutMs / 1000)}s`);
-        terminate();
-      }, timeoutMs);
-      timer.unref();
+    function startTaskTimer() {
+      if (!(timeoutMs > 0)) return;
+      const deadline = Date.now() + timeoutMs;
+      function schedule(remaining) {
+        // Node clamps delays above a signed 32-bit integer to one millisecond.
+        timer = setTimeout(() => {
+          const left = deadline - Date.now();
+          if (left > 0) return schedule(left);
+          state.timedOut = true;
+          state.errors.push(`Timed out after ${Math.round(timeoutMs / 1000)}s`);
+          terminate();
+        }, Math.min(remaining, 2_147_483_647));
+        timer.unref();
+      }
+      schedule(timeoutMs);
+    }
+    startTaskTimer();
+
+    if (stallTimeoutMs > 0) {
+      const checkEvery = Math.min(5000, Math.max(40, Math.floor(Math.min(stallTimeoutMs, reconnectStallMs || stallTimeoutMs) / 4)));
+      stallTimer = setInterval(() => {
+        if (state.turnCompleted || state.cancelled || state.timedOut || state.stalled || protocolFailure) return;
+        if (state.phase === "running_cmd" || state.activeCommands > 0) return;
+        const now = Date.now();
+        if (state.phase === "reconnecting" && state.reconnectingSince && reconnectStallMs > 0 && now - state.reconnectingSince >= reconnectStallMs) {
+          state.stalled = true;
+          state.stallReason = `Stuck reconnecting for ${Math.round((now - state.reconnectingSince) / 1000)}s (${state.reconnectCount} retries)`;
+          state.errors.push(state.stallReason);
+          terminate();
+        } else if (state.phase === "waiting_api" && now - state.lastEventMs >= stallTimeoutMs) {
+          state.stalled = true;
+          state.stallReason = `Upstream API silent for ${Math.round((now - state.lastEventMs) / 1000)}s while waiting for response`;
+          state.errors.push(state.stallReason);
+          terminate();
+        }
+      }, checkEvery);
+      stallTimer.unref();
     }
 
     const onAbort = () => {
@@ -582,6 +678,8 @@ export function runCodex(options) {
 
     child.on("error", (err) => {
       if (child.pid && isPidAlive(child.pid)) { failStream("Codex process error: " + err.message); return; }
+      clearTimeout(graceTimer);
+      clearInterval(stallTimer);
       clearTimeout(terminationTimer);
       if (timer) clearTimeout(timer);
       if (options.signal) {
@@ -592,6 +690,7 @@ export function runCodex(options) {
 
     child.on("close", (code, signal) => {
       clearTimeout(terminationTimer);
+      clearInterval(stallTimer);
       if (timer) clearTimeout(timer);
       if (options.signal) {
         options.signal.removeEventListener("abort", onAbort);
@@ -600,6 +699,9 @@ export function runCodex(options) {
         try { handleLine(stdoutBuffer); } catch { failStream("Invalid final event"); }
       }
 
+      clearTimeout(graceTimer);
+      clearInterval(stallTimer);
+      clearTimeout(timer);
       const durationMs = Date.now() - startedAt;
       const lastMessage =
         state.messages.length > 0
@@ -607,8 +709,9 @@ export function runCodex(options) {
           : "";
 
       const verdict = evaluateRunOutcome({
-        exitCode: code,
+        exitCode: cleanedUpTail ? null : code,
         timedOut: state.timedOut,
+        stalled: state.stalled,
         cancelled: state.cancelled,
         turnCompleted: state.turnCompleted,
         turnFailed: state.turnFailed,
@@ -635,6 +738,10 @@ export function runCodex(options) {
         warnings: verdict.warnings,
         stderr: state.stderr.trim(),
         timedOut: state.timedOut,
+        stalled: state.stalled,
+        stallReason: state.stallReason,
+        phase: state.phase,
+        reconnectCount: state.reconnectCount,
         cancelled: state.cancelled,
         eventCount: state.eventCount,
         recentEvents: state.recentEvents,
@@ -647,6 +754,7 @@ export function runCodex(options) {
       try {
         options.onSpawn?.(child, { args });
         child.stdin.end(stdinPrompt ?? undefined, "utf8");
+        state.lastEventMs = Date.now();
       } catch (err) {
         failStream("Spawn bookkeeping failed: " + err.message);
         child.stdin.end();

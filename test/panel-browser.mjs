@@ -12,18 +12,22 @@ function preload() {
   const A = "aaaa0000-source";
   const B = "bbbb0000-target";
   const state = {
-    codex: { found: true, version: "codex-cli 0.171" }, pluginVersion: "1.5.0",
-    settings: { language: "zh", sandbox: "read-only" }, models: [], goalsStore: { goals: [] },
+    codex: { found: true, version: "codex-cli 0.171" }, pluginVersion: "1.6.0",
+    settings: { language: "zh", sandbox: "read-only", modelRouting: "flexible", taskTimeoutSeconds: 7200, transport: "default" },
+    models: [], goalsStore: { activeGoalId: "open", goals: [
+      { id: "open", title: "Current goal", status: "active", milestones: [{ id: "m1", title: "Verify", status: "pending" }] },
+      { id: "done", title: "Finished goal", status: "completed", milestones: [] },
+    ] },
     jobs: [
-      { id: "live", conversationId: B, status: "running", eventCount: 17, prompt: "本地任务", cwd: "/project/local" },
+      { id: "live", conversationId: B, status: "running", lastEventAt: new Date(Date.now() - 183000).toISOString(), eventCount: 17, prompt: "本地任务", cwd: "/project/local" },
       { id: "old", conversationId: A, sessionId: "22222222-aaaa-4222-8222-aaaaaaaaaaaa",
         cwd: "D:\\project\\api", status: "failed", sandbox: "workspace-write", callbackStatus: "failed",
-        prompt: "<img src=x onerror=no()> " + "长文本 Long prompt with line breaks.\n".repeat(8) },
+        prompt: "<img src=x onerror=no()> " + "长文本 Long prompt with line breaks.\n".repeat(80) },
     ],
     history: [
       { jobId: "old", durationMs: 1250, usage: { input_tokens: 310, output_tokens: 22 }, model: "m1" },
       ...Array.from({ length: 9 }, (_, i) => ({ conversationId: A, at: new Date(i).toISOString(),
-        sessionId: "sync-" + i, status: "completed", promptPreview: "Sync run " + i, executionKind: "sync" })),
+        historyKey: "sync-key-" + i, sessionId: "sync-" + i, status: "completed", promptPreview: "Sync run " + i, executionKind: "sync" })),
       { at: "2024-01-01", status: "completed", prompt: "Unbound" },
     ],
   };
@@ -55,6 +59,20 @@ function preload() {
         }
         state.settings = url === "/api/reset" ? { language: "zh", sandbox: "read-only" } : { ...state.settings, ...body };
         return Response.json({ ok: true, settings: state.settings });
+      }
+      if (url === "/api/goals/archive") {
+        for (const g of state.goalsStore.goals) {
+          if (body.completedOnly ? g.status === "completed" : g.id === body.goalId) g.archived = body.archived ?? true;
+        }
+        return Response.json({ ok: true });
+      }
+      if (url === "/api/jobs/archive") {
+        const matches = row => body.finishedOnly ? (!body.conversationId || body.conversationId === row.conversationId) :
+          body.jobId ? (row.id || row.jobId) === body.jobId : row.historyKey && "history:" + row.historyKey === body.historyKey;
+        for (const record of [...state.jobs, ...state.history]) {
+          if (record.status !== "running" && matches(record)) record.archived = body.archived ?? true;
+        }
+        return Response.json({ ok: true });
       }
       if (url === "/api/jobs/resume") {
         fixture.resumes.push(body);
@@ -96,7 +114,45 @@ async function exercise(width) {
   const cfg = window.fixture;
   await wait(() => $("#tab-badge").textContent === "1", "initial render");
   layout();
+  for (const [attribute, setting, values] of [
+    ["model-routing", "modelRouting", ["pinned", "flexible"]],
+    ["timeout", "taskTimeoutSeconds", [0, 1800, 3600, 14400, 7200]],
+    ["transport", "transport", ["websocket", "http", "default"]],
+  ]) {
+    for (const value of values) {
+      const selector = "[data-" + attribute + '="' + value + '"]';
+      click(selector);
+      await wait(() => cfg.state.settings[setting] === value && $(selector).getAttribute("aria-pressed") === "true", selector);
+    }
+  }
   click('[data-tab="goals"]');
+  check(!$(".idle-warning").hidden && $(".idle-warning").textContent.includes("已静默 3 分"), "three-minute stall warning");
+  const now = Date.now;
+  try {
+    cfg.state.jobs[0].lastEventAt = new Date(now()).toISOString();
+    await cfg.poll();
+    check($(".idle-warning").hidden, "fresh progress clears idle warning");
+    Date.now = () => now() + 181000;
+    await cfg.poll();
+    check(!$(".idle-warning").hidden, "unchanged snapshot crosses idle threshold");
+  } finally { Date.now = now; }
+  click(".milestone-toggle");
+  check($(".milestone-list").hidden, "fold milestones");
+  click(".milestone-toggle");
+  check(!$(".milestone-list").hidden, "expand milestones");
+  click("#archive-finished-goals");
+  await wait(() => !$("#archived-goals").hidden, "archive goal drawer");
+  check(!$("#archived-goals").open && $("#archived-goals-heading").textContent.includes("(1)"), "closed archive drawer");
+  check(all("#goal-select option").every(o => o.value !== "done"), "archived goal in selector");
+  click("#archived-goals-heading");
+  click(".archived-goal summary");
+  click(".restore-goal");
+  await wait(() => $("#archived-goals").hidden && all("#goal-select option").length === 2, "restore goal");
+  click(".archive-goal");
+  await wait(() => $(".goal-title").textContent === "Finished goal", "single goal archive");
+  click(".archived-goal summary");
+  click(".restore-goal");
+  await wait(() => $(".goal-title").textContent === "Current goal", "restore single goal");
   check($("#tab-badge").classList.contains("local") && $("#jobs-list .event-count").textContent.includes("17"), "local active event count");
   check(!$("#history-list .task-card"), "initial local scope");
   scope("all");
@@ -118,8 +174,18 @@ async function exercise(width) {
   check(!prompt.querySelector("img") && prompt.textContent.startsWith("<img"), "prompt text escaped");
   const height = prompt.offsetHeight;
   toggle.click();
-  check(prompt.offsetHeight > height, "prompt did not expand");
+  check(prompt.offsetHeight > height && prompt.offsetHeight <= 260 && prompt.scrollHeight > prompt.clientHeight, "bounded scrollable prompt");
+  check(!toggle.hidden && prompt.nextElementSibling === toggle && toggle.getAttribute("aria-expanded") === "true", "collapse toggle unavailable");
+  prompt.scrollTop = prompt.scrollHeight;
   toggle.click();
+  check(prompt.offsetHeight <= height + 2 && toggle.getAttribute("aria-expanded") === "false" && !toggle.hidden, "collapse must restore two-line height");
+  action("archive").click();
+  await wait(() => !$("[data-filter=failure]").disabled && !$("#history-list .task-card"), "archive finished job");
+  filter("archived");
+  check(all("#history-list .task-card").length === 1 && action("archive").textContent === "还原", "archived job filter");
+  action("archive").click();
+  await wait(() => !$("#history-list .task-card"), "restore finished job");
+  filter("failure");
   layout();
   action("retry").click();
   await wait(() => $("#toast").textContent.includes("fixture action rejected"), "business error reason missing");
@@ -197,6 +263,23 @@ async function exercise(width) {
   click('[data-tab="goals"]');
   scope("all");
   check($("#history-heading").textContent === "Task history" && $("#route-title").textContent.includes("result"), "English history/dialog");
+  filter("success");
+  action("archive").click();
+  await wait(() => $('[data-filter="archived"]').textContent === "Archived (1)", "archive history-only row");
+  filter("archived");
+  check(action("archive").textContent === "Restore", "English restore");
+  action("archive").click();
+  await wait(() => $('[data-filter="archived"]').textContent === "Archived (0)", "restore history-only row");
+  filter("all");
+  click("#history-more");
+  click("#history-collapse-all");
+  check(all("#history-list .task-card").length === 0 && $("#history-less").hidden, "collapse all groups and reset page");
+  const foreign = all("#history-list .group-head").find(b => b.title === "aaaa0000-source");
+  foreign.click();
+  check(all("#history-list .task-card").length === 8 && !$("#history-more").hidden, "closed groups consume no page slots");
+  click("#archive-finished-jobs");
+  await wait(() => $('[data-filter="archived"]').textContent === "Archived (11)", "bulk archive history");
+  check($("#jobs-list .live") && !$("#history-list .task-card"), "bulk archive kept active job");
   layout();
 }
 
@@ -254,7 +337,7 @@ try {
       "--window-size=700,900", "--dump-dom",
       "http://127.0.0.1:" + server.address().port + "/?width=" + width], { timeout: 30000, maxBuffer: 4e6, windowsHide: true });
     assert.ok(stdout.includes('data-result="passed"'), stdout.match(/data-failure="([^"]*)"/)?.[1] || "Browser exercise did not complete");
-    console.log(width + "px · scope, paging, prompt, callback routing, drafts, stale reads, reset and language passed");
+    console.log(width + "px · settings, idle warning, goal and history archives, collapse, paging, routing, drafts, stale reads, reset and language passed");
   }
 } finally {
   server.close();

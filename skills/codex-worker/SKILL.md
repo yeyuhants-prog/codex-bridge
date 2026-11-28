@@ -39,10 +39,17 @@ work as a complementary pair controlled from `[Codex Bridge](sidecar://codex-bri
    - For tasks > 1–2 minutes or multi-stage goals, use **`codex_start`** and
      **ALWAYS pass `conversation_id` = your `<user_information>` `Conversation ID`**
      (along with `cwd`, `goal_id`, `milestone_id`).
-   - Omit `model`, `reasoning_effort`, and `sandbox` so the user's live Sidecar
-     panel selections apply automatically.
+   - Check Model Routing in `codex_config`. In `flexible` mode, honor a named worker (“用 sol / astra”) with its exact local model slug, select the best local model for the task, or omit `model` for the panel default. In `pinned` mode always use the selected model. An explicit user-directed exception requires `force_model: true`.
+   - Omit `reasoning_effort` and `sandbox` to inherit the panel settings or resume policy.
 
-3. **Receive `[Codex Bridge Auto-Callback]` & Steer**
+3. **Handle `[Codex Bridge Periodic Check]` with a Lightweight Sub-Model (L2 Monitor)**
+   - For long-running jobs, the Sidecar sends periodic heartbeats (`[Codex Bridge Periodic Check #N]`, configurable via `monitor_interval_seconds`, default 300s) strictly to the locked `conversation_id`.
+   - Keep the Mastermind context clean by delegating the check to a read-only lightweight subagent:
+     `invoke_subagent(TypeName="research", Model="flash_lite", Role="Codex Progress Monitor", Prompt="...")`
+   - Ask the monitor to inspect recent events and workspace state (`cwd`) and return a `<= 5`-line verdict: healthy progress, retry/error loop, scope drift, or work already finished while stalled on reporting.
+   - Note that the L1 Watchdog in the bridge already distinguishes `running_cmd` (protected) vs `waiting_api` / `reconnecting` and automatically resumes stalled API streams up to `max_auto_heals` times before escalating.
+
+4. **Receive `[Codex Bridge Auto-Callback]` & Steer**
    - When Codex finishes, the Sidecar validates the locked `conversation_id` via
      `agentapi` and delivers `[Codex Bridge Auto-Callback]` back into this chat.
    - Verify deliverables (check key output files or test summaries), update the

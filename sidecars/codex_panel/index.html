@@ -63,6 +63,11 @@
         </div>
         <select id="model-select" class="select"></select>
         <p id="model-desc" class="helper"></p>
+        <div id="model-routing-group" class="segment-row two-col" role="group" data-i18n-aria="routingTitle">
+          <button type="button" class="seg-btn" data-model-routing="flexible"><span class="seg-label" data-i18n="flexModel">按指令灵活切换</span></button>
+          <button type="button" class="seg-btn" data-model-routing="pinned"><span class="seg-label" data-i18n="pinModel">锁定指定模型</span></button>
+        </div>
+        <p id="model-routing-hint" class="helper"></p>
       </section>
 
       <!-- Reasoning Effort -->
@@ -94,6 +99,34 @@
             <span class="seg-label" data-i18n="progAuto">持续自动推进</span>
             <span class="seg-sub" data-i18n="progAutoSub">自动验收→返工/下一步</span>
           </button>
+        </div>
+        <p class="helper" id="timeout-label" data-i18n="timeoutTitle">单轮任务时限</p>
+        <div id="timeout-group" class="pill-grid" role="group" aria-labelledby="timeout-label">
+          <button type="button" class="pill-btn" data-timeout="0" data-i18n="unlimited">不限时</button>
+          <button type="button" class="pill-btn" data-timeout="1800" data-i18n="halfHour">30 分钟</button>
+          <button type="button" class="pill-btn" data-timeout="3600" data-i18n="oneHour">1 小时</button>
+          <button type="button" class="pill-btn" data-timeout="7200" data-i18n="twoHours">2 小时</button>
+          <button type="button" class="pill-btn" data-timeout="14400" data-i18n="fourHours">4 小时</button>
+        </div>
+        <p class="helper" id="monitor-label" data-i18n="monitorTitle">定时检验间隔（子模型巡检）</p>
+        <div id="monitor-group" class="pill-grid" role="group" aria-labelledby="monitor-label">
+          <button type="button" class="pill-btn" data-monitor="0" data-i18n="offOption">关闭</button>
+          <button type="button" class="pill-btn" data-monitor="180" data-i18n="threeMin">3 分钟</button>
+          <button type="button" class="pill-btn" data-monitor="300" data-i18n="fiveMin">5 分钟</button>
+          <button type="button" class="pill-btn" data-monitor="600" data-i18n="tenMin">10 分钟</button>
+        </div>
+        <p class="helper" id="stall-label" data-i18n="stallTitle">断流假死阈值（不误杀本地命令）</p>
+        <div id="stall-group" class="pill-grid" role="group" aria-labelledby="stall-label">
+          <button type="button" class="pill-btn" data-stall="0" data-i18n="offOption">关闭</button>
+          <button type="button" class="pill-btn" data-stall="120" data-i18n="twoMin">2 分钟</button>
+          <button type="button" class="pill-btn" data-stall="240" data-i18n="fourMin">4 分钟</button>
+          <button type="button" class="pill-btn" data-stall="480" data-i18n="eightMin">8 分钟</button>
+        </div>
+        <div class="inline-setting">
+          <label class="switch-label">
+            <input id="toggle-auto-heal" type="checkbox" />
+            <span data-i18n="autoHealLabel">断流自动断点续跑（最多 2 次）</span>
+          </label>
         </div>
         <div class="inline-setting">
           <label for="max-iter-input" class="hint" data-i18n="maxIterLabel">自动推进轮次上限</label>
@@ -132,6 +165,12 @@
             <span class="seg-sub" data-i18n="wfPlanSub">你点头后再启动 Codex</span>
           </button>
         </div>
+        <p class="helper" id="transport-label" data-i18n="transportTitle">连接方式</p>
+        <div id="transport-group" class="pill-grid" role="group" aria-labelledby="transport-label">
+          <button type="button" class="pill-btn" data-transport="default" data-i18n="transportDefault">跟随默认</button>
+          <button type="button" class="pill-btn" data-transport="websocket" data-i18n="transportWs">WebSocket 优先</button>
+          <button type="button" class="pill-btn" data-transport="http" data-i18n="transportHttp">仅 HTTP SSE</button>
+        </div>
         <div class="toggle-row">
           <label class="switch-label">
             <input id="toggle-ephemeral" type="checkbox" />
@@ -160,6 +199,7 @@
       <section class="card goal-board-card">
         <div class="card-head">
           <span class="card-title" data-i18n="goalBoardTitle">持久化目标板（Goal & Milestones）</span>
+          <button id="archive-finished-goals" type="button" class="mini-btn" data-i18n="archiveFinished" hidden>归档已完成</button>
           <button id="btn-toggle-new-goal" type="button" class="mini-btn" data-i18n="newGoalBtn">+ 新建目标</button>
         </div>
 
@@ -180,6 +220,10 @@
         <div id="active-goal-view" class="goal-view">
           <div class="empty" data-i18n="emptyGoal">暂无持久化目标。点右上角「+ 新建目标」或直接在对话中让反重力创建目标板～</div>
         </div>
+        <details id="archived-goals" class="archive-drawer" hidden>
+          <summary id="archived-goals-heading"></summary>
+          <div id="archived-goals-list"></div>
+        </details>
       </section>
 
       <section class="task-board" aria-labelledby="task-heading">
@@ -194,12 +238,16 @@
           <div id="jobs-list" class="task-list"></div>
         </section>
         <section class="task-section" aria-labelledby="history-heading">
-          <header class="section-head"><h3 id="history-heading" data-i18n="historyTitle">历史任务与执行记录</h3><span id="history-count" class="count">0</span></header>
+          <header class="section-head"><h3 id="history-heading" data-i18n="historyTitle">历史任务与执行记录</h3><span id="history-count" class="count">0</span>
+            <button type="button" id="archive-finished-jobs" class="mini-btn" data-i18n="archiveFinished" hidden>归档已完成</button>
+          </header>
           <div id="history-filter" class="filters" role="group" data-i18n-aria="filterTitle">
             <button type="button" data-filter="all" data-i18n="all">全部</button>
             <button type="button" data-filter="success" data-i18n="success">成功</button>
             <button type="button" data-filter="failure" data-i18n="failure">失败</button>
+            <button type="button" data-filter="archived"></button>
           </div>
+          <button type="button" id="history-collapse-all" class="mini-btn" data-i18n="collapseAll" hidden>全部收起</button>
           <div id="history-list" class="task-list"></div>
           <div class="paging"><button id="history-more" type="button" hidden></button><button id="history-less" type="button" data-i18n="less" hidden>收起</button></div>
         </section>

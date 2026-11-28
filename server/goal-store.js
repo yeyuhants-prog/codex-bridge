@@ -14,8 +14,13 @@ const VALID_MILESTONE_STATUSES = new Set([
 ]);
 
 function readStore() {
-  return readJson(getGoalsPath(), { activeGoalId: null, goals: [] },
+  const store = readJson(getGoalsPath(), { activeGoalId: null, goals: [] },
     v => v && Array.isArray(v.goals) && v.goals.every(g => typeof g?.id === "string" && Array.isArray(g.milestones)));
+  for (const goal of store.goals) {
+    goal.archived ??= false;
+    goal.archivedAt ??= null;
+  }
+  return store;
 }
 
 function saveStore(store) {
@@ -91,6 +96,8 @@ export function createGoal({
       )
         .map((c) => String(c || "").trim())
         .filter(Boolean),
+      archived: false,
+      archivedAt: null,
       status: "active",
       sessionId: null,
       blockers: [],
@@ -123,6 +130,7 @@ export function setActiveGoal(goalId) {
     }
     const goal = store.goals.find((g) => g.id === goalId);
     if (!goal) throw problem(404, `Goal not found: ${goalId}`);
+    if (goal.archived) throw problem(409, "Restore the archived goal before activating it.");
     store.activeGoalId = goal.id;
     saveStore(store);
     return goal;
@@ -256,6 +264,7 @@ export function iterationLimit(goal, settings) {
 }
 
 function checkBudget(store, goal, otherReservations) {
+  if (goal.archived) throw problem(409, "Restore the archived goal before dispatch.");
   const limit = iterationLimit(goal, loadSettings());
   const used = (goal.iterationCount || 0) - (goal.iterationBaseline || 0);
   if (goal.status === "active" && used >= limit) {
@@ -339,6 +348,42 @@ export function recordGoalExecution(
   });
 }
 
+function nextActiveGoal(store) {
+  return store.goals.find(g => !g.archived && ["active", "paused"].includes(g.status))?.id || null;
+}
+
+function setArchived(store, goal, archived) {
+  goal.archived = archived;
+  goal.archivedAt = archived ? goal.archivedAt || new Date().toISOString() : null;
+  goal.updatedAt = new Date().toISOString();
+  if (archived && store.activeGoalId === goal.id) store.activeGoalId = nextActiveGoal(store);
+  if (!archived && !store.activeGoalId) store.activeGoalId = nextActiveGoal(store);
+}
+
+export function archiveGoal(goalId, archived = true) {
+  if (typeof archived !== "boolean") throw problem(400, "archived must be boolean.");
+  return withFileLock(getGoalsPath(), () => {
+    const store = readStore();
+    const goal = store.goals.find(g => g.id === goalId);
+    if (!goal) throw problem(404, "Goal not found: " + goalId);
+    if (goal.archived !== archived) {
+      setArchived(store, goal, archived);
+      saveStore(store);
+    }
+    return goal;
+  });
+}
+
+export function archiveCompletedGoals() {
+  return withFileLock(getGoalsPath(), () => {
+    const store = readStore();
+    const finished = store.goals.filter(g => !g.archived && ["completed", "failed"].includes(g.status));
+    for (const goal of finished) setArchived(store, goal, true);
+    if (finished.length) saveStore(store);
+    return finished.length;
+  });
+}
+
 export function deleteGoal(goalId) {
   return withFileLock(getGoalsPath(), () => {
     const store = readStore();
@@ -346,7 +391,7 @@ export function deleteGoal(goalId) {
     if (idx === -1) return false;
     store.goals.splice(idx, 1);
     if (store.activeGoalId === goalId) {
-      store.activeGoalId = store.goals[0]?.id || null;
+      store.activeGoalId = nextActiveGoal(store);
     }
     saveStore(store);
     return true;

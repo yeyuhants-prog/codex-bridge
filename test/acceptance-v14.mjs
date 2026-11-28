@@ -29,7 +29,7 @@ const PROJ_B = "bbbb2222-0000-4000-8000-000000000002";
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-class McpClient {
+export class McpClient {
   constructor(env = {}) {
     this.child = spawn(process.execPath, [MCP_SERVER], {
       cwd: PLUGIN_ROOT,
@@ -780,6 +780,7 @@ async function runTests() {
     const stopStart = await mcpStop.callTool("codex_start", {prompt:"stop lifecycle fixture",cwd:projectDir,conversation_id:CONV_A});
     const stopId = /Job ID: (codex_[a-f0-9]+)/.exec(stopStart.content[0].text)[1];
     await waitForJob(stopId,j => j.status === "running" && j.pid);
+    assert.equal((await sidecarPost("/api/jobs/archive", { jobId: stopId, archived: true })).status, 409);
     const stopped = await sidecarPost("/api/jobs/stop", {jobId:stopId});
     assert.equal(stopped.status,200, JSON.stringify(stopped.data));
     for(let i=0;i<50;i++) {
@@ -829,6 +830,27 @@ async function runTests() {
     console.log("  PASS: Shared MCP closed-loop delivered to Conv A (auto-resolved projectId) and safely quarantined invalid conversation_id.");
 
     // =========================================================================
+    const preferences = { modelRouting: "pinned", taskTimeoutSeconds: 0, transport: "http", disableDesktopNotify: false };
+    const saved = await sidecarPost("/api/settings", preferences);
+    for (const [key, value] of Object.entries(preferences)) assert.equal(saved.data.settings[key], value);
+    assert.equal((await sidecarPost("/api/settings", { disableDesktopNotify: "false" })).status, 400);
+    assert.equal((await sidecarPost("/api/jobs/archive", { finishedOnly: "false" })).status, 400);
+    assert.equal((await sidecarPost("/api/goals/archive", { completedOnly: "false" })).status, 400);
+    for (const archived of [true, false]) {
+      const response = await sidecarPost("/api/jobs/archive", { jobId: stopId, archived });
+      assert.equal(response.status, 200);
+      const snapshot = await getState();
+      assert.equal(snapshot.jobs.find(j => j.id === stopId).archived, archived);
+      assert.equal(snapshot.history.find(r => r.jobId === stopId).archived, archived);
+    }
+    const archiveGoal = (await sidecarPost("/api/goals", { title: "Archive integration" })).data.goal;
+    await sidecarPost("/api/goals/status", { goalId: archiveGoal.id, status: "completed" });
+    assert.equal((await sidecarPost("/api/goals/archive", { completedOnly: true })).status, 200);
+    assert.equal((await getState()).goalsStore.goals.find(g => g.id === archiveGoal.id).archived, true);
+    assert.equal((await sidecarPost("/api/goals/archive", { goalId: archiveGoal.id, archived: false })).status, 200);
+    assert.equal((await getState()).goalsStore.goals.find(g => g.id === archiveGoal.id).archived, false);
+    console.log("  PASS: Sidecar v1.6 settings, archive routes, restore and active-job protection.");
+
     // BONUS REAL CLI VERIFICATION (when --real-cli passed): Real read-only resume write denial
     // =========================================================================
     if (RUN_REAL_CLI) {
@@ -908,7 +930,7 @@ async function runTests() {
   }
 }
 
-runTests().catch((err) => {
+if (path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) runTests().catch((err) => {
   console.error("ACCEPTANCE TEST FAILED:", err);
   process.exit(1);
 });

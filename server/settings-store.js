@@ -1,4 +1,5 @@
 import { problem } from "./validation.js";
+import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
@@ -37,6 +38,14 @@ export const DEFAULT_SETTINGS = {
   language: "zh", // "zh" | "en"
   roleMode: "orchestrator", // "orchestrator" | "flexible"
   model: "", // "" means follow ~/.codex/config.toml default
+  modelRouting: "flexible",
+  transport: "default",
+  disableDesktopNotify: true,
+  taskTimeoutSeconds: 7200,
+  autoHealEnabled: true,
+  stallThresholdSeconds: 240,
+  maxAutoHeals: 2,
+  monitorIntervalSeconds: 300,
   reasoningEffort: "", // "" means follow model/config default
   sandbox: "workspace-write",
   workflowMode: "direct", // "direct" | "plan_first"
@@ -48,6 +57,12 @@ export const DEFAULT_SETTINGS = {
   skipGitRepoCheck: true,
 };
 
+const VALID_ROUTING = new Set(["flexible", "pinned"]);
+const VALID_TRANSPORT = new Set(["default", "websocket", "http"]);
+const validTimeout = value => value === 0 || (Number.isInteger(value) && value >= 60 && value <= 14400);
+const validStallThreshold = value => value === 0 || (Number.isInteger(value) && value >= 60 && value <= 1800);
+const validMonitorInterval = value => value === 0 || (Number.isInteger(value) && value >= 60 && value <= 1800);
+const validMaxAutoHeals = value => Number.isInteger(value) && value >= 0 && value <= 5;
 const VALID_LANGUAGES = new Set(["zh", "en"]);
 const VALID_ROLE_MODES = new Set(["orchestrator", "flexible"]);
 
@@ -86,6 +101,14 @@ export function loadSettings() {
       roleMode: VALID_ROLE_MODES.has(raw.roleMode)
         ? raw.roleMode
         : DEFAULT_SETTINGS.roleMode,
+      modelRouting: VALID_ROUTING.has(raw.modelRouting) ? raw.modelRouting : DEFAULT_SETTINGS.modelRouting,
+      transport: VALID_TRANSPORT.has(raw.transport) ? raw.transport : DEFAULT_SETTINGS.transport,
+      disableDesktopNotify: typeof raw.disableDesktopNotify === "boolean" ? raw.disableDesktopNotify : DEFAULT_SETTINGS.disableDesktopNotify,
+      taskTimeoutSeconds: validTimeout(raw.taskTimeoutSeconds) ? raw.taskTimeoutSeconds : DEFAULT_SETTINGS.taskTimeoutSeconds,
+      autoHealEnabled: typeof raw.autoHealEnabled === "boolean" ? raw.autoHealEnabled : DEFAULT_SETTINGS.autoHealEnabled,
+      stallThresholdSeconds: validStallThreshold(raw.stallThresholdSeconds) ? raw.stallThresholdSeconds : DEFAULT_SETTINGS.stallThresholdSeconds,
+      maxAutoHeals: validMaxAutoHeals(raw.maxAutoHeals) ? raw.maxAutoHeals : DEFAULT_SETTINGS.maxAutoHeals,
+      monitorIntervalSeconds: validMonitorInterval(raw.monitorIntervalSeconds) ? raw.monitorIntervalSeconds : DEFAULT_SETTINGS.monitorIntervalSeconds,
       model: typeof raw.model === "string" ? raw.model.trim() : "",
       reasoningEffort: VALID_EFFORTS.has(raw.reasoningEffort)
         ? raw.reasoningEffort
@@ -126,14 +149,18 @@ export function loadSettings() {
 
 export function saveSettings(patch = {}) {
   return withFileLock(getSettingsPath(), () => {
-    for (const key of ["ephemeral", "skipGitRepoCheck"]) {
+    for (const key of ["ephemeral", "skipGitRepoCheck", "disableDesktopNotify", "autoHealEnabled"]) {
       if (patch[key] !== undefined && typeof patch[key] !== "boolean") throw problem(400, key + " must be boolean.");
     }
-    for (const [key, allowed] of Object.entries({ language: VALID_LANGUAGES, roleMode: VALID_ROLE_MODES,
+    for (const [key, allowed] of Object.entries({ modelRouting: VALID_ROUTING, transport: VALID_TRANSPORT, language: VALID_LANGUAGES, roleMode: VALID_ROLE_MODES,
       reasoningEffort: VALID_EFFORTS, sandbox: VALID_SANDBOXES, workflowMode: VALID_WORKFLOW_MODES,
       progressionMode: VALID_PROGRESSION_MODES })) {
       if (patch[key] !== undefined && !allowed.has(patch[key])) throw problem(400, "Invalid setting: " + key);
     }
+    if (patch.taskTimeoutSeconds !== undefined && !validTimeout(patch.taskTimeoutSeconds)) throw problem(400, "Invalid taskTimeoutSeconds.");
+    if (patch.stallThresholdSeconds !== undefined && !validStallThreshold(patch.stallThresholdSeconds)) throw problem(400, "Invalid stallThresholdSeconds.");
+    if (patch.maxAutoHeals !== undefined && !validMaxAutoHeals(patch.maxAutoHeals)) throw problem(400, "Invalid maxAutoHeals.");
+    if (patch.monitorIntervalSeconds !== undefined && !validMonitorInterval(patch.monitorIntervalSeconds)) throw problem(400, "Invalid monitorIntervalSeconds.");
     if (patch.maxAutoIterations !== undefined && (!Number.isInteger(patch.maxAutoIterations) ||
       patch.maxAutoIterations < 1 || patch.maxAutoIterations > 100)) throw problem(400, "Invalid maxAutoIterations.");
     const next = loadSettings();
@@ -164,14 +191,15 @@ export function resetSettings() {
 }
 
 export function loadHistory() {
-  return readJson(getHistoryPath(), [], Array.isArray);
+  return readJson(getHistoryPath(), [], Array.isArray).map(row => ({ archived: false, archivedAt: null, ...row }));
 }
 
 export function appendHistory(entry) {
   return withFileLock(getHistoryPath(), () => {
     const list = loadHistory();
-    list.unshift({ at: new Date().toISOString(), ...entry });
-    writeJsonAtomic(getHistoryPath(), list.slice(0, 30));
+    list.unshift({ historyKey: randomUUID(), archived: false, archivedAt: null, at: new Date().toISOString(), ...entry });
+    let recent = 0;
+    writeJsonAtomic(getHistoryPath(), list.filter(row => row.archived || ++recent <= 30));
   });
 }
 

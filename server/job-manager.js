@@ -1,9 +1,9 @@
 import { readJson, withFileLock } from "./file-store.js";
 import { processIdentity, matchesProcess } from "./process-identity.js";
 import { validateBooleans, problem } from "./validation.js";
-import { resolveResume, directoryList, workingDirectory } from "./run-policy.js";
+import { resolveResume, workerModel, directoryList, workingDirectory } from "./run-policy.js";
+import { taskRows, historyKey } from "../sidecars/codex_panel/view-model.mjs";
 import crypto from "node:crypto";
-import fs from "node:fs";
 import path from "node:path";
 import {
   runCodex,
@@ -14,7 +14,7 @@ import {
   getJobsPath,
   writeJsonAtomic,
   loadSettings,
-  appendHistory,
+  appendHistory, loadHistory, getHistoryPath,
 } from "./settings-store.js";
 import { abandonGoalDispatch, reserveGoalDispatch, recordGoalExecution } from "./goal-store.js";
 import {
@@ -45,15 +45,66 @@ export const activeStates = new Set(["running", "stopping", "running_detached"])
 export const callbackTerminal = new Set(["completed", "failed", "timed_out", "interrupted", "cancelled"]);
 
 export function readPersistedJobs() {
-  return readJson(getJobsPath(), [], rows => Array.isArray(rows) && rows.every(row => typeof row?.id === "string"));
+  const jobs = readJson(getJobsPath(), [], rows => Array.isArray(rows) && rows.every(row => typeof row?.id === "string"));
+  return jobs.map(job => ({ archived: false, archivedAt: null, lastEventAt: job.startedAt, ...job }));
 }
 
 function writePersistedJobs(list) {
-  let archived = 0;
-  const retained = list.filter(j => activeStates.has(j.status) ||
+  let recent = 0;
+  const retained = list.filter(j => j.archived || activeStates.has(j.status) ||
     (j.notifyOnComplete && !j.callbackSent && (!j.callbackStatus || ["pending", "sending", "failed", "unrouted"].includes(j.callbackStatus))) ||
-    ++archived <= MAX_STORED_JOBS);
+    ++recent <= MAX_STORED_JOBS);
   writeJsonAtomic(getJobsPath(), retained);
+}
+
+// Match the same execution the panel displays, including uniquely matched legacy rows.
+export function archiveExecutions(request) {
+  validateBooleans(request);
+  const { jobId, historyKey: key, sessionId, at, conversationId, finishedOnly, archived = true } = request;
+  if (conversationId !== undefined && (typeof conversationId !== "string" || !conversationId.trim())) {
+    throw problem(400, "Invalid conversationId.");
+  }
+  const byTime = at !== undefined || sessionId !== undefined;
+  if ([Boolean(jobId), Boolean(key), byTime, finishedOnly === true].filter(Boolean).length !== 1 ||
+      (byTime && (!at || sessionId === undefined)) || (finishedOnly && !archived)) {
+    throw problem(400, "Select one job, history record, or finishedOnly.");
+  }
+  return withFileLock(getJobsPath(), () => withFileLock(getHistoryPath(), () => {
+    const jobs = readPersistedJobs();
+    const history = loadHistory();
+    const rows = taskRows(jobs, history);
+    let targets;
+    if (finishedOnly) {
+      targets = rows.filter(row => !activeStates.has(row.status) && (!conversationId || row.conversationId === conversationId));
+    } else {
+      let targetKey = key;
+      if (byTime) {
+        const records = history.filter(record => record.at === at && record.sessionId === sessionId);
+        if (records.length > 1) throw problem(409, "Ambiguous history record. Use historyKey.");
+        targetKey = records.length ? historyKey(records[0]) : null;
+      }
+      targets = rows.filter(row => jobId ? (row.id || row.jobId) === jobId :
+        targetKey && (row.historyKey === targetKey || row.historyKey === "history:" + targetKey));
+      if (!targets.length) throw problem(404, "Execution record not found.");
+      if (targets.some(row => activeStates.has(row.status))) throw problem(409, "Active jobs cannot be archived.");
+    }
+    const ids = new Set(targets.map(row => row.id).filter(Boolean));
+    const keys = new Set(targets.map(row => row.historyKey).filter(Boolean));
+    const now = new Date().toISOString();
+    const update = row => Boolean(row.archived) === archived ? row :
+      { ...row, archived, archivedAt: archived ? now : null };
+    const updatedJobs = jobs.map(job => ids.has(job.id) ? update(job) : job);
+    const updatedHistory = history.map(row => ids.has(row.jobId) || keys.has(historyKey(row)) ? update(row) : row);
+    const historyChanged = updatedHistory.some((row, index) => row !== history[index]);
+    if (historyChanged) writeJsonAtomic(getHistoryPath(), updatedHistory);
+    try {
+      if (updatedJobs.some((job, index) => job !== jobs[index])) writeJsonAtomic(getJobsPath(), updatedJobs);
+    } catch (error) {
+      if (historyChanged) writeJsonAtomic(getHistoryPath(), history);
+      throw error;
+    }
+    return { ok: true };
+  }));
 }
 
 function mutateJob(id, change) {
@@ -102,6 +153,50 @@ export function finishCallback(id, token, patch) {
     if (!token || job.callbackClaim !== token) throw problem(409, "Callback lease no longer owned");
     Object.assign(job, patch, { callbackClaim: null, callbackLeaseUntil: null });
   });
+}
+
+export function claimPeriodicCheckIn(id, intervalSeconds) {
+  return mutateJob(id, job => {
+    if (!["running", "running_detached"].includes(job.status) || job.notifyOnComplete === false) {
+      throw problem(409, "Job is not eligible for periodic check-in.");
+    }
+    const now = Date.now();
+    if (job.checkInClaim && Date.parse(job.checkInLeaseUntil) > now) {
+      throw problem(409, "Periodic check-in already in progress.");
+    }
+    const refMs = Date.parse(job.lastCheckInAt || job.startedAt) || now;
+    if (now - refMs < intervalSeconds * 1000) {
+      throw problem(409, "Periodic check-in interval has not elapsed.");
+    }
+    job.checkInClaim = crypto.randomUUID();
+    job.checkInLeaseUntil = new Date(now + 60_000).toISOString();
+  });
+}
+
+export function finishPeriodicCheckIn(id, token, { delivered = false, error = null } = {}) {
+  return mutateJob(id, job => {
+    if (!token || job.checkInClaim !== token) throw problem(409, "Check-in lease no longer owned");
+    job.checkInClaim = null;
+    job.checkInLeaseUntil = null;
+    job.lastCheckInAt = new Date().toISOString();
+    if (delivered) {
+      job.checkInCount = (job.checkInCount || 0) + 1;
+      job.lastCheckInError = null;
+    } else if (error) {
+      job.lastCheckInError = String(error);
+    }
+  });
+}
+
+function buildAutoHealPrompt(job, attempt, maxHeals, stallReason) {
+  return [
+    `[Auto-Heal Resume #${attempt}/${maxHeals}]`,
+    `Previous background run (${job.id}) was stopped by the L1 network-stall watchdog (${stallReason || "upstream stream stalled"}).`,
+    `Do NOT repeat already-completed downloads, installs, or file edits.`,
+    `First inspect current workspace state (e.g., git status, existing files, recent test outputs) in ${job.cwd}.`,
+    `If all requested changes and verification checks are already complete, summarize the verified results immediately and finish.`,
+    `Otherwise continue cleanly from the exact point where work paused and complete the remaining verification.`,
+  ].join("\n");
 }
 
 export function reconcilePersistedJobs(localRunningIds = new Set()) {
@@ -165,6 +260,9 @@ export class JobManager {
         live.callbackAt = rec.callbackAt;
         live.callbackError = rec.callbackError;
         live.callbackAttempts = rec.callbackAttempts || live.callbackAttempts || 0;
+        live.lastCheckInAt = rec.lastCheckInAt || live.lastCheckInAt || null;
+        live.checkInCount = rec.checkInCount || live.checkInCount || 0;
+        live.lastCheckInError = rec.lastCheckInError ?? live.lastCheckInError ?? null;
         continue;
       }
       const existing = this.jobs.get(rec.id);
@@ -204,6 +302,19 @@ export class JobManager {
       prompt: job.prompt,
       promptPreview: job.promptPreview,
       startedAt: job.startedAt,
+      lastEventAt: job.lastEventAt || job.startedAt,
+      timeoutSeconds: job.timeoutSeconds,
+      phase: job.phase || "waiting_api",
+      activeCommands: job.activeCommands || 0,
+      reconnectCount: job.reconnectCount || 0,
+      autoHealCount: job.autoHealCount || 0,
+      autoHealFromJobId: job.autoHealFromJobId || null,
+      autoHealedToJobId: job.autoHealedToJobId || null,
+      stallReason: job.stallReason || null,
+      lastCheckInAt: job.lastCheckInAt || null,
+      checkInCount: job.checkInCount || 0,
+      lastCheckInError: job.lastCheckInError || null,
+      archived: Boolean(job.archived), archivedAt: job.archivedAt || null,
       finishedAt: job.finishedAt,
       pid: job.pid || null,
       ownerPid: job.ownerPid || process.pid,
@@ -242,6 +353,18 @@ export class JobManager {
       const serialized = this._serializeJob(job);
       if (idx >= 0) {
         const onDisk = list[idx];
+        serialized.archived = Boolean(onDisk.archived);
+        serialized.archivedAt = onDisk.archivedAt || null;
+        for (const field of ["lastCheckInAt", "checkInCount", "lastCheckInError", "checkInClaim", "checkInLeaseUntil"]) {
+          if (onDisk[field] !== undefined && serialized[field] == null) serialized[field] = onDisk[field];
+        }
+        if (onDisk.checkInClaim !== undefined) serialized.checkInClaim = onDisk.checkInClaim;
+        if (onDisk.checkInLeaseUntil !== undefined) serialized.checkInLeaseUntil = onDisk.checkInLeaseUntil;
+        if (typeof onDisk.checkInCount === "number" && onDisk.checkInCount > (serialized.checkInCount || 0)) {
+          serialized.checkInCount = onDisk.checkInCount;
+          serialized.lastCheckInAt = onDisk.lastCheckInAt;
+          serialized.lastCheckInError = onDisk.lastCheckInError ?? null;
+        }
         if (["stopping", "cancelled"].includes(onDisk.status)) {
           job.status = serialized.status = onDisk.status === "stopping" && activeStates.has(job.status) ? "stopping" : "cancelled";
           serialized.notifyOnComplete = false;
@@ -290,6 +413,15 @@ export class JobManager {
     options.addDirs = directoryList(options.addDirs || [], options.cwd);
     reconcilePersistedJobs(this._localRunningIds);
     const settings = loadSettings();
+    const timeoutMs = options.timeoutMs === undefined ? settings.taskTimeoutSeconds * 1000 : options.timeoutMs;
+    const stallTimeoutMs =
+      options.stallTimeoutMs !== undefined
+        ? options.stallTimeoutMs
+        : settings.autoHealEnabled && settings.stallThresholdSeconds > 0
+          ? settings.stallThresholdSeconds * 1000
+          : 0;
+    const reconnectStallMs = options.reconnectStallMs;
+    const model = workerModel(settings, options.model, options.force_model);
     const mode = options.mode || (options.sessionId ? "resume" : "run");
     const exactSid =
       options.sessionId ? normalizeSessionId(options.sessionId) : "";
@@ -350,6 +482,7 @@ export class JobManager {
         ? "pending"
         : "unrouted";
 
+    const startedAt = new Date().toISOString();
     const job = {
       id: jobId,
       parentJobId: options.parentJobId || null,
@@ -358,14 +491,25 @@ export class JobManager {
       mode,
       status: "running",
       cwd: options.cwd ? path.resolve(options.cwd) : process.cwd(),
-      model: options.model || "",
+      model: model || "",
       reasoningEffort: options.reasoningEffort || "",
       sandbox: options.sandbox || "workspace-write",
       goalId: options.goalId || null,
       milestoneId: options.milestoneId || null,
       prompt: options.prompt,
       promptPreview: (options.prompt || "").replace(/\s+/g, " ").slice(0, 160),
-      startedAt: new Date().toISOString(),
+      startedAt, lastEventAt: startedAt, timeoutSeconds: timeoutMs / 1000,
+      phase: "waiting_api",
+      activeCommands: 0,
+      reconnectCount: 0,
+      autoHealCount: Number.isInteger(options.autoHealCount) ? options.autoHealCount : 0,
+      autoHealFromJobId: options.autoHealFromJobId || null,
+      autoHealedToJobId: null,
+      stallReason: null,
+      lastCheckInAt: null,
+      checkInCount: 0,
+      lastCheckInError: null,
+      archived: false, archivedAt: null,
       finishedAt: null,
       pid: null,
       ownerPid: process.pid,
@@ -395,7 +539,7 @@ export class JobManager {
     this._localRunningIds.add(jobId);
     let reservation;
     try {
-      reservation = reserveGoalDispatch(job.goalId, job.milestoneId);
+      reservation = options.isAutoHeal ? null : reserveGoalDispatch(job.goalId, job.milestoneId);
       this._persistJob(job);
     } catch (err) {
       this._localRunningIds.delete(jobId);
@@ -412,18 +556,20 @@ export class JobManager {
       throw err;
     }
 
-    let lastPersistAt = 0;
-
+    let pendingAutoHeal = null;
     const promise = Promise.resolve().then(() => runCodex({
       ...options,
       mode,
       cwd: job.cwd,
       sandbox: job.sandbox, skipGitRepoCheck: job.skipGitRepoCheck,
       sessionId: exactSid || undefined,
-      timeoutMs: options.timeoutMs ?? 1_800_000,
+      timeoutMs, stallTimeoutMs, reconnectStallMs, model,
+      transport: options.transport ?? settings.transport,
+      disableDesktopNotify: options.disableDesktopNotify ?? settings.disableDesktopNotify,
       signal: abortController.signal,
       onSpawn: (child) => {
         job.child = child;
+        job.lastEventAt = new Date().toISOString();
         job.pid = child.pid || null;
         job.processIdentity = processIdentity(job.pid);
         if (lockedSessionId && job.pid) {
@@ -435,8 +581,12 @@ export class JobManager {
           reservation = null;
         }
       },
-      onProgress: ({ eventCount, summary, sessionId }) => {
+      onProgress: ({ eventCount, summary, sessionId, phase, activeCommands, reconnectCount }) => {
+        job.lastEventAt = new Date().toISOString();
         job.eventCount = eventCount;
+        if (phase) job.phase = phase;
+        if (typeof activeCommands === "number") job.activeCommands = activeCommands;
+        if (typeof reconnectCount === "number") job.reconnectCount = reconnectCount;
         if (sessionId) sessionId = normalizeSessionId(sessionId);
         const gotNewSession = sessionId && sessionId !== job.sessionId;
         if (sessionId) job.sessionId = sessionId;
@@ -452,7 +602,7 @@ export class JobManager {
           job.lockToken = lockToken = acq.ownerToken;
         }
         job.recentEvents.push({
-          at: new Date().toISOString(),
+          at: job.lastEventAt,
           summary,
         });
         if (job.recentEvents.length > 40) {
@@ -466,28 +616,54 @@ export class JobManager {
             incrementIteration: false,
           });
         }
-        const now = Date.now();
-        if (gotNewSession || now - lastPersistAt > 2000) {
-          lastPersistAt = now;
-          this._persistJob(job);
-        }
+        this._persistJob(job);
       },
     }))
       .then((result) => {
         job.result = result;
         job.sessionId = result.sessionId?.toLowerCase() || job.sessionId;
-        job.status = (job.status === "stopping" || abortController.signal.aborted ||
-          readPersistedJobs().some(j => j.id === job.id && ["stopping","cancelled"].includes(j.status))) ? "cancelled" : result.ok
+        job.phase = result.ok ? "completed" : result.phase || job.phase;
+        job.stallReason = result.stallReason || null;
+        const wasCancelled = job.status === "stopping" || abortController.signal.aborted ||
+          readPersistedJobs().some(j => j.id === job.id && ["stopping","cancelled"].includes(j.status));
+        job.status = wasCancelled ? "cancelled" : result.ok
           ? "completed"
           : result.cancelled
             ? "cancelled"
             : result.timedOut
               ? "timed_out"
-              : "failed";
+              : result.stalled
+                ? "interrupted"
+                : "failed";
+        if (result.stalled && result.stallReason) {
+          job.error = result.stallReason;
+        }
         job.finishedAt = new Date().toISOString();
         if (job.status === "cancelled") {
           job.callbackStatus = "skipped";
           job.result = { ...result, ok: false, cancelled: true };
+        }
+        const liveSettings = loadSettings();
+        const maxHeals = liveSettings.maxAutoHeals ?? 2;
+        if (
+          !wasCancelled &&
+          result.stalled &&
+          liveSettings.autoHealEnabled &&
+          (job.autoHealCount || 0) < maxHeals &&
+          job.sessionId &&
+          job.sessionId !== "last"
+        ) {
+          pendingAutoHeal = {
+            attempt: (job.autoHealCount || 0) + 1,
+            maxHeals,
+            stallReason: result.stallReason,
+            notifyOnComplete: job.notifyOnComplete,
+            stallTimeoutMs,
+            reconnectStallMs,
+            postTurnGraceMs: options.postTurnGraceMs,
+          };
+          job.notifyOnComplete = false;
+          job.callbackStatus = "skipped";
         }
         if (job.goalId && job.sessionId) {
           recordGoalExecution(job.goalId, {
@@ -531,7 +707,32 @@ export class JobManager {
           try { abandonGoalDispatch(job.goalId, reservation); }
           finally {
             try { if (lockedSessionId) releaseSessionLock(lockedSessionId, lockToken); }
-            finally { for (const wake of job.waiters.splice(0)) wake(); }
+            finally {
+              if (pendingAutoHeal) {
+                try {
+                  const healed = this.resumeFromJob(job.id, {
+                    prompt: buildAutoHealPrompt(job, pendingAutoHeal.attempt, pendingAutoHeal.maxHeals, pendingAutoHeal.stallReason),
+                    autoHealCount: pendingAutoHeal.attempt,
+                    autoHealFromJobId: job.id,
+                    isAutoHeal: true,
+                    notifyOnComplete: pendingAutoHeal.notifyOnComplete,
+                    stallTimeoutMs: pendingAutoHeal.stallTimeoutMs,
+                    reconnectStallMs: pendingAutoHeal.reconnectStallMs,
+                    postTurnGraceMs: pendingAutoHeal.postTurnGraceMs,
+                  });
+                  job.autoHealedToJobId = healed.job.id;
+                  this._persistJob(job);
+                } catch (healErr) {
+                  job.error = `${job.error || "Network stall"} (auto-heal failed: ${healErr.message})`;
+                  if (pendingAutoHeal.notifyOnComplete) {
+                    job.notifyOnComplete = true;
+                    job.callbackStatus = job.callbackTarget ? "pending" : "unrouted";
+                  }
+                  this._persistJob(job);
+                }
+              }
+              for (const wake of job.waiters.splice(0)) wake();
+            }
           }
         }
       });
@@ -543,7 +744,7 @@ export class JobManager {
 
   /**
    * Structured resume from a prior job_id:
-   * - Inherits exact sessionId, cwd, goalId, milestoneId, model, reasoningEffort, sandbox, callbackTarget.
+   * - Inherits exact sessionId, cwd, goalId, milestoneId, reasoningEffort, sandbox, callbackTarget. Model routing uses current preferences.
    * - Refuses missing sessionId (no 'last' fallback).
    * - Enforces sandbox non-escalation unless allowSandboxEscalation is explicitly true.
    * - Enforces cross-process per-session mutual exclusion (reuses active job if already running).
@@ -648,8 +849,10 @@ export class JobManager {
   }
 
   formatJobStatus(job) {
+    const timeout = "Task Timeout: " + (job.timeoutSeconds === 0 ? "unlimited" :
+      job.timeoutSeconds === undefined ? "(unrecorded)" : job.timeoutSeconds + "s");
     if (job.result) {
-      const extra = [];
+      const extra = [timeout];
       if (job.parentJobId) extra.push(`Parent Job: ${job.parentJobId}`);
       if (job.goalId) {
         extra.push(
@@ -665,16 +868,22 @@ export class JobManager {
     const lines = [
       `Job ID: ${job.id}`,
       `Status: ${job.status}`,
+      `Phase: ${job.phase || "waiting_api"}${job.reconnectCount ? ` (reconnects=${job.reconnectCount})` : ""}`,
+      timeout,
       `Mode: ${job.mode}`,
       `Session ID: ${job.sessionId || "(none)"}`,
       `Working Dir: ${job.cwd}`,
       `Sandbox: ${job.sandbox || "workspace-write"}`,
       `PID: ${job.pid || "(none)"}`,
       `Started At: ${job.startedAt}`,
+      `Last Event At: ${job.lastEventAt || job.startedAt}`,
       `Events Seen: ${job.eventCount}`,
       `Callback: ${job.callbackStatus}${job.callbackTarget ? ` -> ${job.callbackTarget.conversationId}` : ""}`,
     ];
 
+    if (job.autoHealCount > 0) lines.push(`Auto-Heal Attempt: #${job.autoHealCount}${job.autoHealFromJobId ? ` (from ${job.autoHealFromJobId})` : ""}`);
+    if (job.autoHealedToJobId) lines.push(`Auto-Healed To: ${job.autoHealedToJobId}`);
+    if (job.checkInCount > 0) lines.push(`Periodic Checks: ${job.checkInCount}${job.lastCheckInAt ? ` (last ${job.lastCheckInAt})` : ""}`);
     if (job.parentJobId) lines.push(`Parent Job: ${job.parentJobId}`);
     if (job.goalId) {
       lines.push(

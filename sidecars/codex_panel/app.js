@@ -12,6 +12,7 @@ let historyLimit = pageSize;
 const collapsed = new Set();
 const expanded = new Set();
 const busy = new Set();
+const foldedMilestones = new Set();
 let stateReqSeq = 0;
 let settingsVersion = 0;
 let pendingSettings = 0;
@@ -44,6 +45,7 @@ const el = {
   maxIterInput: document.getElementById("max-iter-input"),
   sandboxGroup: document.getElementById("sandbox-group"),
   workflowGroup: document.getElementById("workflow-group"),
+  toggleAutoHeal: document.getElementById("toggle-auto-heal"),
   toggleEphemeral: document.getElementById("toggle-ephemeral"),
   quickTask: document.getElementById("quick-task"),
   btnRefresh: document.getElementById("btn-refresh"),
@@ -247,9 +249,36 @@ function renderEfforts() {
   el.effortDesc.textContent = activeDesc;
 }
 
+const preferenceGroups = [
+  ["model-routing-group", "modelRouting", "modelRouting"],
+  ["timeout-group", "timeout", "taskTimeoutSeconds"],
+  ["monitor-group", "monitor", "monitorIntervalSeconds"],
+  ["stall-group", "stall", "stallThresholdSeconds"],
+  ["transport-group", "transport", "transport"],
+];
+const numericPrefs = new Set(["taskTimeoutSeconds", "monitorIntervalSeconds", "stallThresholdSeconds"]);
+for (const [id, attribute, setting] of preferenceGroups) {
+  for (const btn of document.getElementById(id).querySelectorAll("button")) {
+    btn.addEventListener("click", () => {
+      const value = btn.dataset[attribute];
+      updateSetting({ [setting]: numericPrefs.has(setting) ? Number(value) : value });
+    });
+  }
+}
+
 function renderSegments() {
   const dict = t();
   const { settings } = state;
+  for (const [id, attribute, setting] of preferenceGroups) {
+    for (const btn of document.getElementById(id).querySelectorAll("button")) {
+      btn.classList.toggle("active", btn.dataset[attribute] === String(settings[setting]));
+    }
+  }
+  document.getElementById("model-routing-hint").textContent = settings.modelRouting === "pinned" ? dict.pinHint : dict.flexHint;
+  const timeoutGroup = document.getElementById("timeout-group");
+  if (!timeoutGroup.querySelector(".active") && Number.isInteger(settings.taskTimeoutSeconds)) {
+    document.getElementById("timeout-label").textContent = dict.timeoutTitle + " · " + settings.taskTimeoutSeconds + " s";
+  }
   for (const btn of el.roleGroup.querySelectorAll(".seg-btn")) {
     btn.classList.toggle("active", btn.dataset.role === settings.roleMode);
   }
@@ -268,6 +297,7 @@ function renderSegments() {
       btn.dataset.workflow === settings.workflowMode
     );
   }
+  el.toggleAutoHeal.checked = settings.autoHealEnabled !== false;
   el.toggleEphemeral.checked = Boolean(settings.ephemeral);
   el.maxIterInput.value = String(settings.maxAutoIterations || 12);
 
@@ -278,16 +308,48 @@ function renderSegments() {
   el.bindBadge.className = "hint ok";
 }
 
+async function mutatePanel(url, data) {
+  try {
+    await post(url, data);
+    await fetchState(true);
+  } catch (error) { showToast(t().toastActionErr(error.message), true); }
+}
+
+document.getElementById("archive-finished-goals").addEventListener("click", () =>
+  mutatePanel("/api/goals/archive", { completedOnly: true }));
+
+function renderArchivedGoals(goals) {
+  const drawer = document.getElementById("archived-goals");
+  drawer.hidden = !goals.length;
+  document.getElementById("archived-goals-heading").textContent = t().archivedGoals + " (" + goals.length + ")";
+  const list = document.getElementById("archived-goals-list");
+  const opened = new Set([...list.querySelectorAll("details[open]")].map(detail => detail.dataset.id));
+  list.replaceChildren();
+  for (const goal of goals) {
+    const detail = node("details", "archived-goal");
+    detail.dataset.id = goal.id;
+    detail.open = opened.has(goal.id);
+    detail.append(node("summary", "", goal.title), node("p", "helper", [
+      t().taskStatuses[goal.status], goal.objective, goal.cwd, ...goal.milestones.map(m => m.title),
+    ].filter(Boolean).join("\n")),
+      button(t().restoreGoal, "mini-btn restore-goal", () => mutatePanel("/api/goals/archive", { goalId: goal.id, archived: false })),
+      button(t().deleteBtn, "mini-btn danger", () => mutatePanel("/api/goals/delete", { goalId: goal.id })));
+    list.append(detail);
+  }
+}
+
 function renderGoals() {
   const dict = t();
   const store = state.goalsStore || { activeGoalId: null, goals: [] };
-  const goals = store.goals || [];
+  const goals = store.goals.filter(g => !g.archived);
+  renderArchivedGoals(store.goals.filter(g => g.archived));
+  document.getElementById("archive-finished-goals").hidden = !goals.some(g => ["completed", "failed"].includes(g.status));
   const activeGoal =
     goals.find((g) => g.id === store.activeGoalId) || goals[0] || null;
 
-  if (goals.length > 1) {
-    el.goalSelectorRow.classList.remove("hidden");
-    el.goalSelect.replaceChildren();
+  el.goalSelect.replaceChildren();
+  el.goalSelectorRow.classList.toggle("hidden", goals.length <= 1);
+  if (goals.length) {
     for (const g of goals) {
       const opt = document.createElement("option");
       opt.value = g.id;
@@ -296,8 +358,6 @@ function renderGoals() {
       el.goalSelect.appendChild(opt);
     }
     if (activeGoal) el.goalSelect.value = activeGoal.id;
-  } else {
-    el.goalSelectorRow.classList.add("hidden");
   }
 
   el.activeGoalView.replaceChildren();
@@ -441,7 +501,25 @@ function renderGoals() {
   });
   actions.appendChild(btnDelete);
 
-  el.activeGoalView.append(header, track, msList, actions);
+  actions.append(button(dict.archiveBtn, "mini-btn archive-goal", () =>
+    mutatePanel("/api/goals/archive", { goalId: activeGoal.id, archived: true })));
+
+  el.activeGoalView.append(header, track);
+  if (totalCount) {
+    const toggle = button("", "mini-btn milestone-toggle", () => {
+      if (foldedMilestones.has(activeGoal.id)) foldedMilestones.delete(activeGoal.id);
+      else foldedMilestones.add(activeGoal.id);
+      updateMilestones();
+    });
+    function updateMilestones() {
+      msList.hidden = foldedMilestones.has(activeGoal.id);
+      toggle.textContent = msList.hidden ? dict.expandMilestones : dict.foldMilestones;
+      toggle.setAttribute("aria-expanded", String(!msList.hidden));
+    }
+    updateMilestones();
+    el.activeGoalView.append(toggle, msList);
+  }
+  el.activeGoalView.append(actions);
 }
 
 function node(tag, className, text) {
@@ -536,6 +614,8 @@ function renderPrompt(card, row) {
     if (expanded.has(row.key)) expanded.delete(row.key);
     else expanded.add(row.key);
     update();
+    if (!expanded.has(row.key)) prompt.scrollTop = 0;
+    updateCollapseControl();
   });
   toggle.dataset.key = JSON.stringify([row.key, "prompt"]);
   function update() {
@@ -556,9 +636,21 @@ const promptObserver = new ResizeObserver(entries => {
   for (const { target } of entries) {
     if (!target.isConnected) continue;
     const toggle = target.nextElementSibling;
+    if (!toggle?.classList.contains("prompt-toggle") || !target.clientWidth) continue;
     toggle.hidden = !target.classList.contains("expanded") && target.scrollHeight <= target.clientHeight + 1;
   }
 });
+
+function updateIdleNote(note) {
+  const idleSeconds = Math.floor((Date.now() - Date.parse(note.dataset.lastEvent)) / 1000);
+  const phase = note.dataset.phase || "waiting_api";
+  note.hidden = !(idleSeconds >= 180);
+  if (!note.hidden) {
+    const mins = Math.floor(idleSeconds / 60);
+    const secs = idleSeconds % 60;
+    note.textContent = phase === "running_cmd" ? t().cmdRunningNote(mins, secs) : t().idleWarning(mins, secs);
+  }
+}
 
 function taskCard(row) {
   const d = t();
@@ -596,6 +688,12 @@ function taskCard(row) {
     add("Tokens · " + d.tokensIn + " " + tokens(row.usage.input_tokens) + " / " + d.tokensOut + " " + tokens(row.usage.output_tokens), "tokens");
   }
   if (row.eventCount != null || live) add(d.events + " · " + (row.eventCount || 0), live ? "event-count" : "");
+  if (live && row.phase) {
+    const phaseText = (d.phaseLabels[row.phase] || row.phase) + (row.phase === "reconnecting" && row.reconnectCount ? ` (${row.reconnectCount})` : "");
+    add(phaseText, row.phase === "reconnecting" ? "danger-full-access" : "read-only");
+  }
+  if (row.autoHealCount > 0) add(d.autoHealChip(row.autoHealCount), "transfer");
+  if (row.checkInCount > 0) add(d.checkInChip(row.checkInCount));
   if (row.parentJobId) add("← " + row.parentJobId);
   if (row.goalId) add([row.goalId, row.milestoneId].filter(Boolean).join(" / "));
   card.append(meta);
@@ -604,6 +702,14 @@ function taskCard(row) {
     cwd.title = d.workdir + " · " + row.cwd;
     card.append(cwd);
   }
+  if (live) {
+    const idle = node("div", "task-note idle-warning");
+    idle.dataset.lastEvent = row.lastEventAt || row.startedAt || "";
+    idle.dataset.phase = row.phase || "waiting_api";
+    updateIdleNote(idle);
+    card.append(idle);
+  }
+  if (row.autoHealedToJobId) card.append(node("div", "task-note", d.autoHealedNote(row.autoHealedToJobId)));
   if (row.status === "running_detached") card.append(node("div", "task-note", d.detachedBanner(row.pid)));
   if (!live && row.error) card.append(node("div", "task-note", row.error));
   if (row.kind === "job") {
@@ -620,6 +726,12 @@ function taskCard(row) {
         showToast(result.alreadyFinished ? t().alreadyFinished : t().toastStopped(row.id));
       }, row.status === "stopping"));
   } else {
+    actions.append(jobAction(row, "archive", row.archived ? d.restoreBtn : d.archiveBtn, async () => {
+      const target = row.kind === "job" ? { jobId: row.id } : { historyKey: row.key };
+      await post("/api/jobs/archive", { ...target, archived: !row.archived });
+      expanded.delete(row.key);
+      await fetchState(true);
+    }));
     if (row.sessionId && row.sessionId !== "last") {
       if (row.kind === "job") actions.append(jobAction(row, "resume", d.resumeJobBtn, () => resumeJob(row)));
       actions.append(jobAction(row, "copy", d.copySessionBtn, async () => {
@@ -645,6 +757,7 @@ function renderGroups(list, groups, grouped, limit, emptyText) {
   list.replaceChildren();
   if (!groups.length) list.append(node("p", "empty", emptyText));
   let available = 0;
+  let rendered = 0;
   for (const group of groups) {
     const key = JSON.stringify([list.id, group.id]);
     const closed = grouped && collapsed.has(key);
@@ -667,15 +780,34 @@ function renderGroups(list, groups, grouped, limit, emptyText) {
       section.append(heading);
     }
     if (!closed) {
-      const slice = group.rows.slice(0, Math.max(0, limit - available));
+      const slice = group.rows.slice(0, Math.max(0, limit - rendered));
+      rendered += slice.length;
       available += group.rows.length;
       for (const row of slice) section.append(taskCard(row));
-      if (!slice.length) continue;
     }
     list.append(section);
   }
   return available;
 }
+
+function updateCollapseControl() {
+  const openGroups = new Set([...el.panelGoals.querySelectorAll('.group-head[aria-expanded="true"]')].map(heading => heading.title)).size;
+  document.getElementById("history-collapse-all").hidden = !expanded.size && historyLimit <= pageSize && openGroups <= 1;
+}
+
+document.getElementById("history-collapse-all").addEventListener("click", () => {
+  expanded.clear();
+  historyLimit = pageSize;
+  for (const heading of el.panelGoals.querySelectorAll(".group-head")) {
+    if (!getCurrentConvId() || heading.title !== getCurrentConvId()) collapsed.add(heading.dataset.key);
+  }
+  renderTasks();
+});
+
+document.getElementById("archive-finished-jobs").addEventListener("click", () => {
+  const conversationId = scope === "current" ? getCurrentConvId() : "";
+  return mutatePanel("/api/jobs/archive", { finishedOnly: true, ...(conversationId && { conversationId }) });
+});
 
 function renderTasks() {
   const focusedKey = document.activeElement?.dataset.key;
@@ -696,12 +828,15 @@ function renderTasks() {
     btn.setAttribute("aria-pressed", String(btn.dataset.filter === historyFilter));
   }
   el.jobsCount.textContent = v.active.reduce((n, g) => n + g.rows.length, 0);
-  el.historyCount.textContent = v.historyCount;
+  el.historyCount.textContent = historyFilter === "archived" ? v.archivedCount : v.historyCount;
+  el.filter.querySelector('[data-filter="archived"]').textContent = t().archivedFilter + " (" + v.archivedCount + ")";
+  document.getElementById("archive-finished-jobs").hidden = !v.historyCount || historyFilter === "archived";
   renderGroups(el.jobsList, v.active, grouped, Infinity, t().noActive);
   const available = renderGroups(el.historyList, v.history, grouped, historyLimit, t().noHistory);
   el.more.textContent = t().more + " (+" + Math.min(pageSize, Math.max(0, available - historyLimit)) + ")";
   el.more.hidden = available <= historyLimit;
   el.less.hidden = historyLimit <= pageSize || available <= pageSize;
+  updateCollapseControl();
   if (focusedKey && document.activeElement === document.body) {
     Array.from(el.panelGoals.querySelectorAll("[data-key]")).find(b => b.dataset.key === focusedKey)?.focus({ preventScroll: true });
   }
@@ -738,6 +873,7 @@ function renderAll() {
   if (goalKey !== lastGoals) { renderGoals(); lastGoals = goalKey; }
   const taskKey = JSON.stringify([state.jobs, state.history, getCurrentConvId(), lang]);
   if (taskKey !== lastTasks) { renderTasks(); lastTasks = taskKey; }
+  else for (const note of el.jobsList.querySelectorAll(".idle-warning")) updateIdleNote(note);
 }
 
 async function fetchState(silent = false) {
@@ -820,6 +956,10 @@ for (const btn of el.workflowGroup.querySelectorAll(".seg-btn")) {
     updateSetting({ workflowMode: btn.dataset.workflow });
   });
 }
+
+el.toggleAutoHeal.addEventListener("change", () => {
+  updateSetting({ autoHealEnabled: el.toggleAutoHeal.checked });
+});
 
 el.toggleEphemeral.addEventListener("change", () => {
   updateSetting({ ephemeral: el.toggleEphemeral.checked });

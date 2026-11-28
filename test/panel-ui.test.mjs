@@ -63,6 +63,38 @@ test("unique compatible legacy session matches, ambiguous or differently owned r
     { ...record, at: "2026-01-02", executionKind: "sync" }]).length, 3);
 });
 
+test("archived executions stay out of normal filters and are counted once per conversation", () => {
+  const archivedAt = "2026-01-01T12:00:00Z";
+  const rows = taskRows([
+    { id: "live", conversationId: "A", archived: true, status: "running" },
+    { id: "merged", conversationId: "A", status: "failed", archived: false },
+    { id: "done", conversationId: "B", status: "completed", archived: true, archivedAt },
+    { id: "open", conversationId: "A", status: "completed" },
+  ], [{ jobId: "merged", archived: true, archivedAt }, { conversationId: "A", status: "completed", archived: true }]);
+  const view = (filter, scope = "all") => taskView(rows, "A", scope, filter);
+  assert.deepEqual(ids(view("all").history), ["open"]);
+  assert.deepEqual(ids(view("success").history), ["open"]);
+  assert.deepEqual(ids(view("failure").history), []);
+  assert.deepEqual(ids(view("archived").active), ["live"]);
+  assert.equal(view("all").historyCount, 1);
+  assert.equal(view("all").archivedCount, 3);
+  assert.equal(view("archived", "current").archivedCount, 2);
+  const merged = rows.find(r => r.id === "merged");
+  assert.equal(merged.archivedAt, archivedAt);
+  assert.equal(merged.archived, true);
+  assert.equal(view("archived").history.flatMap(g => g.rows).length, 3);
+});
+
+test("legacy execution keys remain stable when archive state changes", () => {
+  const record = { sessionId: "thread", at: "2026-01-01", mode: "resume", prompt: "continue" };
+  const [before] = taskRows([], [record]);
+  const [after] = taskRows([], [{ ...record, archived: true, archivedAt: record.at }]);
+  assert.equal(after.key, before.key);
+  assert.equal(after.historyKey, before.key);
+  assert.equal(before.archivedAt, null);
+  assert.equal(after.kind, "sync");
+});
+
 test("API errors retain the backend reason, HTTP status and routing conflict fields", async () => {
   for (const status of [200, 400, 404, 409, 500]) {
     const data = { ok: false, error: "reason", code: "CROSS_CONVERSATION_RESUME", jobId: "J" };

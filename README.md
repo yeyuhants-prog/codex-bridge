@@ -6,7 +6,7 @@
 
 **An Antigravity plugin with an interactive control panel, persistent goal & milestone board, auto-callback progression loop, and zero-dependency MCP bridge to orchestrate your local OpenAI Codex CLI.**
 
-[![Version](https://img.shields.io/badge/version-1.5.0-7c3aed?style=flat-square)](./plugin.json)
+[![Version](https://img.shields.io/badge/version-1.7.0-7c3aed?style=flat-square)](./plugin.json)
 [![Node](https://img.shields.io/badge/node-%3E%3D18.0.0-22c55e?style=flat-square)](https://nodejs.org/)
 [![Dependencies](https://img.shields.io/badge/dependencies-zero-0ea5e9?style=flat-square)](#architecture)
 [![MCP](https://img.shields.io/badge/protocol-MCP%20Stdio-f59e0b?style=flat-square)](https://modelcontextprotocol.io/)
@@ -25,17 +25,25 @@
 - Let **Antigravity** analyze requirements, design verifiable milestones, inspect diffs, and verify outcomes.
 - Let **Codex** execute edits, run backend tests/scripts, resume multi-turn sessions, and wake Antigravity automatically when background runs finish.
 
+> [!IMPORTANT]
+> **Network Stability Requirement**: **Google Antigravity itself** — as well as long-running OpenAI Codex CLI streaming sessions — has **high requirements for network stability**. On unstable networks or flaky proxy nodes, long HTTP/SSE streams can silently stall or drop (`idle timeout waiting for SSE` / `tls handshake eof`). For the best experience:
+> - Use a stable, low-latency network/proxy node;
+> - Switch **Transport** in the panel to **Prefer WebSocket** if HTTP SSE stalls;
+> - Keep the built-in **L1 Auto-Heal Watchdog** and **Periodic Sub-Model Inspection** enabled so transient stream stalls recover automatically.
+
 ## Features
 
 - **Mastermind + Worker Role Division (`orchestrator` / `flexible`)** — Defaults to **Mastermind Mode**: Antigravity leverages its strengths in text synthesis, specification writing, lightweight tools/plugins, and stage verification, while delegating all heavy coding, backend debugging, and data/meta-analysis script execution to Codex in a closed callback loop (`codex_start` with `conversation_id`).
+- **Flexible Model Routing & Pinned Worker Model (`flexible` / `pinned`)** — Pick your default worker model in the panel (`~/.codex/models_cache.json`) and switch between **Flexible per task** (honor user-named models like *"use `gpt-6.2-sol`"* or switch per task complexity) and **Pinned model** (strictly enforce the selected model unless `force_model: true` is explicitly passed).
+- **Three-Tier Monitoring & Auto-Heal Recovery (v1.7.0)**:
+  - **L1 Phase-Aware Watchdog & Auto-Heal** — Tracks live execution phase (`running_cmd` vs `waiting_api` vs `reconnecting`). Local shell/build/data commands (`running_cmd`) are protected from false stall kills; if `waiting_api` stays silent past the configurable threshold (`Off / 2 / 4 / 8 min`) or gets stuck reconnecting, the bridge stops the hung stream and automatically resumes via `resume_job_id` (up to `maxAutoHeals` times, without burning goal iterations) using an idempotent recovery prompt.
+  - **L2 Periodic Inspection via Lightweight Sub-Model** — Configurable periodic check-in interval (`Off / 3 / 5 / 10 min`) delivers `[Codex Bridge Periodic Check #N]` strictly to the locked source conversation, guiding the Mastermind to delegate fast read-only progress checks to a lightweight `flash_lite` subagent without polluting Mastermind context.
+  - **L3 Post-Turn Tail Cleanup & Transport Control** — Supports `Follow default` / `Prefer WebSocket` / `HTTP SSE only`, suppresses Codex Desktop `notify=[]` hooks on headless CLI runs, and cleanly closes lingering post-`turn.completed` processes after a 5-second grace period with zero false warnings.
+- **Configurable Per-Turn Timeout (`Unlimited` → `4 hr`)** — Choose `Unlimited (0)`, `30 min`, `1 hr`, `2 hr`, or `4 hr` right in the Controls panel (inherited by resumed jobs).
 - **Native Interactive Sidecar Panel (EN / 中文)** — Appears right inside Antigravity's **Plugins** side-pane menu with one-click live **English / Chinese** switching and two clean tabs (**Controls** & **Goals & Jobs**):
-  - **Model selection** (auto-populated from your local `~/.codex/models_cache.json`)
-  - **Reasoning effort** (dynamically adapts to each model's supported levels: `low`, `medium`, `high`, `xhigh`, `max`, `ultra`)
-  - **Progression mode** (switchable live):
-    - `manual` — No automatic callbacks; wait for your next prompt.
-    - `notify` — Automatically wakes Antigravity when a background Codex job finishes so it can verify and report findings.
-    - `autonomous` — Automatically verifies completed milestones, calls `codex_resume` on failure, or advances to the next pending milestone until done (guarded by a configurable `maxAutoIterations` cap and one-click **Pause** button).
-  - **Sandbox policy** (`read-only`, `workspace-write`, `danger-full-access`) & **Briefing workflow** (`direct` vs. `plan_first`)
+  - **Model selection & routing**, **Reasoning effort** (`low` → `ultra`), **Progression mode** (`manual` / `notify` / `autonomous`), **Per-turn timeout**, **Periodic inspection interval**, **API stall threshold & auto-heal toggle**, **Sandbox policy** (`read-only` / `workspace-write` / `danger-full-access`), **Briefing workflow** (`direct` / `plan_first`), and **Transport** (`default` / `websocket` / `http`).
+  - **Historical Goals & Execution Records Archiving** — Main goal board and history filters show only unarchived items; archive completed goals/records in one click or individually into dedicated collapsible **Archived** drawers/filters, with one-click restore (active jobs are protected from archiving).
+  - **Ergonomic Expand / Collapse** — Long prompts expand inside a bounded scrollable container (`max-height: 260px`) so **Collapse prompt** stays visible on screen, plus collapsible goal milestones and one-click **Collapse all**.
 - **Persistent Goal & Milestone State Machine** — Goals, ordered milestones, verification commands, blockers, and linked `Session ID`s persist on disk (`goals.json`), surviving conversation compaction and restarts.
 - **Per-Job Locked Callbacks & Explicit Retry** — Callback targets (`conversationId` / `projectId`) are locked from trusted Antigravity host context at job dispatch time (`GET /api/state` is strictly read-only, preventing cross-conversation leaks). Failed deliveries remain visibly marked `failed` with one-click retry strictly to the original source conversation.
 - **Restart-Resilient Jobs & Cross-Process Session Locks** — Background jobs (`codex_start`) persist to `jobs.json` with atomic per-session file locks (`locks/`). If the MCP server restarts while a Codex process is still alive, the job transitions to `running_detached` (blocking duplicate spawns until it finishes or is explicitly stopped). Structured resume (`resume_job_id` or panel **Resume Job**) preserves original `session_id`, `cwd`, `sandbox`, `goal_id`, and `milestone_id`, places `-C` / `-s` before `resume`, and blocks accidental sandbox widening unless explicitly confirmed.
@@ -85,15 +93,15 @@ git clone https://github.com/yeyuhants-prog/codex-bridge.git "$env:USERPROFILE\.
 
 | Tool | Description |
 | --- | --- |
-| `codex_goal` | Create, inspect, update milestones, pause/resume, or delete persistent multi-step Goals shared with the Sidecar goal board. |
-| `codex_run` | Run a task synchronously via `codex exec` using active panel settings (or per-call overrides). Supports optional `goal_id` & `milestone_id`. |
+| `codex_goal` | Create, inspect, update milestones, pause/resume, archive/unarchive, or delete persistent multi-step Goals shared with the Sidecar goal board. |
+| `codex_run` | Run a task synchronously via `codex exec` using active panel settings (or per-call overrides). Supports optional `goal_id`, `milestone_id`, `force_model`, and `timeout_seconds` (`0` = unlimited). |
 | `codex_resume` | Continue by `resume_job_id` or an exact session UUID. Unknown sessions default to read-only. |
 | `codex_review` | Run Codex's built-in non-interactive Git code review (`uncommitted`, `base` branch, or `commit` SHA). |
-| `codex_start` | Launch a persistent background Codex worker and return `job_id` immediately; triggers auto-callback upon completion in `notify`/`autonomous` modes. |
-| `codex_status` | Inspect progress events, `Session ID`, or final output of a background job (including restart-interrupted jobs), with optional `wait_seconds` long-polling. |
+| `codex_start` | Launch a persistent background Codex worker and return `job_id` immediately; supports L1 auto-heal watchdog, periodic check-ins, and completion auto-callbacks. |
+| `codex_status` | Inspect live phase (`waiting_api` / `running_cmd` / `reconnecting`), progress events, auto-heal & periodic check counts, `Session ID`, or final output of a background job. |
 | `codex_cancel` | Terminate a running background Codex job along with its child process tree. |
-| `codex_config` | Read or update shared preferences (`model`, `reasoning_effort`, `sandbox`, `workflow_mode`, `progression_mode`, `max_auto_iterations`) and list local Codex models. |
-| `codex_info` | Health check showing resolved Codex binary & version, active panel settings, bound conversation, active goal progress, and tracked jobs. |
+| `codex_config` | Read or update shared preferences (`model`, `model_routing`, `reasoning_effort`, `sandbox`, `workflow_mode`, `progression_mode`, `task_timeout_seconds`, `transport`, `auto_heal_enabled`, `stall_threshold_seconds`, `max_auto_heals`, `monitor_interval_seconds`, `max_auto_iterations`) and list local Codex models. |
+| `codex_info` | Health check showing resolved Codex binary & version, active panel settings, watchdog/monitor configuration, active goal progress, and tracked jobs. |
 
 ## Example Prompts
 
@@ -119,6 +127,13 @@ git clone https://github.com/yeyuhants-prog/codex-bridge.git "$env:USERPROFILE\.
 ```bash
 # Zero-token MCP protocol, settings & persistent goal board smoke test
 npm test
+
+# Full automated unit, acceptance, and regression suites (v1.4 ~ v1.7)
+node --test test/panel-ui.test.mjs
+node test/acceptance-v14.mjs
+node test/regression-v15.mjs
+node test/regression-v16.mjs
+node --test test/regression-v17.mjs
 
 # End-to-end live check against your local Codex CLI (read-only, ephemeral)
 npm run test:live
